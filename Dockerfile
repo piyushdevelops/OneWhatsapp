@@ -4,6 +4,12 @@ WORKDIR /app
 
 COPY outputs/whatsapp-dashboard /app/outputs/whatsapp-dashboard
 COPY outputs/whatsapp-webhook-server /app/outputs/whatsapp-webhook-server
+COPY outputs/inbox-schema.sql /app/outputs/inbox-schema.sql
+
+WORKDIR /app/outputs/whatsapp-webhook-server
+RUN npm install --omit=dev
+
+WORKDIR /app
 
 ENV HOST=0.0.0.0
 ENV PORT=3000
