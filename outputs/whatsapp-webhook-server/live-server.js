@@ -50,6 +50,7 @@ let webhookDiagnostics = {
   last_post_ok: null,
   last_post_reason: "",
   last_post_summary: null,
+  last_error: null,
 };
 
 let outboundDiagnostics = {
@@ -458,6 +459,29 @@ async function sendWhatsAppMessage(conversation, request) {
     providerMessageId: responsePayload?.messages?.[0]?.id || "",
     payload: responsePayload,
     request_payload: payload,
+  };
+}
+
+async function metaGet(pathname) {
+  if (!WHATSAPP_ACCESS_TOKEN) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: { message: "missing_access_token" } },
+    };
+  }
+
+  const response = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${pathname}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
   };
 }
 
@@ -1412,6 +1436,10 @@ async function handleWebhook(req, res, parsed) {
           last_post_ok: false,
           last_post_reason: signature.reason,
           last_post_summary: null,
+          last_error: {
+            message: signature.reason,
+            type: "signature",
+          },
         };
         console.log(`[webhook.post] rejected reason=${signature.reason} at=${webhookDiagnostics.last_post_at}`);
         return sendJson(res, 401, { error: signature.reason });
@@ -1427,6 +1455,7 @@ async function handleWebhook(req, res, parsed) {
         last_post_ok: true,
         last_post_reason: signature.skipped ? "signature_skipped" : "accepted",
         last_post_summary: summary,
+        last_error: null,
       };
       console.log(
         `[webhook.post] accepted messages=${summary.messages.length} statuses=${summary.statuses.length} contacts=${summary.contacts.length} at=${webhookDiagnostics.last_post_at}`
@@ -1439,6 +1468,11 @@ async function handleWebhook(req, res, parsed) {
         last_post_ok: false,
         last_post_reason: "invalid_payload",
         last_post_summary: null,
+        last_error: {
+          message: error?.message || "unknown",
+          type: error?.name || "Error",
+          stack_hint: error?.stack ? String(error.stack).split("\n").slice(0, 2).join(" | ") : "",
+        },
       };
       console.log(
         `[webhook.post] invalid_payload at=${webhookDiagnostics.last_post_at} error=${error?.message || "unknown"}`
@@ -1615,6 +1649,39 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/outbound") {
     return sendJson(res, 200, outboundDiagnostics);
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/meta-auth") {
+    const [me, phone] = await Promise.all([
+      metaGet("me"),
+      WHATSAPP_PHONE_NUMBER_ID ? metaGet(WHATSAPP_PHONE_NUMBER_ID) : Promise.resolve({
+        ok: false,
+        status: 0,
+        payload: { error: { message: "missing_phone_number_id" } },
+      }),
+    ]);
+
+    return sendJson(res, 200, {
+      graph_api_version: GRAPH_API_VERSION,
+      runtime: {
+        phone_number_id: WHATSAPP_PHONE_NUMBER_ID || "",
+        waba_id: WHATSAPP_BUSINESS_ACCOUNT_ID || "",
+        access_token_fingerprint: fingerprint(WHATSAPP_ACCESS_TOKEN),
+        access_token_length: WHATSAPP_ACCESS_TOKEN ? String(WHATSAPP_ACCESS_TOKEN).length : 0,
+      },
+      checks: {
+        me: {
+          ok: me.ok,
+          status: me.status,
+          payload: me.payload,
+        },
+        phone_number: {
+          ok: phone.ok,
+          status: phone.status,
+          payload: phone.payload,
+        },
+      },
+    });
   }
 
   if (parsed.pathname === "/webhooks/whatsapp") {
