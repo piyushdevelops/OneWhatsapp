@@ -983,7 +983,7 @@ function createPostgresStorage() {
         updated_at
       )
       values ($1, $2, $3, $4, $5, 'inbound', $6, $7, $8, $9, 'received', $10::jsonb, $11, $11, now())
-      on conflict (organization_id, provider_message_id) do nothing
+      on conflict do nothing
       returning id
       `,
       [

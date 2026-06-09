@@ -107,6 +107,42 @@ function initialsFor(value) {
     .join("") || "WA";
 }
 
+function mergeConversationSummary(item, detail) {
+  if (!detail) return item;
+  const merged = { ...item, ...detail };
+
+  if (!(detail.messages || []).length && (item.messages || []).length) {
+    merged.messages = item.messages;
+  }
+  if ((!detail.preview || !detail.preview.trim()) && item.preview) {
+    merged.preview = item.preview;
+  }
+  if ((!detail.latest_message_at && !detail.last_message_at) && (item.latest_message_at || item.last_message_at)) {
+    merged.latest_message_at = item.latest_message_at || item.last_message_at;
+    merged.last_message_at = item.last_message_at || item.latest_message_at;
+  }
+  if ((!detail.phone || detail.phone === "-") && item.phone) {
+    merged.phone = item.phone;
+  }
+  if ((!detail.segment || detail.segment === "Webhook contact") && item.segment) {
+    merged.segment = item.segment;
+  }
+
+  return merged;
+}
+
+function isLiveConversation(item) {
+  return Boolean(
+    item
+    && (
+      item.id?.startsWith("wa_")
+      || item.owner === "WhatsApp Cloud API"
+      || item.segment === "Webhook contact"
+      || (item.phone && item.phone !== "-")
+    )
+  );
+}
+
 async function loadInboxData({ force = false } = {}) {
   if (inboxLoading) return;
   if (!force && Date.now() - inboxLoadedAt < 1000) return;
@@ -140,7 +176,7 @@ async function loadInboxData({ force = false } = {}) {
 
     inboxConversations = items.map((item) => {
       if (selectedDetail && item.id === selectedDetail.id) {
-        return normalizeInboxConversation({ ...item, ...selectedDetail });
+        return normalizeInboxConversation(mergeConversationSummary(item, selectedDetail));
       }
       return normalizeInboxConversation(item);
     });
@@ -815,9 +851,22 @@ function renderInbox() {
   const selected = activeConversations.find((item) => item.id === state.selectedConversationId) || activeConversations[0];
   state.selectedConversationId = selected.id;
   const brief = conversationBrief(selected);
-  const isLiveWebhookConversation = selected?.id?.startsWith("wa_");
+  const isLiveWebhookConversation = isLiveConversation(selected);
   const canSendToWhatsApp = isLiveWebhookConversation && systemStatus.outboundEnabled;
   const replyDraft = state.replyDrafts[selected.id] || "";
+  const visibleMessages = selected.messages?.length
+    ? selected.messages
+    : selected.preview
+      ? [{
+          from: "in",
+          type: "text",
+          text: selected.preview,
+          body: selected.preview,
+          time: selected.time || "now",
+          status: "received",
+          delivery_mode: "whatsapp",
+        }]
+      : [];
   const inboxStatus = inboxConversations.length
     ? `${inboxConversations.length} live webhook conversation${inboxConversations.length === 1 ? "" : "s"}`
     : inboxLoading
@@ -856,7 +905,7 @@ function renderInbox() {
       <section class="chat-panel">
         ${chatHeader(selected)}
         <div class="messages">
-          ${(selected.messages || []).map((message) => `
+          ${visibleMessages.map((message) => `
             <div class="${messageBubbleClass(message)}">
               <div>${messageContent(message)}</div>
               <div class="message-time">${escapeHtml(messageMeta(message))}</div>
@@ -905,7 +954,7 @@ function renderInbox() {
           ${profileRow("Segment", selected.segment)}
           <div class="profile-section-title">Conversation</div>
           ${profileRow("Unread", String(selected.unread || 0))}
-          ${profileRow("Latest inbound", selected.preview || "-")}
+          ${profileRow("Latest inbound", latestInboundText(selected))}
           ${profileRow("Service window", brief.window)}
           ${profileRow("Reply mode", canSendToWhatsApp ? "WhatsApp live" : "Local only")}
           ${profileRow("Assigned to", "Unassigned")}
@@ -951,6 +1000,11 @@ function messageMeta(message) {
     return `${message.time} - ${message.status.replaceAll("_", " ")}`;
   }
   return message.time;
+}
+
+function latestInboundText(selected) {
+  const latestInbound = [...(selected.messages || [])].reverse().find((message) => message.from === "in");
+  return latestInbound?.text || selected.preview || "-";
 }
 
 function messageBubbleClass(message) {
@@ -1283,7 +1337,7 @@ function splitVariables(value) {
 
 async function sendConversationPayload(payload, { successMessage, pendingDraftClear = true } = {}) {
   const selected = selectedLiveConversation();
-  if (!selected?.id?.startsWith("wa_")) {
+  if (!isLiveConversation(selected)) {
     showToast("No live conversation selected.");
     return;
   }
