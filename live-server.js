@@ -174,6 +174,26 @@ function fingerprint(value) {
   return sha1(value).slice(0, 12);
 }
 
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function splitSqlStatements(sql) {
+  return String(sql || "")
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+}
+
+function isIgnorableSchemaError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("already exists") ||
+    message.includes("duplicate key value violates unique constraint") ||
+    message.includes("multiple primary keys")
+  );
+}
+
 function safeJsonParse(value, fallback = {}) {
   if (!value) return fallback;
   if (typeof value === "object") return value;
@@ -774,14 +794,14 @@ function createPostgresStorage() {
     if (state.organizationId) return state.organizationId;
     const result = await query(
       `
-      insert into organizations (name, slug)
-      values ($1, $2)
+      insert into organizations (id, name, slug)
+      values ($1, $2, $3)
       on conflict (slug) do update
       set name = excluded.name,
           updated_at = now()
       returning id
       `,
-      [ORGANIZATION_NAME, ORGANIZATION_SLUG]
+      [uuid(), ORGANIZATION_NAME, ORGANIZATION_SLUG]
     );
     state.organizationId = result.rows[0].id;
     return state.organizationId;
@@ -792,6 +812,7 @@ function createPostgresStorage() {
     const result = await query(
       `
       insert into whatsapp_channels (
+        id,
         organization_id,
         waba_id,
         phone_number_id,
@@ -801,7 +822,7 @@ function createPostgresStorage() {
         webhook_status,
         updated_at
       )
-      values ($1, $2, $3, $4, $5, $6, 'verified', now())
+      values ($1, $2, $3, $4, $5, $6, $7, 'verified', now())
       on conflict (organization_id, phone_number_id) do update
       set waba_id = excluded.waba_id,
           display_phone_number = coalesce(excluded.display_phone_number, whatsapp_channels.display_phone_number),
@@ -812,6 +833,7 @@ function createPostgresStorage() {
       returning id
       `,
       [
+        uuid(),
         organizationId,
         WHATSAPP_BUSINESS_ACCOUNT_ID,
         phoneNumberId || WHATSAPP_PHONE_NUMBER_ID || "unknown-phone",
@@ -828,6 +850,7 @@ function createPostgresStorage() {
     const result = await query(
       `
       insert into contacts (
+        id,
         organization_id,
         wa_id,
         phone_e164,
@@ -836,7 +859,7 @@ function createPostgresStorage() {
         customer_service_window_expires_at,
         updated_at
       )
-      values ($1, $2, $3, $4, $5, $6, now())
+      values ($1, $2, $3, $4, $5, $6, $7, now())
       on conflict (organization_id, phone_e164) do update
       set wa_id = excluded.wa_id,
           display_name = coalesce(excluded.display_name, contacts.display_name),
@@ -849,6 +872,7 @@ function createPostgresStorage() {
       returning *
       `,
       [
+        uuid(),
         organizationId,
         waId,
         formatPhoneE164(waId),
@@ -880,6 +904,7 @@ function createPostgresStorage() {
     const created = await query(
       `
       insert into conversations (
+        id,
         organization_id,
         channel_id,
         contact_id,
@@ -891,10 +916,10 @@ function createPostgresStorage() {
         created_at,
         updated_at
       )
-      values ($1, $2, $3, 'open', 'normal', 'whatsapp', $4, 0, now(), now())
+      values ($1, $2, $3, $4, 'open', 'normal', 'whatsapp', $5, 0, now(), now())
       returning *
       `,
-      [organizationId, channelId, contactId, intent]
+      [uuid(), organizationId, channelId, contactId, intent]
     );
     return created.rows[0];
   }
@@ -941,6 +966,7 @@ function createPostgresStorage() {
     const result = await query(
       `
       insert into messages (
+        id,
         organization_id,
         channel_id,
         conversation_id,
@@ -956,11 +982,12 @@ function createPostgresStorage() {
         created_at,
         updated_at
       )
-      values ($1, $2, $3, $4, 'inbound', $5, $6, $7, $8, 'received', $9::jsonb, $10, $10, now())
+      values ($1, $2, $3, $4, $5, 'inbound', $6, $7, $8, $9, 'received', $10::jsonb, $11, $11, now())
       on conflict (organization_id, provider_message_id) do nothing
       returning id
       `,
       [
+        uuid(),
         organizationId,
         channelId,
         conversation.id,
@@ -997,6 +1024,7 @@ function createPostgresStorage() {
     await query(
       `
       insert into webhook_events (
+        id,
         organization_id,
         provider,
         event_type,
@@ -1006,10 +1034,10 @@ function createPostgresStorage() {
         received_at,
         processed_at
       )
-      values ($1, 'meta_whatsapp', 'webhook', $2, $3::jsonb, 'processed', $4, now())
+      values ($1, $2, 'meta_whatsapp', 'webhook', $3, $4::jsonb, 'processed', $5, now())
       on conflict (provider, event_fingerprint) do nothing
       `,
-      [organizationId, eventFingerprint, JSON.stringify(payload), receivedAt]
+      [uuid(), organizationId, eventFingerprint, JSON.stringify(payload), receivedAt]
     );
 
     for (const entry of payload.entry || []) {
@@ -1237,6 +1265,7 @@ function createPostgresStorage() {
     const result = await query(
       `
       insert into messages (
+        id,
         organization_id,
         channel_id,
         conversation_id,
@@ -1253,10 +1282,11 @@ function createPostgresStorage() {
         created_at,
         updated_at
       )
-      values ($1, $2, $3, $4, 'outbound', $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $12, now())
+      values ($1, $2, $3, $4, $5, 'outbound', $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $13, now())
       returning id
       `,
       [
+        uuid(),
         organizationId,
         relation.channel_id,
         conversation.id,
@@ -1301,7 +1331,17 @@ function createPostgresStorage() {
     },
     async init() {
       const schemaSql = fs.readFileSync(SCHEMA_FILE, "utf8");
-      await query(schemaSql);
+      for (const statement of splitSqlStatements(schemaSql)) {
+        try {
+          await query(statement);
+        } catch (error) {
+          if (isIgnorableSchemaError(error)) {
+            console.log(`[storage] schema skip: ${error.message}`);
+            continue;
+          }
+          throw error;
+        }
+      }
       await ensureOrganization();
       if (WHATSAPP_PHONE_NUMBER_ID) {
         await ensureChannel(WHATSAPP_PHONE_NUMBER_ID, {
@@ -1320,19 +1360,29 @@ function createPostgresStorage() {
 function createStorage() {
   const postgres = createPostgresStorage();
   const base = postgres || createJsonStorage();
+  const initState = {
+    attempted_mode: base.mode,
+    active_mode: base.mode,
+    last_init_error: null,
+    fallback_used: false,
+  };
   const initPromise = base
     .init()
     .then(() => {
       console.log(`[storage] mode=${base.mode}`);
+      initState.active_mode = base.mode;
     })
     .catch((error) => {
       console.error(`[storage] init failed for mode=${base.mode}`, error);
+      initState.last_init_error = error?.message || "unknown_init_error";
       if (postgres) {
         console.log("[storage] falling back to json storage");
         const fallback = createJsonStorage();
         storage.mode = fallback.mode;
         storage.diagnostics = fallback.diagnostics;
         storage._impl = fallback;
+        initState.active_mode = fallback.mode;
+        initState.fallback_used = true;
         return fallback.init();
       }
       throw error;
@@ -1341,6 +1391,7 @@ function createStorage() {
   const storage = {
     mode: base.mode,
     diagnostics: base.diagnostics,
+    initState,
     _impl: base,
     async ready() {
       await initPromise;
@@ -1627,6 +1678,10 @@ const server = http.createServer(async (req, res) => {
       outbound: outboundConfig(storage.mode),
       storage: {
         mode: storage.mode,
+        attempted_mode: storage.initState?.attempted_mode || storage.mode,
+        active_mode: storage.initState?.active_mode || storage.mode,
+        fallback_used: Boolean(storage.initState?.fallback_used),
+        last_init_error: storage.initState?.last_init_error || null,
         database_url_configured: Boolean(DATABASE_URL),
         pg_module_available: Boolean(Pool),
       },
