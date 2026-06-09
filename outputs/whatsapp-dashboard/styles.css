@@ -1418,6 +1418,55 @@ tr:last-child td {
   margin-top: 28px;
 }
 
+.read-dot {
+  min-width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid #4a505a;
+  color: #8e96a3;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 850;
+  margin-top: 28px;
+}
+
+.conversation-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  border-radius: 999px;
+  padding: 0 7px;
+  margin-top: 8px;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.conversation-status.good,
+.message-status.good {
+  background: rgba(116, 196, 140, 0.16);
+  color: #96e0aa;
+}
+
+.conversation-status.live,
+.message-status.live {
+  background: rgba(105, 163, 255, 0.16);
+  color: #9fc2ff;
+}
+
+.conversation-status.bad,
+.message-status.bad {
+  background: rgba(255, 116, 116, 0.16);
+  color: #ffb3b3;
+}
+
+.conversation-status.muted,
+.message-status.muted {
+  background: rgba(255, 255, 255, 0.11);
+  color: #c2c8d2;
+}
+
 .chat-panel {
   min-width: 0;
   display: grid;
@@ -1512,6 +1561,21 @@ tr:last-child td {
   margin-top: 5px;
   color: rgba(255, 255, 255, 0.62);
   font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.message-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
 }
 
 .composer {
@@ -2099,6 +2163,68 @@ tr:last-child td {
   gap: 10px;
 }
 
+.diagnostics-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.diagnostics-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.diagnostic-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 14px;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.diagnostic-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.diagnostic-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.diagnostic-row strong {
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-green {
+  color: #23824f !important;
+}
+
+.diagnostic-orange {
+  color: #9a5a12 !important;
+}
+
+.diagnostic-red {
+  color: #b53333 !important;
+}
+
+.diagnostic-gray {
+  color: #667085 !important;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -2203,6 +2329,10 @@ tr:last-child td {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .diagnostics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .content-grid {
     grid-template-columns: 1fr;
   }
@@ -2274,8 +2404,13 @@ tr:last-child td {
   .ops-scoreboard,
   .capability-grid,
   .mode-grid,
+  .diagnostics-grid,
   .checklist {
     grid-template-columns: 1fr;
+  }
+
+  .diagnostics-head {
+    display: grid;
   }
 
   .ops-hero h2 {

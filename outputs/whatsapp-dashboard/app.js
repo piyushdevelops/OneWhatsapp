@@ -10,8 +10,8 @@ const state = {
 };
 
 const isLoopbackHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
-const isLocalApiHost = isLoopbackHost && ["8790", "8792", "3000"].includes(window.location.port);
-const defaultInboxApiBase = isLoopbackHost && !isLocalApiHost ? "http://127.0.0.1:8792" : window.location.origin;
+const isStaticDevHost = isLoopbackHost && ["4173", "5173", "5174"].includes(window.location.port);
+const defaultInboxApiBase = isStaticDevHost ? "http://127.0.0.1:8792" : window.location.origin;
 const INBOX_API_BASE = window.ONEOPS_CONFIG?.inboxApiBase || defaultInboxApiBase;
 let inboxConversations = [];
 let inboxLoading = false;
@@ -21,6 +21,14 @@ let inboxPollTimer = null;
 let systemStatus = {
   outboundMode: "local_only",
   outboundEnabled: false,
+  graphApiVersion: "",
+  storageMode: "",
+  attemptedStorageMode: "",
+  storageFallbackUsed: false,
+  phoneNumberConfigured: false,
+  runtime: {},
+  webhookDiagnostics: null,
+  outboundDiagnostics: null,
   healthLoaded: false,
 };
 
@@ -43,16 +51,32 @@ async function loadSystemStatus() {
     systemStatus = {
       outboundMode: payload.outbound?.mode || "local_only",
       outboundEnabled: Boolean(payload.outbound?.enabled),
+      graphApiVersion: payload.outbound?.graph_api_version || "",
+      storageMode: payload.storage?.active_mode || payload.storage?.mode || payload.outbound?.storage_mode || "",
+      attemptedStorageMode: payload.storage?.attempted_mode || payload.storage?.mode || "",
+      storageFallbackUsed: Boolean(payload.storage?.fallback_used),
+      phoneNumberConfigured: Boolean(payload.outbound?.phone_number_id_configured),
+      runtime: payload.runtime || {},
+      webhookDiagnostics: payload.webhook_diagnostics || null,
+      outboundDiagnostics: payload.outbound_diagnostics || null,
       healthLoaded: true,
     };
   } catch {
     systemStatus = {
       outboundMode: "local_only",
       outboundEnabled: false,
+      graphApiVersion: "",
+      storageMode: "",
+      attemptedStorageMode: "",
+      storageFallbackUsed: false,
+      phoneNumberConfigured: false,
+      runtime: {},
+      webhookDiagnostics: null,
+      outboundDiagnostics: null,
       healthLoaded: false,
     };
   } finally {
-    if (state.screen === "inbox") render();
+    if (["dashboard", "inbox", "settings"].includes(state.screen)) render();
   }
 }
 
@@ -69,10 +93,13 @@ function normalizeInboxConversation(item) {
     delivery_mode: message.delivery_mode || "whatsapp",
     media_url: message.media_url || "",
     template_name: message.template_name || "",
+    provider_message_id: message.provider_message_id || "",
   }));
 
   return {
     id: item.id,
+    wa_id: item.wa_id || customer.wa_id || customer.id || "",
+    status: item.status || "open",
     name: item.name || customer.name || "WhatsApp Customer",
     owner: item.owner || "WhatsApp Cloud API",
     preview: item.preview || messages[messages.length - 1]?.text || "",
@@ -93,6 +120,7 @@ function normalizeInboxConversation(item) {
           : "Template required",
     suggestedReply: item.suggested_reply?.body || "",
     allowedReplyModes: item.service_window?.allowed_reply_modes || ["freeform", "template"],
+    storageMode: item.storage_mode || systemStatus.storageMode || "",
     messages,
   };
 }
@@ -447,6 +475,11 @@ function renderDashboard() {
   const stats = liveInboxStats();
   const latest = stats.latest;
   const healthTone = stats.apiState === "Connected" ? "green" : stats.apiState === "Loading" ? "blue" : "red";
+  const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
+  const outboundLabel = systemStatus.outboundEnabled ? "WhatsApp live" : "Local only";
+  const outboundCopy = systemStatus.outboundEnabled
+    ? "Dashboard replies are being handed to Meta Cloud API, with status webhooks updating the thread."
+    : "Dashboard replies are saved locally until a secure Meta token is configured.";
   const lastMessage = latest
     ? `${latest.name}: ${latest.preview}`
     : inboxLastError
@@ -478,7 +511,7 @@ function renderDashboard() {
           <section class="panel pad">
             <div class="signal-list">
               ${commandSignal("Webhook intake", stats.apiState, inboxLastError ? inboxLastError : "Receiving Meta webhook conversations into the local inbox.", healthTone)}
-              ${commandSignal("Outbound delivery", "Local only", "Dashboard replies are saved in the thread. Actual WhatsApp sending starts after a regenerated Meta token is added.", "orange")}
+              ${commandSignal("Outbound delivery", outboundLabel, outboundCopy, outboundTone)}
               ${commandSignal("Templates", syncedTemplates.length ? `${syncedTemplates.length} synced` : "Not synced", "No real template sync is connected yet, so template tables stay empty.", "blue")}
             </div>
           </section>
@@ -499,8 +532,8 @@ function renderDashboard() {
             </article>
             <article class="move-card">
               <h3>WhatsApp sending</h3>
-              <p>Needs a regenerated, secure Cloud API token before dashboard replies can be delivered back to your phone.</p>
-              <span class="badge orange">Pending</span>
+              <p>${escapeHtml(outboundCopy)}</p>
+              <span class="badge ${outboundTone}">${escapeHtml(outboundLabel)}</span>
             </article>
             <article class="move-card">
               <h3>Real data policy</h3>
@@ -908,7 +941,7 @@ function renderInbox() {
           ${visibleMessages.map((message) => `
             <div class="${messageBubbleClass(message)}">
               <div>${messageContent(message)}</div>
-              <div class="message-time">${escapeHtml(messageMeta(message))}</div>
+              <div class="message-time">${messageMetaHtml(message)}</div>
             </div>
           `).join("")}
         </div>
@@ -1002,9 +1035,58 @@ function messageMeta(message) {
   return message.time;
 }
 
+function messageStatusLabel(message) {
+  if (message.from !== "out") return "";
+  const labels = {
+    local: "Local",
+    blocked: "Template required",
+    failed: "Failed",
+    submitted: "Submitted",
+    sent: "Sent",
+    delivered: "Delivered",
+    read: "Read",
+  };
+  return labels[message.status] || (message.status ? message.status.replaceAll("_", " ") : "");
+}
+
+function messageStatusTone(message) {
+  if (message.status === "failed" || message.status === "blocked") return "bad";
+  if (message.status === "local") return "muted";
+  if (message.status === "read" || message.status === "delivered") return "good";
+  return "live";
+}
+
+function messageMetaHtml(message) {
+  const status = messageStatusLabel(message);
+  if (!status) return escapeHtml(message.time);
+  return `
+    <span>${escapeHtml(message.time)}</span>
+    <span class="message-status ${messageStatusTone(message)}">${escapeHtml(status)}</span>
+  `;
+}
+
 function latestInboundText(selected) {
   const latestInbound = [...(selected.messages || [])].reverse().find((message) => message.from === "in");
   return latestInbound?.text || selected.preview || "-";
+}
+
+function latestMessage(item) {
+  return [...(item.messages || [])].reverse()[0] || null;
+}
+
+function conversationPreviewText(item) {
+  const latest = latestMessage(item);
+  const preview = item.preview || latest?.text || "";
+  if (!preview) return "No message yet";
+  return latest?.from === "out" ? `You: ${preview}` : preview;
+}
+
+function conversationStatusHtml(item) {
+  const latest = latestMessage(item);
+  if (!latest || latest.from !== "out") return "";
+  const label = messageStatusLabel(latest);
+  if (!label) return "";
+  return `<span class="conversation-status ${messageStatusTone(latest)}">${escapeHtml(label)}</span>`;
 }
 
 function messageBubbleClass(message) {
@@ -1046,11 +1128,12 @@ function conversationItem(item) {
       <span>
         <span class="conversation-meta">${escapeHtml(item.owner)}</span>
         <span class="conversation-name">${escapeHtml(item.name)}</span>
-        <span class="conversation-preview">${escapeHtml(item.preview)}</span>
+        <span class="conversation-preview">${escapeHtml(conversationPreviewText(item))}</span>
       </span>
       <span>
         <span class="conversation-meta">${escapeHtml(item.time)}</span>
-        <span class="unread-dot">${item.unread}</span>
+        ${conversationStatusHtml(item)}
+        ${item.unread ? `<span class="unread-dot">${item.unread}</span>` : `<span class="read-dot">0</span>`}
       </span>
     </button>
   `;
@@ -1186,7 +1269,82 @@ function renderSettings() {
           </div>
         </div>
       </section>
+      ${renderDiagnosticsPanel()}
     </div>
+  `;
+}
+
+function boolLabel(value) {
+  if (value === true) return "Yes";
+  if (value === false) return "No";
+  return "-";
+}
+
+function diagnosticsStateLabel(ok) {
+  if (ok === true) return "OK";
+  if (ok === false) return "Issue";
+  return "Waiting";
+}
+
+function diagnosticsStateTone(ok) {
+  if (ok === true) return "green";
+  if (ok === false) return "red";
+  return "gray";
+}
+
+function diagnosticRow(label, value, tone = "") {
+  return `
+    <div class="diagnostic-row">
+      <span>${escapeHtml(label)}</span>
+      <strong class="${tone ? `diagnostic-${tone}` : ""}">${escapeHtml(value || "-")}</strong>
+    </div>
+  `;
+}
+
+function renderDiagnosticsPanel() {
+  const webhook = systemStatus.webhookDiagnostics || {};
+  const outbound = systemStatus.outboundDiagnostics || {};
+  const storageTone = systemStatus.storageFallbackUsed ? "orange" : systemStatus.storageMode ? "green" : "gray";
+  const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
+  const webhookTone = diagnosticsStateTone(webhook.last_post_ok);
+  const replyTone = diagnosticsStateTone(outbound.last_attempt_ok);
+
+  return `
+    <section class="panel pad diagnostics-panel">
+      <div class="diagnostics-head">
+        <div>
+          <div class="setting-title">Live platform diagnostics</div>
+          <p class="setting-copy">Current Railway, Postgres, webhook and WhatsApp send status.</p>
+        </div>
+        <button class="secondary-button" data-action="refresh-diagnostics">Refresh diagnostics</button>
+      </div>
+      <div class="diagnostics-grid">
+        <article class="diagnostic-card">
+          <span class="badge ${systemStatus.healthLoaded ? "green" : "red"}">${systemStatus.healthLoaded ? "Health online" : "Health offline"}</span>
+          ${diagnosticRow("Storage", systemStatus.storageMode || "unknown", storageTone)}
+          ${diagnosticRow("Attempted storage", systemStatus.attemptedStorageMode || systemStatus.storageMode || "unknown")}
+          ${diagnosticRow("Fallback used", boolLabel(systemStatus.storageFallbackUsed), systemStatus.storageFallbackUsed ? "orange" : "green")}
+        </article>
+        <article class="diagnostic-card">
+          <span class="badge ${outboundTone}">${systemStatus.outboundEnabled ? "WhatsApp live" : "Local only"}</span>
+          ${diagnosticRow("Graph API", systemStatus.graphApiVersion || "unknown")}
+          ${diagnosticRow("Phone number", boolLabel(systemStatus.phoneNumberConfigured), systemStatus.phoneNumberConfigured ? "green" : "red")}
+          ${diagnosticRow("Token fingerprint", systemStatus.runtime?.access_token_fingerprint || "-")}
+        </article>
+        <article class="diagnostic-card">
+          <span class="badge ${webhookTone}">Webhook ${diagnosticsStateLabel(webhook.last_post_ok)}</span>
+          ${diagnosticRow("Last webhook", webhook.last_post_at ? formatClientRelative(webhook.last_post_at) : "none")}
+          ${diagnosticRow("Reason", webhook.last_post_reason || "-")}
+          ${diagnosticRow("Last inbound", webhook.last_post_summary?.messages?.[0]?.text || webhook.last_post_summary?.statuses?.[0]?.status || "-")}
+        </article>
+        <article class="diagnostic-card">
+          <span class="badge ${replyTone}">Outbound ${diagnosticsStateLabel(outbound.last_attempt_ok)}</span>
+          ${diagnosticRow("Last attempt", outbound.last_attempt_at ? formatClientRelative(outbound.last_attempt_at) : "none")}
+          ${diagnosticRow("Reason", outbound.last_attempt_reason || "-")}
+          ${diagnosticRow("Recipient", outbound.last_recipient_wa_id || "-")}
+        </article>
+      </div>
+    </section>
   `;
 }
 
@@ -1594,7 +1752,13 @@ document.addEventListener("click", (event) => {
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
       loadInboxData({ force: true });
+      loadSystemStatus();
       showToast("Live data refreshed.");
+    },
+    "refresh-diagnostics": () => {
+      loadSystemStatus();
+      loadInboxData({ force: true });
+      showToast("Diagnostics refreshed.");
     },
     "refresh-dashboard": () => showToast("Signals refreshed."),
     "topup": () => showToast("Wallet top-up flow will connect to billing."),
