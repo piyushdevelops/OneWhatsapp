@@ -10,6 +10,9 @@
     "start:webhook": "node server.js",
     "start:api": "node inbox-api-server.js"
   },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
   "engines": {
     "node": ">=18"
   }

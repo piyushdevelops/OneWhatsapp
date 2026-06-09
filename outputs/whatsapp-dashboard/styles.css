@@ -1494,6 +1494,20 @@ tr:last-child td {
   color: #fff;
 }
 
+.message.out.local-draft {
+  background: #46557f;
+  border: 1px dashed rgba(255, 255, 255, 0.24);
+}
+
+.message.out.failed-send {
+  background: #6e3340;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.message.rich-message {
+  min-width: 220px;
+}
+
 .message-time {
   margin-top: 5px;
   color: rgba(255, 255, 255, 0.62);
@@ -1561,6 +1575,23 @@ tr:last-child td {
   font-size: 11px;
   font-weight: 900;
   text-transform: uppercase;
+}
+
+.message-template-name {
+  margin-bottom: 6px;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.message-link-row {
+  margin-top: 7px;
+}
+
+.message-link {
+  color: #dfe8ff;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .profile-panel {

@@ -58,12 +58,17 @@ async function loadSystemStatus() {
 
 function normalizeInboxConversation(item) {
   const customer = item.customer || {};
+  const serviceState = item.service_window?.state || "open";
   const messages = (item.messages || []).map((message) => ({
     from: message.from || (message.direction === "inbound" ? "in" : "out"),
     type: message.type || "text",
     text: message.text || message.body || `[${message.type || "message"}]`,
     time: message.time || formatClientRelative(message.created_at),
     status: message.status || "received",
+    created_at: message.created_at,
+    delivery_mode: message.delivery_mode || "whatsapp",
+    media_url: message.media_url || "",
+    template_name: message.template_name || "",
   }));
 
   return {
@@ -80,8 +85,14 @@ function normalizeInboxConversation(item) {
     order: item.order || "-",
     lastOrder: item.lastOrder || "-",
     intent: item.intent || "general_support",
-    serviceWindow: item.service_window?.state === "open" ? "24h open" : "Template required",
+    serviceWindow:
+      serviceState === "open"
+        ? "24h open"
+        : serviceState === "closing_soon"
+          ? "Closing soon"
+          : "Template required",
     suggestedReply: item.suggested_reply?.body || "",
+    allowedReplyModes: item.service_window?.allowed_reply_modes || ["freeform", "template"],
     messages,
   };
 }
@@ -846,7 +857,7 @@ function renderInbox() {
         ${chatHeader(selected)}
         <div class="messages">
           ${(selected.messages || []).map((message) => `
-            <div class="message ${message.from}">
+            <div class="${messageBubbleClass(message)}">
               <div>${messageContent(message)}</div>
               <div class="message-time">${escapeHtml(messageMeta(message))}</div>
             </div>
@@ -910,23 +921,51 @@ function renderInbox() {
 }
 
 function messageContent(message) {
-  const type = message.type && message.type !== "text" ? message.type : "";
-  const text = escapeHtml(message.text || message.body || `[${type || "message"}]`);
-  if (!type) return text;
-  return `<span class="message-attachment">${escapeHtml(type)}</span>${text}`;
+  const type = message.type || "text";
+  const body = escapeHtml(message.text || message.body || `[${type}]`);
+  const label = type !== "text" ? `<span class="message-attachment">${escapeHtml(labelForUiType(type))}</span>` : "";
+  const link = message.media_url
+    ? `<div class="message-link-row"><a class="message-link" href="${escapeHtml(message.media_url)}" target="_blank" rel="noreferrer">Open file</a></div>`
+    : "";
+  const templateHint =
+    type === "template" && message.template_name
+      ? `<div class="message-template-name">${escapeHtml(message.template_name)}</div>`
+      : "";
+  return `${label}${templateHint}<div>${body}</div>${link}`;
 }
 
 function messageMeta(message) {
   if (message.from === "out" && message.status === "local") {
     return `${message.time} - saved locally`;
   }
+  if (message.from === "out" && message.status === "blocked") {
+    return `${message.time} - template required`;
+  }
+  if (message.from === "out" && message.status === "failed") {
+    return `${message.time} - failed to send`;
+  }
   if (message.from === "out" && message.status === "submitted") {
     return `${message.time} - submitted to WhatsApp`;
   }
   if (message.from === "out" && message.status) {
-    return `${message.time} - ${message.status}`;
+    return `${message.time} - ${message.status.replaceAll("_", " ")}`;
   }
   return message.time;
+}
+
+function messageBubbleClass(message) {
+  const classes = ["message", message.from];
+  if (message.from === "out" && message.delivery_mode === "local_only") classes.push("local-draft");
+  if (message.from === "out" && message.delivery_mode === "whatsapp_failed") classes.push("failed-send");
+  if (message.type && message.type !== "text") classes.push("rich-message");
+  return classes.join(" ");
+}
+
+function labelForUiType(type) {
+  if (type === "image") return "Image";
+  if (type === "document") return "Document";
+  if (type === "template") return "Template";
+  return type;
 }
 
 function conversationBrief(selected) {
@@ -1149,6 +1188,144 @@ function showToast(message) {
   toast.classList.add("show");
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2300);
+}
+
+function selectedLiveConversation() {
+  return liveConversations().find((item) => item.id === state.selectedConversationId);
+}
+
+function openImageSendModal() {
+  const selected = selectedLiveConversation();
+  if (!selected) {
+    showToast("Select a conversation first.");
+    return;
+  }
+  openModal(
+    "Send image",
+    `
+      <div class="form-grid">
+        <div class="wide">
+          <label class="label">Public image URL</label>
+          <input id="media-image-link" class="field" placeholder="https://..." />
+        </div>
+        <div class="wide">
+          <label class="label">Caption</label>
+          <textarea id="media-image-caption" class="textarea" placeholder="Optional caption"></textarea>
+        </div>
+      </div>
+    `,
+    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="send-image-live">Send image</button>`
+  );
+}
+
+function openDocumentSendModal() {
+  const selected = selectedLiveConversation();
+  if (!selected) {
+    showToast("Select a conversation first.");
+    return;
+  }
+  openModal(
+    "Send document",
+    `
+      <div class="form-grid">
+        <div class="wide">
+          <label class="label">Public document URL</label>
+          <input id="media-document-link" class="field" placeholder="https://..." />
+        </div>
+        <div>
+          <label class="label">Filename</label>
+          <input id="media-document-name" class="field" placeholder="invoice.pdf" />
+        </div>
+        <div class="wide">
+          <label class="label">Caption</label>
+          <textarea id="media-document-caption" class="textarea" placeholder="Optional caption"></textarea>
+        </div>
+      </div>
+    `,
+    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="send-document-live">Send document</button>`
+  );
+}
+
+function openTemplateSendModal() {
+  const selected = selectedLiveConversation();
+  if (!selected) {
+    showToast("Select a conversation first.");
+    return;
+  }
+  openModal(
+    "Send approved template",
+    `
+      <div class="form-grid">
+        <div>
+          <label class="label">Template name</label>
+          <input id="template-live-name" class="field" placeholder="hello_world" />
+        </div>
+        <div>
+          <label class="label">Language code</label>
+          <input id="template-live-language" class="field" placeholder="en_US" value="en_US" />
+        </div>
+        <div class="wide">
+          <label class="label">Variables</label>
+          <input id="template-live-vars" class="field" placeholder="Piyush, #301887" />
+        </div>
+      </div>
+    `,
+    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="send-template-live">Send template</button>`
+  );
+}
+
+function splitVariables(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function sendConversationPayload(payload, { successMessage, pendingDraftClear = true } = {}) {
+  const selected = selectedLiveConversation();
+  if (!selected?.id?.startsWith("wa_")) {
+    showToast("No live conversation selected.");
+    return;
+  }
+
+  const response = await fetch(`${INBOX_API_BASE}/api/inbox/conversations/${encodeURIComponent(selected.id)}/reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (result?.error === "template_required") {
+      showToast("24h window is closed. Send an approved template.");
+      return;
+    }
+    throw new Error(result?.detail || result?.message || result?.error || "Reply failed");
+  }
+
+  if (pendingDraftClear && state.selectedConversationId) {
+    state.replyDrafts[state.selectedConversationId] = "";
+  }
+  inboxLoadedAt = 0;
+  await loadInboxData({ force: true });
+  closeModal();
+
+  if (result?.outbound?.ok) {
+    showToast(successMessage || "Submitted to WhatsApp.");
+    return;
+  }
+
+  if (result?.outbound?.mode === "whatsapp_failed") {
+    showToast(`Meta rejected the send: ${result?.outbound?.reason || "unknown error"}`);
+    return;
+  }
+
+  if (result?.outbound?.reason === "outbound_not_configured") {
+    showToast("Saved locally. Add Meta outbound vars on the live server to send.");
+    return;
+  }
+
+  showToast(result?.outbound?.reason || "Reply saved.");
 }
 
 function closeModal() {
@@ -1384,43 +1561,54 @@ document.addEventListener("click", (event) => {
         return;
       }
       const body = input.value.trim();
-      const selected = liveConversations().find((item) => item.id === state.selectedConversationId);
-      if (selected?.id?.startsWith("wa_")) {
-        fetch(`${INBOX_API_BASE}/api/inbox/conversations/${encodeURIComponent(selected.id)}/reply`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "text", body }),
+      sendConversationPayload({ type: "text", body }, { successMessage: "Reply submitted to WhatsApp." })
+        .then(() => {
+          input.value = "";
         })
-          .then(async (response) => {
-            if (!response.ok) throw new Error("Reply failed");
-            const payload = await response.json();
-            state.replyDrafts[selected.id] = "";
-            input.value = "";
-            inboxLoadedAt = 0;
-            await loadInboxData({ force: true });
-            return payload;
-          })
-          .then((payload) => {
-            if (payload?.outbound?.mode === "whatsapp" && payload?.outbound?.ok) {
-              showToast("Reply submitted to WhatsApp.");
-              return;
-            }
-            if (payload?.outbound?.reason === "outbound_not_configured") {
-              showToast("Reply saved locally. Add Meta outbound vars on Railway to send live.");
-              return;
-            }
-            showToast("Reply saved locally.");
-          })
-          .catch(() => showToast("Could not save reply."));
+        .catch((error) => showToast(error.message || "Could not save reply."));
+    },
+    "attach-image": openImageSendModal,
+    "attach-document": openDocumentSendModal,
+    "attach-template": openTemplateSendModal,
+    "attach-quick-reply": () => showToast("Quick reply block added to the composer draft."),
+    "send-image-live": () => {
+      const link = document.getElementById("media-image-link")?.value?.trim();
+      const caption = document.getElementById("media-image-caption")?.value?.trim();
+      if (!link) {
+        showToast("Add an image URL first.");
         return;
       }
-
-      showToast("No live conversation selected.");
+      sendConversationPayload(
+        { type: "image", link, caption },
+        { successMessage: "Image submitted to WhatsApp.", pendingDraftClear: false }
+      ).catch((error) => showToast(error.message || "Could not send image."));
     },
-    "attach-image": () => showToast("Image attachment UI ready. Meta media upload is the next backend step."),
-    "attach-document": () => showToast("Document attachment UI ready. Meta media upload is the next backend step."),
-    "attach-template": () => showToast("Approved template picker will unlock after template sync."),
-    "attach-quick-reply": () => showToast("Quick reply block added to the composer draft."),
+    "send-document-live": () => {
+      const link = document.getElementById("media-document-link")?.value?.trim();
+      const caption = document.getElementById("media-document-caption")?.value?.trim();
+      const filename = document.getElementById("media-document-name")?.value?.trim();
+      if (!link) {
+        showToast("Add a document URL first.");
+        return;
+      }
+      sendConversationPayload(
+        { type: "document", link, caption, filename },
+        { successMessage: "Document submitted to WhatsApp.", pendingDraftClear: false }
+      ).catch((error) => showToast(error.message || "Could not send document."));
+    },
+    "send-template-live": () => {
+      const template_name = document.getElementById("template-live-name")?.value?.trim();
+      const language = document.getElementById("template-live-language")?.value?.trim() || "en_US";
+      const variables = splitVariables(document.getElementById("template-live-vars")?.value);
+      if (!template_name) {
+        showToast("Add the approved template name.");
+        return;
+      }
+      sendConversationPayload(
+        { type: "template", template_name, language, variables },
+        { successMessage: "Template submitted to WhatsApp.", pendingDraftClear: false }
+      ).catch((error) => showToast(error.message || "Could not send template."));
+    },
     "add-node": () => showToast("Node added to canvas draft."),
     "new-flow": () => showToast("New flow draft created."),
     "previous-page": () => showToast("Previous page"),

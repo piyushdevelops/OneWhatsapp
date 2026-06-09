@@ -37,9 +37,13 @@ WHATSAPP_VERIFY_TOKEN
 META_APP_SECRET
 WHATSAPP_ACCESS_TOKEN
 WHATSAPP_PHONE_NUMBER_ID
+WHATSAPP_BUSINESS_ACCOUNT_ID
 GRAPH_API_VERSION
 DATA_DIR
 DASHBOARD_DIR
+DATABASE_URL
+ORGANIZATION_NAME
+ORGANIZATION_SLUG
 ```
 
 Keep these in the hosting provider's environment settings. Do not put real Meta tokens in frontend files or documentation.
@@ -59,12 +63,49 @@ Subscribe to the WhatsApp webhook message events you need for inbox delivery and
 
 If `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` are set, inbox text replies are sent through Meta's Cloud API from the server.
 
-If those variables are missing, replies are saved locally and still appear in the thread, but are not delivered to WhatsApp.
+The server now supports these outbound reply types:
 
-## Production Upgrade
+- text replies
+- approved templates
+- images by public URL
+- documents by public URL
 
-The current staging server stores webhook events in JSON files. That is fine for a few days of live testing, but production should move to Postgres using the schema in:
+If Meta rejects a send, the dashboard keeps the failed outbound item in the thread and marks it as failed instead of pretending it was delivered.
+
+If the outbound variables are missing, replies are saved locally and still appear in the thread, but are not delivered to WhatsApp.
+
+## Postgres Mode
+
+If `DATABASE_URL` is set, the live server switches from JSON files to Postgres-backed storage automatically and initializes the schema from:
 
 ```txt
 ../inbox-schema.sql
 ```
+
+This gives you:
+
+- conversation history that survives deploys
+- real message status persistence
+- cleaner path to multi-workspace rollout later
+
+If `DATABASE_URL` is not set, the server falls back to local JSON storage.
+
+## Recommended Production Token
+
+Use a permanent Meta system-user token for `WHATSAPP_ACCESS_TOKEN` instead of a temporary user token.
+
+Recommended path:
+
+1. Business Settings -> Users -> System Users
+2. Create or use a system user with WhatsApp permissions
+3. Generate a long-lived token for the same app and business assets
+4. Replace the Railway `WHATSAPP_ACCESS_TOKEN`
+5. Redeploy and confirm `/api/diagnostics/outbound`
+
+## Production Upgrade
+
+For a stable production rollout, use all three together:
+
+- Postgres via `DATABASE_URL`
+- persistent volume only for temporary local fallback files
+- permanent system-user access token
