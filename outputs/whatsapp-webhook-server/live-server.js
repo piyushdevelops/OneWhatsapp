@@ -14,6 +14,15 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DASHBOARD_DIR = process.env.DASHBOARD_DIR || path.join(__dirname, "../whatsapp-dashboard");
 const EVENTS_FILE = process.env.EVENTS_FILE || path.join(DATA_DIR, "webhook-events.jsonl");
 const REPLIES_FILE = process.env.REPLIES_FILE || path.join(DATA_DIR, "local-replies.json");
+let webhookDiagnostics = {
+  last_verify_at: "",
+  last_verify_ok: null,
+  last_verify_mode: "",
+  last_post_at: "",
+  last_post_ok: null,
+  last_post_reason: "",
+  last_post_summary: null,
+};
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -425,9 +434,12 @@ function serveStatic(req, parsed, res) {
     return sendText(res, 403, "Forbidden");
   }
 
+  const htmlVariant = path.extname(resolved) ? "" : `${resolved}.html`;
   const target = fs.existsSync(resolved) && fs.statSync(resolved).isFile()
     ? resolved
-    : path.join(DASHBOARD_DIR, "index.html");
+    : htmlVariant && fs.existsSync(htmlVariant) && fs.statSync(htmlVariant).isFile()
+      ? htmlVariant
+      : path.join(DASHBOARD_DIR, "index.html");
 
   if (!fs.existsSync(target)) {
     return sendText(res, 404, "Not found");
@@ -448,10 +460,24 @@ async function handleWebhook(req, res, parsed) {
     const mode = parsed.query["hub.mode"];
     const token = parsed.query["hub.verify_token"];
     const challenge = parsed.query["hub.challenge"];
+    const ok = Boolean(mode === "subscribe" && token === VERIFY_TOKEN && challenge);
 
-    if (mode === "subscribe" && token === VERIFY_TOKEN && challenge) {
+    webhookDiagnostics = {
+      ...webhookDiagnostics,
+      last_verify_at: new Date().toISOString(),
+      last_verify_ok: ok,
+      last_verify_mode: mode || "",
+    };
+
+    if (ok) {
+      console.log(
+        `[webhook.verify] ok mode=${mode} at=${webhookDiagnostics.last_verify_at}`
+      );
       return sendText(res, 200, String(challenge));
     }
+    console.log(
+      `[webhook.verify] failed mode=${mode || "unknown"} reason=invalid_verify_token at=${webhookDiagnostics.last_verify_at}`
+    );
     return sendJson(res, 403, { error: "invalid_verify_token" });
   }
 
@@ -459,17 +485,50 @@ async function handleWebhook(req, res, parsed) {
     try {
       const rawBody = await readBody(req);
       const signature = verifyMetaSignature(req, rawBody);
-      if (!signature.ok) return sendJson(res, 401, { error: signature.reason });
+      if (!signature.ok) {
+        webhookDiagnostics = {
+          ...webhookDiagnostics,
+          last_post_at: new Date().toISOString(),
+          last_post_ok: false,
+          last_post_reason: signature.reason,
+          last_post_summary: null,
+        };
+        console.log(
+          `[webhook.post] rejected reason=${signature.reason} at=${webhookDiagnostics.last_post_at}`
+        );
+        return sendJson(res, 401, { error: signature.reason });
+      }
 
       const payload = rawBody ? JSON.parse(rawBody) : {};
+      const summary = extractSummary(payload);
       appendEvent({
         received_at: new Date().toISOString(),
         signature_checked: !signature.skipped,
-        summary: extractSummary(payload),
+        summary,
         payload,
       });
+      webhookDiagnostics = {
+        ...webhookDiagnostics,
+        last_post_at: new Date().toISOString(),
+        last_post_ok: true,
+        last_post_reason: signature.skipped ? "signature_skipped" : "accepted",
+        last_post_summary: summary,
+      };
+      console.log(
+        `[webhook.post] accepted messages=${summary.messages.length} statuses=${summary.statuses.length} contacts=${summary.contacts.length} at=${webhookDiagnostics.last_post_at}`
+      );
       return sendJson(res, 200, { ok: true });
-    } catch {
+    } catch (error) {
+      webhookDiagnostics = {
+        ...webhookDiagnostics,
+        last_post_at: new Date().toISOString(),
+        last_post_ok: false,
+        last_post_reason: "invalid_payload",
+        last_post_summary: null,
+      };
+      console.log(
+        `[webhook.post] invalid_payload at=${webhookDiagnostics.last_post_at} error=${error?.message || "unknown"}`
+      );
       return sendJson(res, 400, { error: "invalid_payload" });
     }
   }
@@ -573,7 +632,12 @@ const server = http.createServer(async (req, res) => {
       webhook: "/webhooks/whatsapp",
       api: "/api/inbox/conversations",
       outbound: outboundConfig(),
+      webhook_diagnostics: webhookDiagnostics,
     });
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/webhook") {
+    return sendJson(res, 200, webhookDiagnostics);
   }
 
   if (parsed.pathname === "/webhooks/whatsapp") {

@@ -8,8 +8,9 @@ const state = {
   search: "",
 };
 
-const isLocalStaticPreview = ["127.0.0.1:4173", "localhost:4173"].includes(window.location.host);
-const defaultInboxApiBase = isLocalStaticPreview ? "http://127.0.0.1:8792" : window.location.origin;
+const isLoopbackHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
+const isLocalApiHost = isLoopbackHost && ["8790", "8792", "3000"].includes(window.location.port);
+const defaultInboxApiBase = isLoopbackHost && !isLocalApiHost ? "http://127.0.0.1:8792" : window.location.origin;
 const INBOX_API_BASE = window.ONEOPS_CONFIG?.inboxApiBase || defaultInboxApiBase;
 let inboxConversations = [];
 let inboxLoading = false;
