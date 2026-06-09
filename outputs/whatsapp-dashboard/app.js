@@ -16,6 +16,11 @@ let inboxLoading = false;
 let inboxLoadedAt = 0;
 let inboxLastError = "";
 let inboxPollTimer = null;
+let systemStatus = {
+  outboundMode: "local_only",
+  outboundEnabled: false,
+  healthLoaded: false,
+};
 
 function formatClientRelative(iso) {
   const diff = Date.now() - new Date(iso).getTime();
@@ -26,6 +31,27 @@ function formatClientRelative(iso) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h`;
   return `${Math.floor(hours / 24)}d`;
+}
+
+async function loadSystemStatus() {
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/health`);
+    if (!response.ok) throw new Error(`Health API returned ${response.status}`);
+    const payload = await response.json();
+    systemStatus = {
+      outboundMode: payload.outbound?.mode || "local_only",
+      outboundEnabled: Boolean(payload.outbound?.enabled),
+      healthLoaded: true,
+    };
+  } catch {
+    systemStatus = {
+      outboundMode: "local_only",
+      outboundEnabled: false,
+      healthLoaded: false,
+    };
+  } finally {
+    if (state.screen === "inbox") render();
+  }
 }
 
 function normalizeInboxConversation(item) {
@@ -748,6 +774,7 @@ function renderInbox() {
   state.selectedConversationId = selected.id;
   const brief = conversationBrief(selected);
   const isLiveWebhookConversation = selected?.id?.startsWith("wa_");
+  const canSendToWhatsApp = isLiveWebhookConversation && systemStatus.outboundEnabled;
   const inboxStatus = inboxConversations.length
     ? `${inboxConversations.length} live webhook conversation${inboxConversations.length === 1 ? "" : "s"}`
     : inboxLoading
@@ -802,9 +829,9 @@ function renderInbox() {
           </div>
           <div class="composer-row">
             <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" />
-            <button class="primary-button" data-action="send-reply">${isLiveWebhookConversation ? "Save local" : "Send"}</button>
+            <button class="primary-button" data-action="send-reply">${canSendToWhatsApp ? "Send" : isLiveWebhookConversation ? "Save local" : "Send"}</button>
           </div>
-          <div class="composer-note">${isLiveWebhookConversation ? "Saved replies appear in the thread. WhatsApp delivery needs the regenerated Meta token." : "Demo conversation mode."}</div>
+          <div class="composer-note">${canSendToWhatsApp ? "Replies from this composer go to WhatsApp through Meta Cloud API." : isLiveWebhookConversation ? "Saved replies appear in the thread until Meta outbound is configured on the server." : "Demo conversation mode."}</div>
         </div>
       </section>
       <aside class="profile-panel">
@@ -837,6 +864,7 @@ function renderInbox() {
           ${profileRow("Unread", String(selected.unread || 0))}
           ${profileRow("Latest inbound", selected.preview || "-")}
           ${profileRow("Service window", brief.window)}
+          ${profileRow("Reply mode", canSendToWhatsApp ? "WhatsApp live" : "Local only")}
           ${profileRow("Assigned to", "Unassigned")}
           <div class="timeline-card">
             <span>Timeline</span>
@@ -859,6 +887,9 @@ function messageContent(message) {
 function messageMeta(message) {
   if (message.from === "out" && message.status === "local") {
     return `${message.time} - saved locally`;
+  }
+  if (message.from === "out" && message.status === "submitted") {
+    return `${message.time} - submitted to WhatsApp`;
   }
   if (message.from === "out" && message.status) {
     return `${message.time} - ${message.status}`;
@@ -1327,13 +1358,25 @@ document.addEventListener("click", (event) => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ type: "text", body }),
         })
-          .then((response) => {
+          .then(async (response) => {
             if (!response.ok) throw new Error("Reply failed");
+            const payload = await response.json();
             input.value = "";
             inboxLoadedAt = 0;
-            return loadInboxData({ force: true });
+            await loadInboxData({ force: true });
+            return payload;
           })
-          .then(() => showToast("Reply saved locally, not sent to WhatsApp yet."))
+          .then((payload) => {
+            if (payload?.outbound?.mode === "whatsapp" && payload?.outbound?.ok) {
+              showToast("Reply submitted to WhatsApp.");
+              return;
+            }
+            if (payload?.outbound?.reason === "outbound_not_configured") {
+              showToast("Reply saved locally. Add Meta outbound vars on Railway to send live.");
+              return;
+            }
+            showToast("Reply saved locally.");
+          })
           .catch(() => showToast("Could not save reply."));
         return;
       }
@@ -1372,4 +1415,5 @@ document.addEventListener("keydown", (event) => {
 });
 
 render();
+loadSystemStatus();
 loadInboxData({ force: true });

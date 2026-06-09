@@ -35,6 +35,9 @@ Local reply API:  https://your-domain.com/api/inbox/conversations/:id/reply
 PORT
 WHATSAPP_VERIFY_TOKEN
 META_APP_SECRET
+WHATSAPP_ACCESS_TOKEN
+WHATSAPP_PHONE_NUMBER_ID
+GRAPH_API_VERSION
 DATA_DIR
 DASHBOARD_DIR
 ```
@@ -52,11 +55,11 @@ Verify token: the exact value from WHATSAPP_VERIFY_TOKEN
 
 Subscribe to the WhatsApp webhook message events you need for inbox delivery and status updates.
 
-## Current Limitation
+## Outbound Replies
 
-Outbound replies are still saved locally and shown in the thread. They are not delivered to WhatsApp yet.
+If `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` are set, inbox text replies are sent through Meta's Cloud API from the server.
 
-Next backend step: add a secure `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID`, then call Meta's `/messages` endpoint from the server only.
+If those variables are missing, replies are saved locally and still appear in the thread, but are not delivered to WhatsApp.
 
 ## Production Upgrade
 

@@ -7,6 +7,9 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "local-dev-verify-token";
 const APP_SECRET = process.env.META_APP_SECRET || "";
+const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || "";
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DASHBOARD_DIR = process.env.DASHBOARD_DIR || path.join(__dirname, "../whatsapp-dashboard");
 const EVENTS_FILE = process.env.EVENTS_FILE || path.join(DATA_DIR, "webhook-events.jsonl");
@@ -131,6 +134,16 @@ function writeReplies(replies) {
   fs.writeFileSync(REPLIES_FILE, JSON.stringify(replies, null, 2));
 }
 
+function outboundConfig() {
+  const enabled = Boolean(WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID);
+  return {
+    enabled,
+    mode: enabled ? "whatsapp" : "local_only",
+    graph_api_version: GRAPH_API_VERSION,
+    phone_number_id_configured: Boolean(WHATSAPP_PHONE_NUMBER_ID),
+  };
+}
+
 function extractSummary(payload) {
   const entries = payload.entry || [];
   const changes = entries.flatMap((entry) => entry.changes || []);
@@ -201,6 +214,55 @@ function classifyIntent(text) {
   if (value.includes("cod") || value.includes("payment") || value.includes("prepaid")) return "payment";
   if (value.includes("hi") || value.includes("hello")) return "new_message";
   return "general_support";
+}
+
+async function sendWhatsAppTextMessage(conversation, body) {
+  const config = outboundConfig();
+  if (!config.enabled) {
+    return {
+      ok: false,
+      localOnly: true,
+      reason: "outbound_not_configured",
+    };
+  }
+
+  const response = await fetch(
+    `https://graph.facebook.com/${GRAPH_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: conversation.wa_id,
+        type: "text",
+        text: {
+          preview_url: false,
+          body,
+        },
+      }),
+    }
+  );
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return {
+      ok: false,
+      localOnly: false,
+      reason: payload?.error?.message || `meta_http_${response.status}`,
+      payload,
+    };
+  }
+
+  return {
+    ok: true,
+    localOnly: false,
+    providerMessageId: payload?.messages?.[0]?.id || "",
+    payload,
+  };
 }
 
 function buildInbox() {
@@ -297,12 +359,13 @@ function buildInbox() {
     if (!conversation) continue;
     conversation.messages.push({
       id: reply.id,
+      provider_message_id: reply.provider_message_id || "",
       direction: "outbound",
       from: "out",
       type: "text",
       text: reply.body,
       body: reply.body,
-      status: "local",
+      status: reply.status || "local",
       time: formatRelative(reply.created_at),
       created_at: reply.created_at,
     });
@@ -342,6 +405,7 @@ function conversationResponse(conversation) {
       expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
       allowed_reply_modes: ["freeform", "template"],
     },
+    outbound: outboundConfig(),
     suggested_reply: {
       body: suggestedReply(conversation),
       confidence: 0.74,
@@ -448,26 +512,47 @@ async function handleApi(req, res, parsed) {
 
   const replyMatch = parsed.pathname.match(/^\/api\/inbox\/conversations\/([^/]+)\/reply$/);
   if (req.method === "POST" && replyMatch) {
-    const rawBody = await readBody(req, 1_000_000);
-    const body = rawBody ? JSON.parse(rawBody) : {};
-    if (!body.body || typeof body.body !== "string") {
-      return sendJson(res, 400, { error: "body_required" });
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      if (!body.body || typeof body.body !== "string") {
+        return sendJson(res, 400, { error: "body_required" });
+      }
+      const conversation = buildInbox().find((item) => item.id === decodeURIComponent(replyMatch[1]));
+      if (!conversation) return sendJson(res, 404, { error: "conversation_not_found" });
+
+      const outbound = await sendWhatsAppTextMessage(conversation, body.body);
+      const reply = {
+        id: `local_${Date.now()}`,
+        conversation_id: decodeURIComponent(replyMatch[1]),
+        body: body.body,
+        provider_message_id: outbound.providerMessageId || "",
+        status: outbound.ok ? "submitted" : "local",
+        delivery_mode: outbound.ok ? "whatsapp" : "local_only",
+        created_at: new Date().toISOString(),
+      };
+      const replies = readReplies();
+      replies.push(reply);
+      writeReplies(replies);
+      return sendJson(res, 200, {
+        message: {
+          id: reply.id,
+          status: reply.status,
+          delivery_mode: reply.delivery_mode,
+          provider_message_id: reply.provider_message_id,
+        },
+        outbound: {
+          ok: outbound.ok,
+          mode: reply.delivery_mode,
+          reason: outbound.reason || "",
+        },
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        error: "reply_failed",
+        detail: error.message || "unknown_error",
+      });
     }
-    const reply = {
-      id: `local_${Date.now()}`,
-      conversation_id: decodeURIComponent(replyMatch[1]),
-      body: body.body,
-      created_at: new Date().toISOString(),
-    };
-    const replies = readReplies();
-    replies.push(reply);
-    writeReplies(replies);
-    return sendJson(res, 200, {
-      message: {
-        id: reply.id,
-        status: "local",
-      },
-    });
   }
 
   return sendJson(res, 404, { error: "not_found" });
@@ -487,6 +572,7 @@ const server = http.createServer(async (req, res) => {
       dashboard: true,
       webhook: "/webhooks/whatsapp",
       api: "/api/inbox/conversations",
+      outbound: outboundConfig(),
     });
   }
 
