@@ -1,7 +1,7 @@
 -- WhatsApp Inbox MVP schema
 -- Target: Postgres 14+
 
-create table organizations (
+create table if not exists organizations (
   id uuid primary key,
   name text not null,
   slug text not null unique,
@@ -9,7 +9,7 @@ create table organizations (
   updated_at timestamptz not null default now()
 );
 
-create table team_users (
+create table if not exists team_users (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   name text not null,
@@ -21,7 +21,7 @@ create table team_users (
   unique (organization_id, email)
 );
 
-create table whatsapp_channels (
+create table if not exists whatsapp_channels (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   waba_id text not null,
@@ -38,7 +38,7 @@ create table whatsapp_channels (
   unique (organization_id, phone_number_id)
 );
 
-create table contacts (
+create table if not exists contacts (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   wa_id text,
@@ -55,7 +55,7 @@ create table contacts (
   unique (organization_id, phone_e164)
 );
 
-create table conversations (
+create table if not exists conversations (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   channel_id uuid not null references whatsapp_channels(id) on delete cascade,
@@ -75,7 +75,7 @@ create table conversations (
   updated_at timestamptz not null default now()
 );
 
-create table messages (
+create table if not exists messages (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   channel_id uuid not null references whatsapp_channels(id) on delete cascade,
@@ -103,11 +103,11 @@ create table messages (
   updated_at timestamptz not null default now()
 );
 
-create unique index messages_provider_message_id_uidx
+create unique index if not exists messages_provider_message_id_uidx
   on messages (organization_id, provider_message_id)
   where provider_message_id is not null;
 
-create table webhook_events (
+create table if not exists webhook_events (
   id uuid primary key,
   organization_id uuid references organizations(id) on delete cascade,
   channel_id uuid references whatsapp_channels(id) on delete set null,
@@ -123,7 +123,7 @@ create table webhook_events (
   unique (provider, event_fingerprint)
 );
 
-create table conversation_notes (
+create table if not exists conversation_notes (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   conversation_id uuid not null references conversations(id) on delete cascade,
@@ -132,7 +132,7 @@ create table conversation_notes (
   created_at timestamptz not null default now()
 );
 
-create table tags (
+create table if not exists tags (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   name text not null,
@@ -141,14 +141,14 @@ create table tags (
   unique (organization_id, name)
 );
 
-create table conversation_tags (
+create table if not exists conversation_tags (
   conversation_id uuid not null references conversations(id) on delete cascade,
   tag_id uuid not null references tags(id) on delete cascade,
   created_at timestamptz not null default now(),
   primary key (conversation_id, tag_id)
 );
 
-create table audit_logs (
+create table if not exists audit_logs (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   actor_user_id uuid references team_users(id) on delete set null,
@@ -159,12 +159,12 @@ create table audit_logs (
   created_at timestamptz not null default now()
 );
 
-create index contacts_org_last_inbound_idx on contacts (organization_id, last_inbound_at desc);
-create index conversations_org_status_last_idx on conversations (organization_id, status, last_message_at desc);
-create index conversations_assignee_idx on conversations (organization_id, assigned_to_user_id, status);
-create index messages_conversation_created_idx on messages (conversation_id, created_at asc);
-create index messages_status_idx on messages (organization_id, status, created_at desc);
-create index webhook_events_status_idx on webhook_events (processing_status, received_at asc);
+create index if not exists contacts_org_last_inbound_idx on contacts (organization_id, last_inbound_at desc);
+create index if not exists conversations_org_status_last_idx on conversations (organization_id, status, last_message_at desc);
+create index if not exists conversations_assignee_idx on conversations (organization_id, assigned_to_user_id, status);
+create index if not exists messages_conversation_created_idx on messages (conversation_id, created_at asc);
+create index if not exists messages_status_idx on messages (organization_id, status, created_at desc);
+create index if not exists webhook_events_status_idx on webhook_events (processing_status, received_at asc);
 
 -- Optional seed for local MVP development.
 insert into organizations (id, name, slug)

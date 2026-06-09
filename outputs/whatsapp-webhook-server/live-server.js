@@ -185,6 +185,15 @@ function splitSqlStatements(sql) {
     .filter(Boolean);
 }
 
+function isIgnorableSchemaError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("already exists") ||
+    message.includes("duplicate key value violates unique constraint") ||
+    message.includes("multiple primary keys")
+  );
+}
+
 function safeJsonParse(value, fallback = {}) {
   if (!value) return fallback;
   if (typeof value === "object") return value;
@@ -1323,7 +1332,15 @@ function createPostgresStorage() {
     async init() {
       const schemaSql = fs.readFileSync(SCHEMA_FILE, "utf8");
       for (const statement of splitSqlStatements(schemaSql)) {
-        await query(statement);
+        try {
+          await query(statement);
+        } catch (error) {
+          if (isIgnorableSchemaError(error)) {
+            console.log(`[storage] schema skip: ${error.message}`);
+            continue;
+          }
+          throw error;
+        }
       }
       await ensureOrganization();
       if (WHATSAPP_PHONE_NUMBER_ID) {
