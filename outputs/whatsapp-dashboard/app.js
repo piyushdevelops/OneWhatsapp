@@ -1245,7 +1245,14 @@ function showToast(message) {
 }
 
 function selectedLiveConversation() {
-  return liveConversations().find((item) => item.id === state.selectedConversationId);
+  const conversations = liveConversations();
+  if (!conversations.length) return null;
+
+  const selected = conversations.find((item) => item.id === state.selectedConversationId);
+  if (selected) return selected;
+
+  state.selectedConversationId = conversations[0].id;
+  return conversations[0];
 }
 
 function openImageSendModal() {
