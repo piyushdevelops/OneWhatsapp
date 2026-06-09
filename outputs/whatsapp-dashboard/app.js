@@ -20,6 +20,7 @@ let inboxLoading = false;
 let inboxLoadedAt = 0;
 let inboxLastError = "";
 let inboxPollTimer = null;
+let inboxDataSignature = "";
 let systemStatus = {
   outboundMode: "local_only",
   outboundEnabled: false,
@@ -173,12 +174,35 @@ function isLiveConversation(item) {
   );
 }
 
+function conversationSignature(item) {
+  return {
+    id: item.id,
+    preview: item.preview,
+    unread: item.unread,
+    time: item.time,
+    status: item.status,
+    serviceWindow: item.serviceWindow,
+    messages: (item.messages || []).map((message) => [
+      message.provider_message_id || message.id || "",
+      message.from,
+      message.text,
+      message.status,
+      message.created_at,
+    ]),
+  };
+}
+
+function inboxSignature(conversations) {
+  return JSON.stringify(conversations.map(conversationSignature));
+}
+
 async function loadInboxData({ force = false } = {}) {
   if (inboxLoading) return;
   if (!force && Date.now() - inboxLoadedAt < 1000) return;
 
   inboxLoading = true;
   inboxLastError = "";
+  let shouldRender = true;
 
   try {
     const listResponse = await fetch(`${INBOX_API_BASE}/api/inbox/conversations`);
@@ -187,8 +211,12 @@ async function loadInboxData({ force = false } = {}) {
     const items = listPayload.items || [];
 
     if (!items.length) {
+      const nextSignature = "[]";
+      const changed = inboxDataSignature !== nextSignature || inboxConversations.length !== 0;
       inboxConversations = [];
+      inboxDataSignature = nextSignature;
       inboxLoadedAt = Date.now();
+      if (!changed && force) shouldRender = false;
       return;
     }
 
@@ -204,21 +232,27 @@ async function loadInboxData({ force = false } = {}) {
       selectedDetail = await detailResponse.json();
     }
 
-    inboxConversations = items.map((item) => {
+    const nextConversations = items.map((item) => {
       if (selectedDetail && item.id === selectedDetail.id) {
         return normalizeInboxConversation(mergeConversationSummary(item, selectedDetail));
       }
       return normalizeInboxConversation(item);
     });
+    const nextSignature = inboxSignature(nextConversations);
+    const changed = nextSignature !== inboxDataSignature;
+    inboxConversations = nextConversations;
+    inboxDataSignature = nextSignature;
     inboxLoadedAt = Date.now();
+    if (!changed && force) shouldRender = false;
   } catch (error) {
     inboxLastError = error.message || "Inbox API unavailable";
+    inboxDataSignature = "";
     inboxConversations = [];
     inboxLoadedAt = Date.now();
   } finally {
     inboxLoading = false;
     updateNavCounts();
-    if (["dashboard", "audience", "inbox"].includes(state.screen)) render();
+    if (shouldRender && ["dashboard", "audience", "inbox"].includes(state.screen)) render();
   }
 }
 
@@ -228,7 +262,7 @@ function ensureInboxPolling() {
     if (state.screen === "inbox") {
       loadInboxData({ force: true });
     }
-  }, 2000);
+  }, 4500);
 }
 
 function updateNavCounts() {
@@ -388,35 +422,62 @@ function setScreen(next) {
   render();
 }
 
-function captureComposerState() {
-  const input = document.getElementById("reply-input");
-  if (!input || state.screen !== "inbox" || !state.selectedConversationId) return null;
+function captureInboxUiState() {
+  if (state.screen !== "inbox" || !state.selectedConversationId) return null;
 
-  state.replyDrafts[state.selectedConversationId] = input.value;
+  const replyInput = document.getElementById("reply-input");
+  const copilotInput = document.getElementById("copilot-prompt");
+  const messages = document.querySelector(".messages");
+  const active = document.activeElement;
 
-  if (document.activeElement !== input) return null;
+  if (replyInput) state.replyDrafts[state.selectedConversationId] = replyInput.value;
+  if (copilotInput) state.copilotPrompts[state.selectedConversationId] = copilotInput.value;
 
   return {
     conversationId: state.selectedConversationId,
-    selectionStart: input.selectionStart ?? input.value.length,
-    selectionEnd: input.selectionEnd ?? input.value.length,
+    activeId: active?.id || "",
+    selectionStart: active?.selectionStart ?? null,
+    selectionEnd: active?.selectionEnd ?? null,
+    messageScrollTop: messages?.scrollTop ?? 0,
+    messageScrollHeight: messages?.scrollHeight ?? 0,
+    messageClientHeight: messages?.clientHeight ?? 0,
+    wasNearBottom: messages
+      ? messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48
+      : true,
   };
 }
 
-function restoreComposerState(snapshot) {
+function restoreInboxUiState(snapshot) {
   if (!snapshot || state.screen !== "inbox" || snapshot.conversationId !== state.selectedConversationId) return;
-  const input = document.getElementById("reply-input");
-  if (!input) return;
-  input.focus();
-  const end = input.value.length;
-  input.setSelectionRange(
-    Math.min(snapshot.selectionStart, end),
-    Math.min(snapshot.selectionEnd, end)
-  );
+  const messages = document.querySelector(".messages");
+  if (messages) {
+    if (snapshot.wasNearBottom) {
+      messages.scrollTop = messages.scrollHeight;
+    } else {
+      const heightDelta = messages.scrollHeight - snapshot.messageScrollHeight;
+      messages.scrollTop = Math.max(0, snapshot.messageScrollTop + heightDelta);
+    }
+  }
+
+  if (!snapshot.activeId) return;
+  const active = document.getElementById(snapshot.activeId);
+  if (!active || typeof active.focus !== "function") return;
+  active.focus({ preventScroll: true });
+  if (
+    typeof active.setSelectionRange === "function"
+    && snapshot.selectionStart !== null
+    && snapshot.selectionEnd !== null
+  ) {
+    const end = active.value.length;
+    active.setSelectionRange(
+      Math.min(snapshot.selectionStart, end),
+      Math.min(snapshot.selectionEnd, end)
+    );
+  }
 }
 
 function render() {
-  const composerSnapshot = captureComposerState();
+  const inboxSnapshot = captureInboxUiState();
   const [title, subtitle] = screenMeta[state.screen];
   pageTitle.textContent = title;
   pageSubtitle.textContent = subtitle;
@@ -436,7 +497,7 @@ function render() {
 
   screen.innerHTML = renderers[state.screen]();
   screen.className = `screen screen-${state.screen}`;
-  restoreComposerState(composerSnapshot);
+  restoreInboxUiState(inboxSnapshot);
 }
 
 function renderActions(current) {
