@@ -1,0 +1,16 @@
+{
+  "name": "oneoperations-whatsapp-live",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OneOperations WhatsApp dashboard, webhook, and inbox API server.",
+  "main": "live-server.js",
+  "scripts": {
+    "start": "node live-server.js",
+    "start:live": "node live-server.js",
+    "start:webhook": "node server.js",
+    "start:api": "node inbox-api-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
