@@ -7,8 +7,10 @@ const state = {
   selectedFlowNode: "incoming-message",
   search: "",
   replyDrafts: {},
+  copilotPrompts: {},
 };
 
+const BRAND_NAME = "The June Shop";
 const isLoopbackHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
 const isStaticDevHost = isLoopbackHost && ["4173", "5173", "5174"].includes(window.location.port);
 const defaultInboxApiBase = isStaticDevHost ? "http://127.0.0.1:8792" : window.location.origin;
@@ -309,7 +311,7 @@ const automationFlow = [
     id: "incoming-message",
     title: "Incoming WhatsApp message",
     type: "Trigger",
-    detail: "Starts when Meta sends a new webhook message from a customer.",
+    detail: "Starts when a customer sends a WhatsApp message.",
     status: "Live",
     tone: "green",
     x: 70,
@@ -348,14 +350,14 @@ const automationFlow = [
 ];
 
 const screenMeta = {
-  dashboard: ["Command Center", "Live WhatsApp signals from your connected webhook."],
-  audience: ["Customers", "Only contacts received from your live WhatsApp webhook."],
+  dashboard: ["Command Center", "Live WhatsApp signals for The June Shop."],
+  audience: ["Customers", "Only real WhatsApp customers appear here."],
   broadcasts: ["Campaigns", "Build Meta-compliant WhatsApp campaign drafts before connecting sends."],
   templates: ["Templates", "Show approved Meta templates only after template sync is connected."],
   journeys: ["Automations", "A working flow map for routing live WhatsApp conversations."],
   inbox: ["Inbox", "Shared WhatsApp conversations with customer context and next-best action."],
   bot: ["Studio", "Design, inspect and improve WhatsApp automation flows."],
-  settings: ["Account Settings", "Assignment rules, working hours and support automation settings."],
+  settings: ["Account Settings", "Working hours, support rules and live platform diagnostics."],
 };
 
 const screen = document.getElementById("screen");
@@ -433,6 +435,7 @@ function render() {
   };
 
   screen.innerHTML = renderers[state.screen]();
+  screen.className = `screen screen-${state.screen}`;
   restoreComposerState(composerSnapshot);
 }
 
@@ -478,7 +481,7 @@ function renderDashboard() {
   const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
   const outboundLabel = systemStatus.outboundEnabled ? "WhatsApp live" : "Local only";
   const outboundCopy = systemStatus.outboundEnabled
-    ? "Dashboard replies are being handed to Meta Cloud API, with status webhooks updating the thread."
+    ? "Dashboard replies are being sent through WhatsApp, with delivery status updating the thread."
     : "Dashboard replies are saved locally until a secure Meta token is configured.";
   const lastMessage = latest
     ? `${latest.name}: ${latest.preview}`
@@ -491,7 +494,7 @@ function renderDashboard() {
       <section class="live-command">
         <div class="command-intro">
           <span class="eyebrow">Live workspace</span>
-          <h2>The dashboard is now clean: only webhook conversations and local drafts are shown.</h2>
+          <h2>The dashboard is now clean: only real customer conversations and drafts are shown.</h2>
           <p>${escapeHtml(lastMessage)}</p>
           <div class="hero-actions">
             <button class="primary-button" data-screen-shortcut="inbox">Open live inbox</button>
@@ -499,7 +502,7 @@ function renderDashboard() {
           </div>
         </div>
         <div class="metric-grid three">
-          ${metric("Webhook conversations", stats.conversations, latest ? `${latest.time} latest activity` : "No customer message yet")}
+          ${metric("Customer conversations", stats.conversations, latest ? `${latest.time} latest activity` : "No customer message yet")}
           ${metric("Unread customer messages", stats.unread, stats.unread ? "Needs reply" : "All clear", stats.unread ? "warn" : "")}
           ${metric("Inbox API", stats.apiState, inboxLastError || "Local backend connected", healthTone === "red" ? "warn" : "")}
         </div>
@@ -510,7 +513,7 @@ function renderDashboard() {
           <div class="section-title">Current Signals</div>
           <section class="panel pad">
             <div class="signal-list">
-              ${commandSignal("Webhook intake", stats.apiState, inboxLastError ? inboxLastError : "Receiving Meta webhook conversations into the local inbox.", healthTone)}
+              ${commandSignal("Customer chat intake", stats.apiState, inboxLastError ? inboxLastError : "Receiving live WhatsApp conversations into your inbox.", healthTone)}
               ${commandSignal("Outbound delivery", outboundLabel, outboundCopy, outboundTone)}
               ${commandSignal("Templates", syncedTemplates.length ? `${syncedTemplates.length} synced` : "Not synced", "No real template sync is connected yet, so template tables stay empty.", "blue")}
             </div>
@@ -526,8 +529,8 @@ function renderDashboard() {
           <div class="section-title">Setup Reality</div>
           <div class="move-stack">
             <article class="move-card">
-              <h3>Webhook receiving</h3>
-              <p>Meta can deliver inbound messages to this local dashboard through the tunnel.</p>
+              <h3>WhatsApp receiving</h3>
+              <p>Customer messages are arriving in the shared TJS inbox.</p>
               <span class="badge ${healthTone}">${escapeHtml(stats.apiState)}</span>
             </article>
             <article class="move-card">
@@ -694,10 +697,10 @@ function renderAudience() {
         <input class="search" data-search placeholder="Search live customers by name, phone, or message" value="${escapeHtml(state.search)}" />
         <div class="toolbar-right">
           <span class="badge blue">${customers.length} live customer${customers.length === 1 ? "" : "s"}</span>
-          <span class="badge gray">Source: WhatsApp webhook</span>
+          <span class="badge gray">Source: WhatsApp</span>
         </div>
       </div>
-      ${customers.length ? renderCustomersTable(customers) : emptyPanel("No live customers yet", "Customers will appear here only after Meta sends a webhook event into this dashboard.")}
+      ${customers.length ? renderCustomersTable(customers) : emptyPanel("No live customers yet", "Customers will appear here after they message The June Shop on WhatsApp.")}
     </div>
   `;
 }
@@ -734,7 +737,7 @@ function renderBroadcasts() {
         <div class="campaign-head">
           <div>
             <span class="eyebrow">Meta-ready campaign design</span>
-            <h2>Build drafts around what WhatsApp Cloud API can actually send.</h2>
+            <h2>Build drafts around what WhatsApp can actually send.</h2>
             <p>Broadcast sends need approved templates and opt-in. Free-form text or attachments are only for customers inside the service window.</p>
           </div>
           <button class="primary-button" data-action="open-broadcast-modal">Create campaign draft</button>
@@ -801,7 +804,7 @@ function renderJourneys() {
   return `
     <div class="page-stack">
       <div class="metric-grid three">
-        ${metric("Live webhook trigger", "1", "Incoming WhatsApp message")}
+        ${metric("New message trigger", "1", "Incoming WhatsApp message")}
         ${metric("Auto-sent messages", "0", "Human review is required")}
         ${metric("Flow status", "Draft", "Ready to connect outbound token", "warn")}
       </div>
@@ -860,22 +863,18 @@ function renderInbox() {
   if (!activeConversations.length) {
     return `
       <div class="inbox-shell">
-        <aside class="inbox-rail">
-          <div class="rail-logo">TJS</div>
-        </aside>
         <aside class="inbox-list">
           <div class="inbox-list-head">
             <input class="dark-search" placeholder="Search messages in conversations" />
-            <div class="conversation-tabs">
-              <button>Mine <span class="badge gray">0</span></button>
-              <button>Unassigned <span class="badge gray">0</span></button>
-              <button class="active">All <span class="badge blue">0</span></button>
+            <div class="conversation-tabs single-agent-tabs">
+              <button class="active">Customers <span class="badge blue">0</span></button>
+              <button>Needs reply <span class="badge gray">0</span></button>
             </div>
-            <div class="inbox-source">${escapeHtml(inboxLoading ? "Loading live webhook inbox" : inboxLastError || "Waiting for webhook messages")}</div>
+            <div class="inbox-source">${escapeHtml(inboxLoading ? "Loading customer conversations" : inboxLastError || "Waiting for the first customer message")}</div>
           </div>
         </aside>
         <section class="chat-panel blank-chat">
-          ${emptyPanel("No live WhatsApp conversations yet", "Send a WhatsApp message to the connected number. It will appear here from the Meta webhook.")}
+          ${emptyPanel("No customer conversations yet", "New WhatsApp chats will appear here as soon as customers write in.")}
         </section>
       </div>
     `;
@@ -887,6 +886,7 @@ function renderInbox() {
   const isLiveWebhookConversation = isLiveConversation(selected);
   const canSendToWhatsApp = isLiveWebhookConversation && systemStatus.outboundEnabled;
   const replyDraft = state.replyDrafts[selected.id] || "";
+  const copilotPrompt = state.copilotPrompts[selected.id] || "";
   const visibleMessages = selected.messages?.length
     ? selected.messages
     : selected.preview
@@ -900,34 +900,22 @@ function renderInbox() {
           delivery_mode: "whatsapp",
         }]
       : [];
+  const awaitingCount = activeConversations.filter((item) => Number(item.unread || 0) > 0).length;
   const inboxStatus = inboxConversations.length
-    ? `${inboxConversations.length} live webhook conversation${inboxConversations.length === 1 ? "" : "s"}`
+    ? `${inboxConversations.length} customer conversation${inboxConversations.length === 1 ? "" : "s"}`
     : inboxLoading
-      ? "Loading live webhook inbox"
+      ? "Loading customer conversations"
       : inboxLastError
-        ? "Using sample inbox while API is offline"
-        : "Waiting for webhook messages";
+        ? "Inbox connection needs attention"
+        : "Waiting for customer messages";
   return `
     <div class="inbox-shell">
-      <aside class="inbox-rail">
-        <div class="rail-logo">TJS</div>
-        <button class="rail-button active" aria-label="Conversations">
-          <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v12H8l-4 4V5Z"/></svg>
-        </button>
-        <button class="rail-button" aria-label="Contacts">
-          <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8 1a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM2 21a6 6 0 0 1 12 0"/></svg>
-        </button>
-        <button class="rail-button" aria-label="Reports">
-          <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5m0 14h16M8 17v-6m5 6V7m5 10v-3"/></svg>
-        </button>
-      </aside>
       <aside class="inbox-list">
         <div class="inbox-list-head">
           <input class="dark-search" placeholder="Search messages in conversations" />
-          <div class="conversation-tabs">
-            <button>Mine <span class="badge gray">0</span></button>
-            <button>Unassigned <span class="badge gray">0</span></button>
-            <button class="active">All <span class="badge blue">${activeConversations.length}</span></button>
+          <div class="conversation-tabs single-agent-tabs">
+            <button class="active">Customers <span class="badge blue">${activeConversations.length}</span></button>
+            <button>Needs reply <span class="badge ${awaitingCount ? "orange" : "gray"}">${awaitingCount}</span></button>
           </div>
           <div class="inbox-source">${escapeHtml(inboxStatus)}</div>
         </div>
@@ -946,6 +934,7 @@ function renderInbox() {
           `).join("")}
         </div>
         <div class="composer">
+          ${replyCopilot(selected, visibleMessages, copilotPrompt)}
           <div class="composer-tools" aria-label="Message attachments">
             <button class="tool-button" data-action="attach-image" title="Attach image">IMG</button>
             <button class="tool-button" data-action="attach-document" title="Attach document">DOC</button>
@@ -956,48 +945,10 @@ function renderInbox() {
             <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" value="${escapeHtml(replyDraft)}" />
             <button class="primary-button" data-action="send-reply">${canSendToWhatsApp ? "Send" : isLiveWebhookConversation ? "Save local" : "Send"}</button>
           </div>
-          <div class="composer-note">${canSendToWhatsApp ? "Replies from this composer go to WhatsApp through Meta Cloud API." : isLiveWebhookConversation ? "Saved replies appear in the thread until Meta outbound is configured on the server." : "Demo conversation mode."}</div>
+          <div class="composer-note">${canSendToWhatsApp ? "Message will be sent from The June Shop WhatsApp." : isLiveWebhookConversation ? "Saved locally until WhatsApp sending is enabled." : "Conversation draft mode."}</div>
         </div>
       </section>
-      <aside class="profile-panel">
-        <div class="profile-card-dark customer-brief">
-          <div class="chat-person" style="margin-bottom: 14px;">
-            <span class="avatar">${selected.initials}</span>
-            <div>
-              <div class="chat-title">${escapeHtml(selected.name)}</div>
-              <div class="chat-subtitle">${escapeHtml(selected.phone)}</div>
-            </div>
-          </div>
-          <div class="brief-strip">
-            <span class="badge ${brief.tone}">${escapeHtml(brief.intent)}</span>
-            <span class="badge gray">${escapeHtml(brief.window)}</span>
-          </div>
-          <div class="suggested-reply">
-            <span>Suggested reply</span>
-            <p>${escapeHtml(brief.reply)}</p>
-            <button class="dark-button" data-action="use-suggested-reply">Use reply</button>
-          </div>
-          <div class="brief-actions">
-            ${brief.actions.map((action) => `<button class="dark-button" data-action="brief-action">${escapeHtml(action)}</button>`).join("")}
-          </div>
-          <div class="profile-section-title">Customer</div>
-          ${profileRow("Phone", selected.phone)}
-          ${profileRow("WhatsApp ID", selected.phone.replace(/\D/g, "") || "-")}
-          ${profileRow("Email", selected.email || "-")}
-          ${profileRow("Segment", selected.segment)}
-          <div class="profile-section-title">Conversation</div>
-          ${profileRow("Unread", String(selected.unread || 0))}
-          ${profileRow("Latest inbound", latestInboundText(selected))}
-          ${profileRow("Service window", brief.window)}
-          ${profileRow("Reply mode", canSendToWhatsApp ? "WhatsApp live" : "Local only")}
-          ${profileRow("Assigned to", "Unassigned")}
-          <div class="timeline-card">
-            <span>Timeline</span>
-            <p>${escapeHtml(selected.time)} latest customer activity</p>
-            <p>${isLiveWebhookConversation ? "Source: Meta webhook" : "Source: local demo"}</p>
-          </div>
-        </div>
-      </aside>
+      ${customerContextPanel(selected, visibleMessages, brief)}
     </div>
   `;
 }
@@ -1070,6 +1021,71 @@ function latestInboundText(selected) {
   return latestInbound?.text || selected.preview || "-";
 }
 
+function latestOutboundText(selected) {
+  const latestOutbound = [...(selected.messages || [])].reverse().find((message) => message.from === "out");
+  return latestOutbound?.text || "-";
+}
+
+function customerConversationState(selected) {
+  if (Number(selected.unread || 0) > 0) {
+    return { label: "Awaiting reply", tone: "orange" };
+  }
+  return { label: "Up to date", tone: "green" };
+}
+
+function conversationRundown(selected, messages = selected.messages || []) {
+  const inboundMessages = messages.filter((message) => message.from === "in");
+  const outboundMessages = messages.filter((message) => message.from === "out");
+  const lastInbound = inboundMessages[inboundMessages.length - 1]?.text || selected.preview || "No customer message yet";
+  const lastOutbound = outboundMessages[outboundMessages.length - 1]?.text || "No reply sent yet";
+  return {
+    lastInbound,
+    lastOutbound,
+    inboundCount: inboundMessages.length,
+    outboundCount: outboundMessages.length,
+  };
+}
+
+function generatedReplyFor(selected, prompt = "") {
+  const brief = conversationBrief(selected);
+  const latest = latestInboundText(selected);
+  const lower = `${prompt} ${latest}`.toLowerCase();
+
+  if (lower.includes("order") || lower.includes("delivery") || lower.includes("receive")) {
+    return "Hi, thanks for writing in. I am checking your order details now and will update you here shortly.";
+  }
+  if (lower.includes("return") || lower.includes("exchange") || lower.includes("refund")) {
+    return "Hi, I understand. Please share your order number and a quick photo if relevant, and I will check the best return or exchange option for you.";
+  }
+  if (lower.includes("price") || lower.includes("discount") || lower.includes("offer")) {
+    return "Hi, thanks for checking. I will confirm the current offer and availability for you shortly.";
+  }
+  return brief.reply;
+}
+
+function replyCopilot(selected, messages, prompt) {
+  const rundown = conversationRundown(selected, messages);
+  return `
+    <section class="reply-copilot">
+      <div class="copilot-head">
+        <div>
+          <strong>Reply copilot</strong>
+          <span>Uses recent customer messages</span>
+        </div>
+        <button class="tool-button" data-action="generate-ai-reply">Draft reply</button>
+      </div>
+      <div class="copilot-rundown">
+        <span>Last customer message</span>
+        <p>${escapeHtml(rundown.lastInbound)}</p>
+      </div>
+      <div class="copilot-row">
+        <input id="copilot-prompt" placeholder="Ask for a reply angle, tone, or summary" value="${escapeHtml(prompt)}" />
+        <button class="tool-button" data-action="summarize-chat">Summarize</button>
+      </div>
+    </section>
+  `;
+}
+
 function latestMessage(item) {
   return [...(item.messages || [])].reverse()[0] || null;
 }
@@ -1082,11 +1098,8 @@ function conversationPreviewText(item) {
 }
 
 function conversationStatusHtml(item) {
-  const latest = latestMessage(item);
-  if (!latest || latest.from !== "out") return "";
-  const label = messageStatusLabel(latest);
-  if (!label) return "";
-  return `<span class="conversation-status ${messageStatusTone(latest)}">${escapeHtml(label)}</span>`;
+  if (Number(item.unread || 0) <= 0) return "";
+  return `<span class="conversation-status orange">Awaiting reply</span>`;
 }
 
 function messageBubbleClass(message) {
@@ -1117,7 +1130,7 @@ function conversationBrief(selected) {
     tone: selected.intent === "return_request" ? "orange" : selected.intent === "order_status" ? "blue" : "green",
     window: selected.serviceWindow || "24h open",
     reply: selected.suggestedReply || "Thanks for writing in. I am checking this for you and will update you shortly.",
-    actions: ["Assign to me", "Add tag", "Resolve"],
+    actions: ["Resolve"],
   };
 }
 
@@ -1126,14 +1139,14 @@ function conversationItem(item) {
     <button class="conversation-item ${item.id === state.selectedConversationId ? "active" : ""}" data-conversation-id="${item.id}">
       <span class="avatar">${escapeHtml(item.initials)}</span>
       <span>
-        <span class="conversation-meta">${escapeHtml(item.owner)}</span>
+        <span class="conversation-meta">${escapeHtml(BRAND_NAME)}</span>
         <span class="conversation-name">${escapeHtml(item.name)}</span>
         <span class="conversation-preview">${escapeHtml(conversationPreviewText(item))}</span>
       </span>
       <span>
         <span class="conversation-meta">${escapeHtml(item.time)}</span>
         ${conversationStatusHtml(item)}
-        ${item.unread ? `<span class="unread-dot">${item.unread}</span>` : `<span class="read-dot">0</span>`}
+        ${item.unread ? `<span class="unread-dot">${item.unread}</span>` : ""}
       </span>
     </button>
   `;
@@ -1146,12 +1159,11 @@ function chatHeader(selected) {
         <span class="avatar">${escapeHtml(selected.initials)}</span>
         <div>
           <div class="chat-title">${escapeHtml(selected.name)}</div>
-          <div class="chat-subtitle">WhatsApp conversation - ${escapeHtml(selected.order)}</div>
+          <div class="chat-subtitle">${escapeHtml(BRAND_NAME)} customer conversation</div>
         </div>
       </div>
       <div class="chat-actions">
-        <button class="dark-button" data-action="assign-chat">Assign</button>
-        <button class="dark-button" data-action="resolve-chat">Resolve</button>
+        <button class="dark-button" data-action="resolve-chat">Mark resolved</button>
       </div>
     </div>
   `;
@@ -1161,21 +1173,97 @@ function profileRow(label, value) {
   return `<div class="profile-row"><span class="profile-label">${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
 }
 
+function contextMetric(label, value) {
+  return `
+    <div class="context-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function customerContextPanel(selected, messages, brief) {
+  const stateInfo = customerConversationState(selected);
+  const rundown = conversationRundown(selected, messages);
+  return `
+    <aside class="profile-panel">
+      <section class="context-card customer-summary-card">
+        <div class="chat-person">
+          <span class="avatar">${escapeHtml(selected.initials)}</span>
+          <div>
+            <div class="chat-title">${escapeHtml(selected.name)}</div>
+            <div class="chat-subtitle">${escapeHtml(selected.phone)}</div>
+          </div>
+        </div>
+        <div class="brief-strip">
+          <span class="badge ${stateInfo.tone}">${escapeHtml(stateInfo.label)}</span>
+          <span class="badge gray">${escapeHtml(brief.window)}</span>
+        </div>
+        <div class="context-grid two">
+          ${contextMetric("Customer", selected.phone)}
+          ${contextMetric("WhatsApp ID", selected.wa_id || selected.phone.replace(/\D/g, "") || "-")}
+          ${contextMetric("Segment", selected.segment === "Webhook contact" ? "Customer" : selected.segment)}
+          ${contextMetric("Last message", selected.time)}
+        </div>
+      </section>
+
+      <section class="context-card">
+        <div class="context-card-head">
+          <strong>Order details</strong>
+          <span class="badge gray">Shopify sync</span>
+        </div>
+        <div class="context-grid two">
+          ${contextMetric("Last order", selected.lastOrder || "-")}
+          ${contextMetric("Order value", "-")}
+          ${contextMetric("Orders", "-")}
+          ${contextMetric("Lifetime spend", "-")}
+        </div>
+        <div class="empty-context">Order history will appear here after Shopify is connected.</div>
+      </section>
+
+      <section class="context-card">
+        <div class="context-card-head">
+          <strong>Conversation history</strong>
+          <span class="badge ${stateInfo.tone}">${escapeHtml(stateInfo.label)}</span>
+        </div>
+        <div class="history-stack">
+          <button class="history-button" data-action="jump-latest-message">
+            <span>Latest customer message</span>
+            <strong>${escapeHtml(rundown.lastInbound)}</strong>
+          </button>
+          <button class="history-button" data-action="use-last-reply-context">
+            <span>Last reply sent</span>
+            <strong>${escapeHtml(rundown.lastOutbound)}</strong>
+          </button>
+        </div>
+      </section>
+
+      <section class="context-card">
+        <div class="context-card-head">
+          <strong>Suggested reply</strong>
+        </div>
+        <p class="context-copy">${escapeHtml(brief.reply)}</p>
+        <button class="dark-button" data-action="use-suggested-reply">Use reply</button>
+      </section>
+    </aside>
+  `;
+}
+
 function renderBot() {
   return `
     <div class="flow-shell">
       <aside class="flow-sidebar">
         <button class="secondary-button" style="width: 100%;" data-action="new-flow">Create automation draft</button>
         <div class="flow-list-title">YOUR FLOWS</div>
-        <button class="flow-item active">Live webhook triage</button>
+        <button class="flow-item active">Customer message triage</button>
       </aside>
       <section class="canvas">
         <div class="flow-top">
-          <div class="flow-name">Live webhook triage <button class="ghost-button icon-only" aria-label="Rename flow">...</button></div>
+          <div class="flow-name">Customer message triage <button class="ghost-button icon-only" aria-label="Rename flow">...</button></div>
           <button class="primary-button" data-action="save-flow">Save automation draft</button>
         </div>
         <div class="flow-health-board">
-          <div><span>Trigger</span><strong>Webhook live</strong></div>
+          <div><span>Trigger</span><strong>WhatsApp live</strong></div>
           <div><span>Outbound mode</span><strong>Local only</strong></div>
           <div><span>Human fallback</span><strong>Required</strong></div>
         </div>
@@ -1595,7 +1683,7 @@ function openBroadcastModal() {
         <div class="form-grid wide">
           <div>
             <label class="label">Audience source</label>
-            <select class="select"><option>Webhook customers only</option><option>Uploaded opt-in list</option><option>Segment after CRM sync</option></select>
+            <select class="select"><option>WhatsApp customers only</option><option>Uploaded opt-in list</option><option>Segment after CRM sync</option></select>
           </div>
           <div>
             <label class="label">Template category</label>
@@ -1765,7 +1853,6 @@ document.addEventListener("click", (event) => {
     "save-settings": () => showToast("Settings updated."),
     "save-flow": () => showToast("Flow changes saved."),
     "show-stats": () => showToast("Flow stats panel coming next."),
-    "assign-chat": () => showToast("Conversation assigned to you."),
     "resolve-chat": () => showToast("Conversation resolved."),
     "use-suggested-reply": () => {
       const selected = liveConversations().find((item) => item.id === state.selectedConversationId);
@@ -1776,6 +1863,37 @@ document.addEventListener("click", (event) => {
         input.focus();
         showToast("Suggested reply added.");
       }
+    },
+    "generate-ai-reply": () => {
+      const selected = selectedLiveConversation();
+      const input = document.getElementById("reply-input");
+      const prompt = document.getElementById("copilot-prompt")?.value || "";
+      if (!selected || !input) return;
+      const reply = generatedReplyFor(selected, prompt);
+      input.value = reply;
+      state.replyDrafts[selected.id] = reply;
+      input.focus();
+      showToast("Reply draft prepared.");
+    },
+    "summarize-chat": () => {
+      const selected = selectedLiveConversation();
+      if (!selected) return;
+      const rundown = conversationRundown(selected);
+      showToast(`Customer: ${rundown.lastInbound.slice(0, 90)}`);
+    },
+    "jump-latest-message": () => {
+      const messages = document.querySelector(".messages");
+      if (messages) messages.scrollTop = messages.scrollHeight;
+      showToast("Jumped to latest message.");
+    },
+    "use-last-reply-context": () => {
+      const selected = selectedLiveConversation();
+      const input = document.getElementById("copilot-prompt");
+      if (!selected || !input) return;
+      input.value = `Follow up on my last reply: ${latestOutboundText(selected)}`;
+      state.copilotPrompts[selected.id] = input.value;
+      input.focus();
+      showToast("Context added to copilot.");
     },
     "apply-suggestion": () => showToast("Recommendation added to draft plan."),
     "brief-action": () => showToast("Action queued for this customer."),
@@ -1855,6 +1973,9 @@ document.addEventListener("input", (event) => {
   }
   if (target.id === "reply-input" && state.selectedConversationId) {
     state.replyDrafts[state.selectedConversationId] = target.value;
+  }
+  if (target.id === "copilot-prompt" && state.selectedConversationId) {
+    state.copilotPrompts[state.selectedConversationId] = target.value;
   }
 });
 
