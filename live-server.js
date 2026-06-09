@@ -462,6 +462,29 @@ async function sendWhatsAppMessage(conversation, request) {
   };
 }
 
+async function metaGet(pathname) {
+  if (!WHATSAPP_ACCESS_TOKEN) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: { message: "missing_access_token" } },
+    };
+  }
+
+  const response = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${pathname}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
+  };
+}
+
 function suggestedReply(conversation) {
   if (conversation.intent === "order_status") {
     return "I am checking your order status now and will update you here shortly.";
@@ -1626,6 +1649,39 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/outbound") {
     return sendJson(res, 200, outboundDiagnostics);
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/meta-auth") {
+    const [me, phone] = await Promise.all([
+      metaGet("me"),
+      WHATSAPP_PHONE_NUMBER_ID ? metaGet(WHATSAPP_PHONE_NUMBER_ID) : Promise.resolve({
+        ok: false,
+        status: 0,
+        payload: { error: { message: "missing_phone_number_id" } },
+      }),
+    ]);
+
+    return sendJson(res, 200, {
+      graph_api_version: GRAPH_API_VERSION,
+      runtime: {
+        phone_number_id: WHATSAPP_PHONE_NUMBER_ID || "",
+        waba_id: WHATSAPP_BUSINESS_ACCOUNT_ID || "",
+        access_token_fingerprint: fingerprint(WHATSAPP_ACCESS_TOKEN),
+        access_token_length: WHATSAPP_ACCESS_TOKEN ? String(WHATSAPP_ACCESS_TOKEN).length : 0,
+      },
+      checks: {
+        me: {
+          ok: me.ok,
+          status: me.status,
+          payload: me.payload,
+        },
+        phone_number: {
+          ok: phone.ok,
+          status: phone.status,
+          payload: phone.payload,
+        },
+      },
+    });
   }
 
   if (parsed.pathname === "/webhooks/whatsapp") {
