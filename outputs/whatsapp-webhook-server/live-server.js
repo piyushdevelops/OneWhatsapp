@@ -23,6 +23,14 @@ let webhookDiagnostics = {
   last_post_reason: "",
   last_post_summary: null,
 };
+let outboundDiagnostics = {
+  last_attempt_at: "",
+  last_attempt_ok: null,
+  last_attempt_reason: "",
+  last_conversation_id: "",
+  last_recipient_wa_id: "",
+  last_provider_message_id: "",
+};
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -581,6 +589,17 @@ async function handleApi(req, res, parsed) {
       if (!conversation) return sendJson(res, 404, { error: "conversation_not_found" });
 
       const outbound = await sendWhatsAppTextMessage(conversation, body.body);
+      outboundDiagnostics = {
+        last_attempt_at: new Date().toISOString(),
+        last_attempt_ok: outbound.ok,
+        last_attempt_reason: outbound.reason || (outbound.ok ? "accepted_by_meta" : "unknown"),
+        last_conversation_id: conversation.id,
+        last_recipient_wa_id: conversation.wa_id || "",
+        last_provider_message_id: outbound.providerMessageId || "",
+      };
+      console.log(
+        `[outbound.reply] ok=${outboundDiagnostics.last_attempt_ok} recipient=${outboundDiagnostics.last_recipient_wa_id} reason=${outboundDiagnostics.last_attempt_reason} at=${outboundDiagnostics.last_attempt_at}`
+      );
       const reply = {
         id: `local_${Date.now()}`,
         conversation_id: decodeURIComponent(replyMatch[1]),
@@ -604,9 +623,21 @@ async function handleApi(req, res, parsed) {
           ok: outbound.ok,
           mode: reply.delivery_mode,
           reason: outbound.reason || "",
+          provider_message_id: outbound.providerMessageId || "",
         },
       });
     } catch (error) {
+      outboundDiagnostics = {
+        last_attempt_at: new Date().toISOString(),
+        last_attempt_ok: false,
+        last_attempt_reason: error.message || "reply_failed",
+        last_conversation_id: decodeURIComponent(replyMatch[1] || ""),
+        last_recipient_wa_id: "",
+        last_provider_message_id: "",
+      };
+      console.log(
+        `[outbound.reply] exception reason=${outboundDiagnostics.last_attempt_reason} at=${outboundDiagnostics.last_attempt_at}`
+      );
       return sendJson(res, 400, {
         error: "reply_failed",
         detail: error.message || "unknown_error",
@@ -633,11 +664,16 @@ const server = http.createServer(async (req, res) => {
       api: "/api/inbox/conversations",
       outbound: outboundConfig(),
       webhook_diagnostics: webhookDiagnostics,
+      outbound_diagnostics: outboundDiagnostics,
     });
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/webhook") {
     return sendJson(res, 200, webhookDiagnostics);
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/outbound") {
+    return sendJson(res, 200, outboundDiagnostics);
   }
 
   if (parsed.pathname === "/webhooks/whatsapp") {

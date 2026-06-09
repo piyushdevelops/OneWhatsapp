@@ -6,6 +6,7 @@ const state = {
   selectedConversationId: "",
   selectedFlowNode: "incoming-message",
   search: "",
+  replyDrafts: {},
 };
 
 const isLoopbackHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
@@ -310,7 +311,35 @@ function setScreen(next) {
   render();
 }
 
+function captureComposerState() {
+  const input = document.getElementById("reply-input");
+  if (!input || state.screen !== "inbox" || !state.selectedConversationId) return null;
+
+  state.replyDrafts[state.selectedConversationId] = input.value;
+
+  if (document.activeElement !== input) return null;
+
+  return {
+    conversationId: state.selectedConversationId,
+    selectionStart: input.selectionStart ?? input.value.length,
+    selectionEnd: input.selectionEnd ?? input.value.length,
+  };
+}
+
+function restoreComposerState(snapshot) {
+  if (!snapshot || state.screen !== "inbox" || snapshot.conversationId !== state.selectedConversationId) return;
+  const input = document.getElementById("reply-input");
+  if (!input) return;
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(
+    Math.min(snapshot.selectionStart, end),
+    Math.min(snapshot.selectionEnd, end)
+  );
+}
+
 function render() {
+  const composerSnapshot = captureComposerState();
   const [title, subtitle] = screenMeta[state.screen];
   pageTitle.textContent = title;
   pageSubtitle.textContent = subtitle;
@@ -329,6 +358,7 @@ function render() {
   };
 
   screen.innerHTML = renderers[state.screen]();
+  restoreComposerState(composerSnapshot);
 }
 
 function renderActions(current) {
@@ -776,6 +806,7 @@ function renderInbox() {
   const brief = conversationBrief(selected);
   const isLiveWebhookConversation = selected?.id?.startsWith("wa_");
   const canSendToWhatsApp = isLiveWebhookConversation && systemStatus.outboundEnabled;
+  const replyDraft = state.replyDrafts[selected.id] || "";
   const inboxStatus = inboxConversations.length
     ? `${inboxConversations.length} live webhook conversation${inboxConversations.length === 1 ? "" : "s"}`
     : inboxLoading
@@ -829,7 +860,7 @@ function renderInbox() {
             <button class="tool-button" data-action="attach-quick-reply" title="Add quick reply">QR</button>
           </div>
           <div class="composer-row">
-            <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" />
+            <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" value="${escapeHtml(replyDraft)}" />
             <button class="primary-button" data-action="send-reply">${canSendToWhatsApp ? "Send" : isLiveWebhookConversation ? "Save local" : "Send"}</button>
           </div>
           <div class="composer-note">${canSendToWhatsApp ? "Replies from this composer go to WhatsApp through Meta Cloud API." : isLiveWebhookConversation ? "Saved replies appear in the thread until Meta outbound is configured on the server." : "Demo conversation mode."}</div>
@@ -1339,6 +1370,7 @@ document.addEventListener("click", (event) => {
       const input = document.getElementById("reply-input");
       if (selected && input) {
         input.value = conversationBrief(selected).reply;
+        state.replyDrafts[state.selectedConversationId] = input.value;
         input.focus();
         showToast("Suggested reply added.");
       }
@@ -1362,6 +1394,7 @@ document.addEventListener("click", (event) => {
           .then(async (response) => {
             if (!response.ok) throw new Error("Reply failed");
             const payload = await response.json();
+            state.replyDrafts[selected.id] = "";
             input.value = "";
             inboxLoadedAt = 0;
             await loadInboxData({ force: true });
@@ -1405,6 +1438,10 @@ document.addEventListener("input", (event) => {
   if (target.matches("[data-search]")) {
     state.search = target.value;
     render();
+    return;
+  }
+  if (target.id === "reply-input" && state.selectedConversationId) {
+    state.replyDrafts[state.selectedConversationId] = target.value;
   }
 });
 
