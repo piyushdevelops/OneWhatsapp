@@ -1,10 +1,8 @@
 -- WhatsApp Inbox MVP schema
 -- Target: Postgres 14+
 
-create extension if not exists pgcrypto;
-
 create table organizations (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   name text not null,
   slug text not null unique,
   created_at timestamptz not null default now(),
@@ -12,7 +10,7 @@ create table organizations (
 );
 
 create table team_users (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   name text not null,
   email text not null,
@@ -24,7 +22,7 @@ create table team_users (
 );
 
 create table whatsapp_channels (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   waba_id text not null,
   phone_number_id text not null,
@@ -41,7 +39,7 @@ create table whatsapp_channels (
 );
 
 create table contacts (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   wa_id text,
   phone_e164 text not null,
@@ -58,7 +56,7 @@ create table contacts (
 );
 
 create table conversations (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   channel_id uuid not null references whatsapp_channels(id) on delete cascade,
   contact_id uuid not null references contacts(id) on delete cascade,
@@ -78,7 +76,7 @@ create table conversations (
 );
 
 create table messages (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   channel_id uuid not null references whatsapp_channels(id) on delete cascade,
   conversation_id uuid not null references conversations(id) on delete cascade,
@@ -110,7 +108,7 @@ create unique index messages_provider_message_id_uidx
   where provider_message_id is not null;
 
 create table webhook_events (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid references organizations(id) on delete cascade,
   channel_id uuid references whatsapp_channels(id) on delete set null,
   provider text not null default 'meta_whatsapp',
@@ -126,7 +124,7 @@ create table webhook_events (
 );
 
 create table conversation_notes (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   conversation_id uuid not null references conversations(id) on delete cascade,
   author_user_id uuid references team_users(id) on delete set null,
@@ -135,7 +133,7 @@ create table conversation_notes (
 );
 
 create table tags (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   name text not null,
   color text,
@@ -151,7 +149,7 @@ create table conversation_tags (
 );
 
 create table audit_logs (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
   actor_user_id uuid references team_users(id) on delete set null,
   action text not null,
@@ -169,6 +167,6 @@ create index messages_status_idx on messages (organization_id, status, created_a
 create index webhook_events_status_idx on webhook_events (processing_status, received_at asc);
 
 -- Optional seed for local MVP development.
-insert into organizations (name, slug)
-values ('The June Shop', 'the-june-shop')
+insert into organizations (id, name, slug)
+values ('00000000-0000-0000-0000-000000000001', 'The June Shop', 'the-june-shop')
 on conflict (slug) do nothing;

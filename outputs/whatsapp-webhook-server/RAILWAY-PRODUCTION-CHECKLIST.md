@@ -51,6 +51,12 @@ After deploy, check:
 - `/api/diagnostics/webhook`
 - `/api/diagnostics/outbound`
 
+Inside `/health`, check:
+
+- `storage.mode`
+- `storage.fallback_used`
+- `storage.last_init_error`
+
 ## 5. Confirm production behavior
 
 1. Send a WhatsApp message from your phone
