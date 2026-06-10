@@ -34,6 +34,10 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN =
   process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 const SHOPIFY_LOOKUP_TTL_MS = Number(process.env.SHOPIFY_LOOKUP_TTL_MS || 300000);
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
+const AUTOMATION_EVENTS_FILE =
+  process.env.AUTOMATION_EVENTS_FILE || path.join(DATA_DIR, "automation-events.json");
+const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -74,6 +78,9 @@ function ensureDataDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(EVENTS_FILE)) fs.writeFileSync(EVENTS_FILE, "");
   if (!fs.existsSync(REPLIES_FILE)) fs.writeFileSync(REPLIES_FILE, "[]");
+  if (!fs.existsSync(AUTOMATION_EVENTS_FILE)) {
+    fs.writeFileSync(AUTOMATION_EVENTS_FILE, JSON.stringify({ events: [], runs: [] }, null, 2));
+  }
 }
 
 function sendJson(res, status, body) {
@@ -142,6 +149,84 @@ function verifyMetaSignature(req, rawBody) {
   };
 }
 
+function verifyShopifySignature(req, rawBody) {
+  if (!SHOPIFY_WEBHOOK_SECRET) return { ok: true, skipped: true };
+
+  const signature = req.headers["x-shopify-hmac-sha256"];
+  if (!signature) {
+    return { ok: false, skipped: false, reason: "missing_shopify_signature" };
+  }
+
+  const expected = crypto
+    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(rawBody, "utf8")
+    .digest("base64");
+  const left = Buffer.from(String(signature));
+  const right = Buffer.from(expected);
+
+  if (left.length !== right.length) {
+    return { ok: false, skipped: false, reason: "shopify_signature_length_mismatch" };
+  }
+
+  return {
+    ok: crypto.timingSafeEqual(left, right),
+    skipped: false,
+    reason: "shopify_signature_mismatch",
+  };
+}
+
+const AUTOMATION_BLUEPRINTS = {
+  checkout_abandonment: {
+    id: "checkout_abandonment",
+    name: "Checkout Abandonment",
+    group: "revenue",
+    trigger: "Checkout created or updated",
+    setup_gap: "Map checkout recovery template and wait window before enabling sends.",
+  },
+  cod_confirmation: {
+    id: "cod_confirmation",
+    name: "COD Confirmation",
+    group: "revenue",
+    trigger: "COD order created",
+    setup_gap: "Map COD payment gateway values and confirm/cancel template.",
+  },
+  cod_to_prepaid: {
+    id: "cod_to_prepaid",
+    name: "COD to Prepaid",
+    group: "revenue",
+    trigger: "COD order eligible for prepaid conversion",
+    setup_gap: "Connect payment-link generation and approved prepaid incentive template.",
+  },
+  delivery_failure: {
+    id: "delivery_failure",
+    name: "Delivery Failure Recovery",
+    group: "support",
+    trigger: "Delivery failed or NDR signal",
+    setup_gap: "Connect logistics event source or Shopify delivery-failed tag mapping.",
+  },
+  post_purchase_review: {
+    id: "post_purchase_review",
+    name: "Post Purchase Review",
+    group: "revenue",
+    trigger: "Fulfillment or delivery completed",
+    setup_gap: "Set review delay and approved review request template.",
+  },
+  winback: {
+    id: "winback",
+    name: "Winback",
+    group: "revenue",
+    trigger: "Customer enters dormant segment",
+    setup_gap: "Enable scheduled segment evaluation and winback template.",
+  },
+  return_refund: {
+    id: "return_refund",
+    name: "Return / Refund Follow-up",
+    group: "support",
+    trigger: "Refund, return, or refund-pending signal",
+    setup_gap: "Map return-delivered and refund status events.",
+  },
+};
+
 function readJsonl(file) {
   if (!fs.existsSync(file)) return [];
   return fs
@@ -170,6 +255,37 @@ function readReplies() {
 function writeReplies(replies) {
   ensureDataDir();
   fs.writeFileSync(REPLIES_FILE, JSON.stringify(replies, null, 2));
+}
+
+function readAutomationEventStore() {
+  ensureDataDir();
+  if (!fs.existsSync(AUTOMATION_EVENTS_FILE)) {
+    fs.writeFileSync(AUTOMATION_EVENTS_FILE, JSON.stringify({ events: [], runs: [] }, null, 2));
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(AUTOMATION_EVENTS_FILE, "utf8"));
+    return {
+      events: Array.isArray(parsed.events) ? parsed.events : [],
+      runs: Array.isArray(parsed.runs) ? parsed.runs : [],
+    };
+  } catch {
+    return { events: [], runs: [] };
+  }
+}
+
+function writeAutomationEventStore(store) {
+  ensureDataDir();
+  fs.writeFileSync(
+    AUTOMATION_EVENTS_FILE,
+    JSON.stringify(
+      {
+        events: Array.isArray(store.events) ? store.events : [],
+        runs: Array.isArray(store.runs) ? store.runs : [],
+      },
+      null,
+      2
+    )
+  );
 }
 
 function sha1(value) {
@@ -215,6 +331,148 @@ function formatPhoneE164(waId) {
   if (!waId) return "";
   const digits = String(waId).replace(/\D/g, "");
   return digits ? `+${digits}` : "";
+}
+
+function compactDigits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function topicEventType(topic) {
+  return String(topic || "shopify/event").replace(/[^a-z0-9_/-]/gi, "_").toLowerCase();
+}
+
+function firstTruthy(...values) {
+  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== "") || "";
+}
+
+function payloadContains(payload, patterns) {
+  const haystack = JSON.stringify(payload || {}).toLowerCase();
+  return patterns.some((pattern) => haystack.includes(pattern));
+}
+
+function isCodPayload(payload) {
+  const paymentValues = [
+    payload?.gateway,
+    payload?.payment_gateway_names,
+    payload?.payment_terms?.payment_terms_name,
+    payload?.transactions?.map?.((transaction) => transaction.gateway).join(" "),
+    payload?.note,
+    payload?.tags,
+  ]
+    .flat()
+    .join(" ")
+    .toLowerCase();
+
+  return /(cod|cash on delivery|cash_on_delivery|manual|pay on delivery)/.test(paymentValues);
+}
+
+function normalizeShopifyAutomationEvent(topic, payload, receivedAt) {
+  const customer = payload?.customer || {};
+  const shipping = payload?.shipping_address || {};
+  const billing = payload?.billing_address || {};
+  const phone = compactDigits(firstTruthy(payload?.phone, customer.phone, shipping.phone, billing.phone));
+  const amount = Number(firstTruthy(payload?.total_price, payload?.current_total_price, payload?.subtotal_price, 0));
+  const orderId = String(firstTruthy(payload?.admin_graphql_api_id, payload?.id, payload?.order_id));
+  const customerId = String(firstTruthy(customer.admin_graphql_api_id, customer.id, payload?.customer_id));
+  const eventFingerprint = sha1(
+    [
+      "shopify",
+      topicEventType(topic),
+      orderId,
+      customerId,
+      payload?.updated_at || payload?.created_at || receivedAt,
+      payload?.token || payload?.checkout_token || "",
+      JSON.stringify(payload || {}).slice(0, 1000),
+    ].join("|")
+  );
+
+  return {
+    provider: "shopify",
+    event_type: topicEventType(topic),
+    topic: topicEventType(topic),
+    event_fingerprint: eventFingerprint,
+    order_id: orderId,
+    customer_id: customerId,
+    customer_email: firstTruthy(payload?.email, customer.email),
+    phone: phone ? `+${phone}` : "",
+    amount: Number.isFinite(amount) ? amount : 0,
+    currency: firstTruthy(payload?.currency, payload?.presentment_currency, "INR"),
+    raw_payload: payload || {},
+    received_at: receivedAt,
+  };
+}
+
+function evaluateAutomationMatches(topic, payload) {
+  const eventType = topicEventType(topic);
+  const matches = [];
+  const add = (id, reason) => {
+    const blueprint = AUTOMATION_BLUEPRINTS[id];
+    if (blueprint) matches.push({ ...blueprint, reason });
+  };
+
+  if (eventType.includes("checkouts/") || eventType.includes("carts/")) {
+    add("checkout_abandonment", "Checkout/cart activity observed.");
+  }
+
+  if (eventType.includes("orders/create") || eventType.includes("orders/updated") || eventType.includes("orders/paid")) {
+    if (isCodPayload(payload)) {
+      add("cod_confirmation", "COD order activity observed.");
+      add("cod_to_prepaid", "COD order can be evaluated for prepaid conversion.");
+    }
+  }
+
+  if (
+    eventType.includes("fulfillments/create") ||
+    eventType.includes("orders/fulfilled") ||
+    eventType.includes("orders/paid")
+  ) {
+    add("post_purchase_review", "Fulfillment/order completion signal observed.");
+  }
+
+  if (
+    eventType.includes("refunds/create") ||
+    eventType.includes("returns/") ||
+    payloadContains(payload, ["refund", "return delivered", "return_delivered"])
+  ) {
+    add("return_refund", "Return/refund signal observed.");
+  }
+
+  if (
+    eventType.includes("fulfillment_events/create") ||
+    payloadContains(payload, ["delivery failed", "delivery_failed", "ndr", "rto", "failed delivery"])
+  ) {
+    add("delivery_failure", "Delivery failure or NDR-like signal observed.");
+  }
+
+  if (eventType.includes("customers/update") && payloadContains(payload, ["winback", "inactive", "dormant"])) {
+    add("winback", "Customer entered a dormant/winback-like state.");
+  }
+
+  return matches;
+}
+
+function buildAutomationRun(event, match) {
+  const createdAt = new Date().toISOString();
+  return {
+    id: uuid(),
+    automation_id: match.id,
+    automation_name: match.name,
+    group: match.group,
+    status: "would_trigger",
+    mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+    trigger_event_id: event.id,
+    trigger_event_type: event.event_type,
+    trigger_reason: match.reason,
+    order_id: event.order_id || "",
+    customer_id: event.customer_id || "",
+    customer_email: event.customer_email || "",
+    phone: event.phone || "",
+    amount: event.amount || 0,
+    currency: event.currency || "INR",
+    setup_gap: match.setup_gap,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
 }
 
 function initials(name, fallback) {
@@ -1120,6 +1378,80 @@ function createJsonStorage() {
       .sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at));
   }
 
+  async function recordAutomationEvent(topic, payload, receivedAt) {
+    const store = readAutomationEventStore();
+    const normalized = {
+      id: uuid(),
+      ...normalizeShopifyAutomationEvent(topic, payload, receivedAt),
+    };
+    const existing = store.events.find(
+      (event) => event.provider === normalized.provider && event.event_fingerprint === normalized.event_fingerprint
+    );
+    const event = existing || normalized;
+    const matches = evaluateAutomationMatches(topic, payload);
+    const existingRunKeys = new Set(
+      store.runs.map((run) => `${run.automation_id}:${run.trigger_event_id}`)
+    );
+    const runs = [];
+
+    if (!existing) {
+      store.events.unshift(event);
+    }
+
+    for (const match of matches) {
+      const key = `${match.id}:${event.id}`;
+      if (existingRunKeys.has(key)) continue;
+      const run = buildAutomationRun(event, match);
+      store.runs.unshift(run);
+      runs.push(run);
+    }
+
+    store.events = store.events.slice(0, 500);
+    store.runs = store.runs.slice(0, 500);
+    writeAutomationEventStore(store);
+
+    return {
+      event,
+      matches,
+      runs,
+      duplicate: Boolean(existing),
+    };
+  }
+
+  async function listAutomationRuns(limit = 50) {
+    const store = readAutomationEventStore();
+    return store.runs.slice(0, limit);
+  }
+
+  async function automationOverview() {
+    const runs = await listAutomationRuns(500);
+    const byAutomation = {};
+    for (const run of runs) {
+      if (!byAutomation[run.automation_id]) {
+        byAutomation[run.automation_id] = {
+          automation_id: run.automation_id,
+          automation_name: run.automation_name,
+          group: run.group,
+          observed: 0,
+          last_event_at: "",
+          last_event_type: "",
+        };
+      }
+      const current = byAutomation[run.automation_id];
+      current.observed += 1;
+      if (!current.last_event_at || new Date(run.created_at) > new Date(current.last_event_at)) {
+        current.last_event_at = run.created_at;
+        current.last_event_type = run.trigger_event_type;
+      }
+    }
+    return {
+      mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+      sends_enabled: false,
+      total_runs: runs.length,
+      by_automation: Object.values(byAutomation),
+    };
+  }
+
   return {
     mode: "json",
     diagnostics: {
@@ -1176,6 +1508,9 @@ function createJsonStorage() {
       writeReplies(replies);
       return reply;
     },
+    recordAutomationEvent,
+    listAutomationRuns,
+    automationOverview,
   };
 }
 
@@ -1728,6 +2063,225 @@ function createPostgresStorage() {
     };
   }
 
+  async function recordAutomationEvent(topic, payload, receivedAt) {
+    const organizationId = await ensureOrganization();
+    const normalized = normalizeShopifyAutomationEvent(topic, payload, receivedAt);
+    const rawPayloadJson = JSON.stringify(payload || {});
+    const inserted = await query(
+      `
+      insert into commerce_events (
+        id,
+        organization_id,
+        provider,
+        event_type,
+        topic,
+        event_fingerprint,
+        order_id,
+        customer_id,
+        customer_email,
+        phone_e164,
+        amount,
+        currency,
+        raw_payload,
+        received_at,
+        created_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, now())
+      on conflict (provider, event_fingerprint) do nothing
+      returning *
+      `,
+      [
+        uuid(),
+        organizationId,
+        normalized.provider,
+        normalized.event_type,
+        normalized.topic,
+        normalized.event_fingerprint,
+        normalized.order_id || null,
+        normalized.customer_id || null,
+        normalized.customer_email || null,
+        normalized.phone || null,
+        normalized.amount || 0,
+        normalized.currency || "INR",
+        rawPayloadJson,
+        normalized.received_at,
+      ]
+    );
+
+    const eventResult = inserted.rowCount
+      ? inserted
+      : await query(
+          `
+          select *
+          from commerce_events
+          where provider = $1 and event_fingerprint = $2
+          limit 1
+          `,
+          [normalized.provider, normalized.event_fingerprint]
+        );
+    const event = eventResult.rows[0];
+    const matches = evaluateAutomationMatches(topic, payload);
+    const runs = [];
+
+    for (const match of matches) {
+      const run = buildAutomationRun(
+        {
+          id: event.id,
+          event_type: event.event_type,
+          order_id: event.order_id,
+          customer_id: event.customer_id,
+          customer_email: event.customer_email,
+          phone: event.phone_e164,
+          amount: event.amount,
+          currency: event.currency,
+        },
+        match
+      );
+      const runResult = await query(
+        `
+        insert into automation_runs (
+          id,
+          organization_id,
+          automation_id,
+          automation_name,
+          automation_group,
+          status,
+          mode,
+          trigger_event_id,
+          trigger_event_type,
+          trigger_reason,
+          order_id,
+          customer_id,
+          customer_email,
+          phone_e164,
+          amount,
+          currency,
+          setup_gap,
+          raw_context,
+          created_at,
+          updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20)
+        on conflict (automation_id, trigger_event_id) do nothing
+        returning *
+        `,
+        [
+          run.id,
+          organizationId,
+          run.automation_id,
+          run.automation_name,
+          run.group,
+          run.status,
+          run.mode,
+          run.trigger_event_id,
+          run.trigger_event_type,
+          run.trigger_reason,
+          run.order_id || null,
+          run.customer_id || null,
+          run.customer_email || null,
+          run.phone || null,
+          run.amount || 0,
+          run.currency || "INR",
+          run.setup_gap,
+          JSON.stringify({ topic: normalized.topic, event_fingerprint: normalized.event_fingerprint }),
+          run.created_at,
+          run.updated_at,
+        ]
+      );
+      if (runResult.rowCount) runs.push(mapAutomationRun(runResult.rows[0]));
+    }
+
+    return {
+      event: {
+        id: event.id,
+        provider: event.provider,
+        event_type: event.event_type,
+        topic: event.topic,
+        order_id: event.order_id || "",
+        customer_id: event.customer_id || "",
+        customer_email: event.customer_email || "",
+        phone: event.phone_e164 || "",
+        amount: Number(event.amount || 0),
+        currency: event.currency || "INR",
+        received_at: event.received_at,
+      },
+      matches,
+      runs,
+      duplicate: inserted.rowCount === 0,
+    };
+  }
+
+  function mapAutomationRun(row) {
+    return {
+      id: row.id,
+      automation_id: row.automation_id,
+      automation_name: row.automation_name,
+      group: row.automation_group,
+      status: row.status,
+      mode: row.mode,
+      trigger_event_id: row.trigger_event_id,
+      trigger_event_type: row.trigger_event_type,
+      trigger_reason: row.trigger_reason || "",
+      order_id: row.order_id || "",
+      customer_id: row.customer_id || "",
+      customer_email: row.customer_email || "",
+      phone: row.phone_e164 || "",
+      amount: Number(row.amount || 0),
+      currency: row.currency || "INR",
+      setup_gap: row.setup_gap || "",
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  async function listAutomationRuns(limit = 50) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select *
+      from automation_runs
+      where organization_id = $1
+      order by created_at desc
+      limit $2
+      `,
+      [organizationId, Math.max(1, Math.min(Number(limit) || 50, 200))]
+    );
+    return result.rows.map(mapAutomationRun);
+  }
+
+  async function automationOverview() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select
+        automation_id,
+        automation_name,
+        automation_group,
+        count(*)::int as observed,
+        max(created_at) as last_event_at,
+        (array_agg(trigger_event_type order by created_at desc))[1] as last_event_type
+      from automation_runs
+      where organization_id = $1
+      group by automation_id, automation_name, automation_group
+      order by observed desc, last_event_at desc
+      `,
+      [organizationId]
+    );
+    return {
+      mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+      sends_enabled: false,
+      total_runs: result.rows.reduce((sum, row) => sum + Number(row.observed || 0), 0),
+      by_automation: result.rows.map((row) => ({
+        automation_id: row.automation_id,
+        automation_name: row.automation_name,
+        group: row.automation_group,
+        observed: Number(row.observed || 0),
+        last_event_at: row.last_event_at || "",
+        last_event_type: row.last_event_type || "",
+      })),
+    };
+  }
+
   return {
     mode: "postgres",
     diagnostics: {
@@ -1759,6 +2313,9 @@ function createPostgresStorage() {
     listConversations,
     getConversation,
     saveReply,
+    recordAutomationEvent,
+    listAutomationRuns,
+    automationOverview,
   };
 }
 
@@ -1816,6 +2373,18 @@ function createStorage() {
     async saveReply(...args) {
       await storage.ready();
       return storage._impl.saveReply(...args);
+    },
+    async recordAutomationEvent(...args) {
+      await storage.ready();
+      return storage._impl.recordAutomationEvent(...args);
+    },
+    async listAutomationRuns(...args) {
+      await storage.ready();
+      return storage._impl.listAutomationRuns(...args);
+    },
+    async automationOverview(...args) {
+      await storage.ready();
+      return storage._impl.automationOverview(...args);
     },
   };
 
@@ -1940,7 +2509,105 @@ async function handleWebhook(req, res, parsed) {
   return sendJson(res, 405, { error: "method_not_allowed" });
 }
 
+async function handleShopifyWebhook(req, res) {
+  if (req.method !== "POST") return sendJson(res, 405, { error: "method_not_allowed" });
+
+  try {
+    const rawBody = await readBody(req);
+    const signature = verifyShopifySignature(req, rawBody);
+    if (!signature.ok) return sendJson(res, 401, { ok: false, error: signature.reason });
+
+    const payload = rawBody ? JSON.parse(rawBody) : {};
+    const topic = req.headers["x-shopify-topic"] || payload.topic || "shopify/event";
+    const receivedAt = new Date().toISOString();
+    const result = await storage.recordAutomationEvent(topic, payload, receivedAt);
+
+    console.log(
+      `[shopify.webhook] topic=${topic} matches=${result.matches.length} runs=${result.runs.length} duplicate=${result.duplicate}`
+    );
+    return sendJson(res, 200, {
+      ok: true,
+      topic,
+      signature_checked: !signature.skipped,
+      mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+      sends_enabled: false,
+      duplicate: result.duplicate,
+      matches: result.matches.map((item) => ({
+        automation_id: item.id,
+        automation_name: item.name,
+        reason: item.reason,
+      })),
+      runs_created: result.runs.length,
+    });
+  } catch (error) {
+    console.log(`[shopify.webhook] failed error=${error?.message || "unknown"}`);
+    return sendJson(res, 400, {
+      ok: false,
+      error: "invalid_shopify_payload",
+      detail: error?.message || "unknown_error",
+    });
+  }
+}
+
 async function handleApi(req, res, parsed) {
+  if (req.method === "GET" && parsed.pathname === "/api/automations/overview") {
+    return sendJson(res, 200, {
+      ok: true,
+      ...(await storage.automationOverview()),
+      webhook: "/webhooks/shopify",
+    });
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/automations/runs") {
+    const limit = Number(parsed.query.limit || 50);
+    return sendJson(res, 200, {
+      ok: true,
+      items: await storage.listAutomationRuns(limit),
+    });
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/automations/test-event") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const topic = body.topic || "orders/create";
+      const payload = body.payload || {
+        id: `test_${Date.now()}`,
+        total_price: "1499.00",
+        currency: "INR",
+        gateway: "Cash on Delivery",
+        email: "customer@example.com",
+        phone: "+916291909628",
+        tags: "cod, automation-test",
+        customer: {
+          id: "automation-test-customer",
+          email: "customer@example.com",
+          phone: "+916291909628",
+        },
+        created_at: new Date().toISOString(),
+      };
+      const result = await storage.recordAutomationEvent(topic, payload, new Date().toISOString());
+      return sendJson(res, 200, {
+        ok: true,
+        mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+        sends_enabled: false,
+        topic,
+        matches: result.matches.map((item) => ({
+          automation_id: item.id,
+          automation_name: item.name,
+          reason: item.reason,
+        })),
+        runs_created: result.runs.length,
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: "test_event_failed",
+        detail: error?.message || "unknown_error",
+      });
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/meta/templates") {
     const result = await listMetaTemplates();
     return sendJson(res, result.ok ? 200 : result.status || 500, {
@@ -2177,6 +2844,7 @@ const server = http.createServer(async (req, res) => {
       now: new Date().toISOString(),
       dashboard: true,
       webhook: "/webhooks/whatsapp",
+      shopify_webhook: "/webhooks/shopify",
       api: "/api/inbox/conversations",
       outbound: outboundConfig(storage.mode),
       shopify: {
@@ -2184,6 +2852,11 @@ const server = http.createServer(async (req, res) => {
         shop_domain_configured: Boolean(shopifyConfig().domain),
         admin_token_configured: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
         api_version: SHOPIFY_API_VERSION,
+      },
+      automation: {
+        mode: AUTOMATION_MODE === "live" ? "observe_guarded" : "observe",
+        sends_enabled: false,
+        shopify_webhook: "/webhooks/shopify",
       },
       storage: {
         mode: storage.mode,
@@ -2263,6 +2936,10 @@ const server = http.createServer(async (req, res) => {
 
   if (parsed.pathname === "/webhooks/whatsapp") {
     return handleWebhook(req, res, parsed);
+  }
+
+  if (parsed.pathname === "/webhooks/shopify") {
+    return handleShopifyWebhook(req, res);
   }
 
   if (parsed.pathname.startsWith("/api/")) {

@@ -31,6 +31,16 @@ let shopifySegments = [];
 let shopifySegmentsLoading = false;
 let shopifySegmentsLoadedAt = 0;
 let shopifySegmentsLastError = "";
+let automationOverview = {
+  mode: "observe",
+  sends_enabled: false,
+  total_runs: 0,
+  by_automation: [],
+};
+let automationRuns = [];
+let automationsLoading = false;
+let automationsLoadedAt = 0;
+let automationsLastError = "";
 const customSegments = [];
 let systemStatus = {
   outboundMode: "local_only",
@@ -44,6 +54,7 @@ let systemStatus = {
   webhookDiagnostics: null,
   outboundDiagnostics: null,
   shopify: null,
+  automation: null,
   healthLoaded: false,
 };
 
@@ -75,6 +86,7 @@ async function loadSystemStatus() {
       webhookDiagnostics: payload.webhook_diagnostics || null,
       outboundDiagnostics: payload.outbound_diagnostics || null,
       shopify: payload.shopify || null,
+      automation: payload.automation || null,
       healthLoaded: true,
     };
   } catch {
@@ -90,6 +102,7 @@ async function loadSystemStatus() {
       webhookDiagnostics: null,
       outboundDiagnostics: null,
       shopify: null,
+      automation: null,
       healthLoaded: false,
     };
   } finally {
@@ -474,6 +487,64 @@ async function loadShopifySegments({ force = false } = {}) {
     shopifySegmentsLoading = false;
     if (state.screen === "audience") render();
   }
+}
+
+async function loadAutomationData({ force = false } = {}) {
+  if (automationsLoading) return;
+  if (!force && Date.now() - automationsLoadedAt < 5000) return;
+
+  automationsLoading = true;
+  automationsLastError = "";
+
+  try {
+    const [overviewResponse, runsResponse] = await Promise.all([
+      fetch(`${INBOX_API_BASE}/api/automations/overview`),
+      fetch(`${INBOX_API_BASE}/api/automations/runs?limit=50`),
+    ]);
+    if (!overviewResponse.ok) throw new Error(`Automation overview returned ${overviewResponse.status}`);
+    if (!runsResponse.ok) throw new Error(`Automation runs returned ${runsResponse.status}`);
+    const overviewPayload = await overviewResponse.json();
+    const runsPayload = await runsResponse.json();
+    automationOverview = {
+      mode: overviewPayload.mode || "observe",
+      sends_enabled: Boolean(overviewPayload.sends_enabled),
+      total_runs: Number(overviewPayload.total_runs || 0),
+      by_automation: Array.isArray(overviewPayload.by_automation) ? overviewPayload.by_automation : [],
+      webhook: overviewPayload.webhook || "/webhooks/shopify",
+    };
+    automationRuns = Array.isArray(runsPayload.items) ? runsPayload.items : [];
+    automationsLoadedAt = Date.now();
+  } catch (error) {
+    automationsLastError = error.message || "Automation data unavailable";
+    automationOverview = { mode: "observe", sends_enabled: false, total_runs: 0, by_automation: [] };
+    automationRuns = [];
+    automationsLoadedAt = Date.now();
+  } finally {
+    automationsLoading = false;
+    if (["journeys", "bot"].includes(state.screen)) render();
+  }
+}
+
+function automationStats(id) {
+  const overview = automationOverview.by_automation.find((item) => item.automation_id === id) || {};
+  const runs = automationRuns.filter((run) => run.automation_id === id);
+  return {
+    observed: Number(overview.observed || runs.length || 0),
+    last_event_at: overview.last_event_at || runs[0]?.created_at || "",
+    last_event_type: overview.last_event_type || runs[0]?.trigger_event_type || "",
+    last_run: runs[0] || null,
+  };
+}
+
+function automationModeLabel() {
+  if (automationOverview.mode === "observe_guarded") return "Guarded observe";
+  return "Observe mode";
+}
+
+function automationModeCopy() {
+  return automationOverview.sends_enabled
+    ? "Execution is enabled."
+    : "Watching Shopify signals only. No customer messages are sent from automations yet.";
 }
 
 function normalizeMetaTemplate(item) {
@@ -869,6 +940,9 @@ function setScreen(next) {
   });
   if (["dashboard", "audience", "inbox"].includes(next)) {
     loadInboxData({ force: true });
+  }
+  if (["journeys", "bot"].includes(next)) {
+    loadAutomationData({ force: true });
   }
   render();
 }
@@ -1505,27 +1579,45 @@ function renderTemplateTable(rowsData) {
 }
 
 function renderJourneys() {
+  loadAutomationData();
   const filtered = automationTemplates.filter((item) => item.group === state.automationTab);
   const liveTemplates = approvedTemplates().length;
   const readyCount = automationTemplates.length;
+  const observedCount = automationOverview.total_runs || 0;
+  const latestRun = automationRuns[0] || null;
   return `
     <div class="page-stack">
-      <section class="panel pad">
-        <div class="campaign-head">
-          <div>
-            <span class="eyebrow">Automation command center</span>
-            <h2>Revenue and support flows are setup-ready.</h2>
-            <p>Each automation has a trigger, conditions, WhatsApp template slot, fallback path and execution gap list. Studio opens the exact flow map.</p>
+      <section class="automation-hero">
+        <div class="automation-hero-copy">
+          <span class="eyebrow">Automation OS</span>
+          <h2>Smart journeys that watch your store before they message customers.</h2>
+          <p>Shopify signals are matched to ready-made revenue and support flows. For now every match runs in observe mode, so you can see what would trigger before we switch on live execution.</p>
+          <div class="hero-actions">
+            <button class="primary-button" data-screen-shortcut="bot">Open Studio</button>
+            <button class="secondary-button" data-action="simulate-automation-event">Simulate safe trigger</button>
           </div>
-          <button class="primary-button" data-screen-shortcut="bot">Open Studio</button>
+        </div>
+        <div class="automation-signal-board">
+          <div class="signal-light ${automationsLastError ? "red" : "green"}"></div>
+          <div>
+            <strong>${escapeHtml(automationsLastError ? "Automation observer needs attention" : "Automation observer is watching")}</strong>
+            <p>${escapeHtml(automationsLastError || automationModeCopy())}</p>
+          </div>
+          <div class="signal-route">
+            <span>Shopify</span>
+            <i></i>
+            <span>Rules</span>
+            <i></i>
+            <span>WhatsApp</span>
+          </div>
         </div>
       </section>
 
       <div class="metric-grid four">
         ${metric("Automation blueprints", readyCount, "Prebuilt for The June Shop")}
+        ${metric("Observed triggers", observedCount, latestRun ? `Latest: ${latestRun.automation_name}` : "Waiting for Shopify activity")}
         ${metric("Approved templates", liveTemplates, liveTemplates ? "Available for journeys" : "Create automation templates", liveTemplates ? "" : "warn")}
-        ${metric("Shopify triggers", systemStatus.shopify?.enabled ? "Connected" : "Pending", "Order, checkout and customer events", systemStatus.shopify?.enabled ? "" : "warn")}
-        ${metric("Execution engine", "Draft", "Next backend layer: scheduler + logs", "warn")}
+        ${metric("Execution mode", automationModeLabel(), "No automated sends yet", "warn")}
       </div>
 
       <div class="toolbar">
@@ -1534,12 +1626,16 @@ function renderJourneys() {
           ${tab("support", "Support Automations", state.automationTab, "automationTab")}
         </div>
         <div class="toolbar-right">
-          <span class="badge gray">Templates split by Broadcast / Automation / Both</span>
+          <span class="badge green">Shopify webhook ready</span>
+          <span class="badge blue">${escapeHtml(automationModeLabel())}</span>
         </div>
       </div>
 
-      <section class="automation-table-wrap">
-        ${renderAutomationTable(filtered)}
+      <section class="automation-command-grid">
+        <div class="automation-table-wrap">
+          ${renderAutomationTable(filtered)}
+        </div>
+        ${renderAutomationRunFeed()}
       </section>
     </div>
   `;
@@ -1552,17 +1648,52 @@ function renderAutomationTable(items) {
         <span class="row-title">${escapeHtml(item.name)}</span>
         <div class="row-subtle">${escapeHtml(item.revenueGoal)}</div>
       </td>
-      <td><span class="badge ${item.group === "revenue" ? "green" : "orange"}">${escapeHtml(item.status)}</span></td>
+      <td><span class="badge ${automationStats(item.id).observed ? "green" : "blue"}">${automationStats(item.id).observed ? "Observed" : "Ready"}</span></td>
       <td>${escapeHtml(item.trigger)}</td>
       <td>${escapeHtml(item.audience)}</td>
       <td>${escapeHtml(item.templateUsage)}</td>
-      <td>${escapeHtml(item.metrics.sent)}</td>
-      <td>${escapeHtml(item.metrics.revenue)}</td>
+      <td>${escapeHtml(automationStats(item.id).observed)}</td>
+      <td>${escapeHtml(automationStats(item.id).last_event_type || "Waiting")}</td>
       <td>${escapeHtml(item.nextSetup)}</td>
       <td><button class="ghost-button" data-automation-id="${escapeHtml(item.id)}" data-screen-shortcut="bot">Open</button></td>
     </tr>
   `).join("");
-  return table(["Automation", "Status", "Trigger", "Audience", "Template", "Sent", "Revenue", "Next setup", ""], rows);
+  return table(["Automation", "State", "Trigger", "Audience", "Template", "Observed", "Latest signal", "Next setup", ""], rows);
+}
+
+function renderAutomationRunFeed() {
+  const rows = automationRuns.slice(0, 6);
+  return `
+    <aside class="automation-feed panel">
+      <div class="panel-header">
+        <div>
+          <h3 class="panel-title">Signal Feed</h3>
+          <p class="panel-subtitle">Recent Shopify moments matched to automations.</p>
+        </div>
+        <span class="badge ${automationOverview.sends_enabled ? "green" : "blue"}">${escapeHtml(automationModeLabel())}</span>
+      </div>
+      <div class="run-feed">
+        ${rows.length ? rows.map((run) => `
+          <article class="run-card">
+            <div>
+              <span class="run-type">${escapeHtml(run.trigger_event_type || "shopify/event")}</span>
+              <strong>${escapeHtml(run.automation_name)}</strong>
+              <p>${escapeHtml(run.trigger_reason || run.setup_gap || "Matched automation opportunity.")}</p>
+            </div>
+            <div class="run-meta">
+              <span>${escapeHtml(formatClientRelative(run.created_at))}</span>
+              <small>${escapeHtml(run.amount ? `${run.currency || "INR"} ${Math.round(run.amount)}` : run.phone || "Customer signal")}</small>
+            </div>
+          </article>
+        `).join("") : `
+          <div class="empty-signal">
+            <strong>No Shopify triggers observed yet.</strong>
+            <p>Use the safe simulator or connect Shopify webhooks to start filling this feed.</p>
+          </div>
+        `}
+      </div>
+    </aside>
+  `;
 }
 
 function selectedAutomation() {
@@ -1606,6 +1737,7 @@ function automationConnector(from, to) {
 function renderAutomationInspector() {
   const automation = selectedAutomation();
   const node = selectedAutomationNode();
+  const stats = automationStats(automation.id);
   return `
     <aside class="automation-inspector">
       <span class="badge ${node.tone}">${escapeHtml(node.status)}</span>
@@ -1614,8 +1746,10 @@ function renderAutomationInspector() {
       <div class="inspector-list">
         ${profileRow("Automation", automation.name)}
         ${profileRow("Node type", node.type)}
+        ${profileRow("Observed triggers", stats.observed || "0")}
+        ${profileRow("Last signal", stats.last_event_type || "Waiting")}
         ${profileRow("Template slot", automation.templateUsage)}
-        ${profileRow("Current mode", automation.status)}
+        ${profileRow("Current mode", automationModeLabel())}
         ${profileRow("Next setup", automation.nextSetup)}
       </div>
       <button class="secondary-button" data-screen-shortcut="templates">Manage templates</button>
@@ -2082,7 +2216,9 @@ function customerContextPanel(selected, messages, brief) {
 }
 
 function renderBot() {
+  loadAutomationData();
   const automation = selectedAutomation();
+  const stats = automationStats(automation.id);
   return `
     <div class="flow-shell">
       <aside class="flow-sidebar">
@@ -2090,8 +2226,8 @@ function renderBot() {
         <div class="flow-list-title">YOUR AUTOMATIONS</div>
         ${automationTemplates.map((item) => `
           <button class="flow-item ${item.id === state.selectedAutomationId ? "active" : ""}" data-automation-id="${escapeHtml(item.id)}">
-            <span>${escapeHtml(item.name)}</span>
-            <small>${escapeHtml(item.trigger)}</small>
+            <span>${escapeHtml(item.name)} ${automationStats(item.id).observed ? `<b>${escapeHtml(automationStats(item.id).observed)}</b>` : ""}</span>
+            <small>${escapeHtml(automationStats(item.id).last_event_type || item.trigger)}</small>
           </button>
         `).join("")}
       </aside>
@@ -2102,8 +2238,8 @@ function renderBot() {
         </div>
         <div class="flow-health-board">
           <div><span>Trigger</span><strong>${escapeHtml(automation.trigger)}</strong></div>
-          <div><span>Audience</span><strong>${escapeHtml(automation.audience)}</strong></div>
-          <div><span>Template</span><strong>${escapeHtml(automation.templateUsage)}</strong></div>
+          <div><span>Observed</span><strong>${escapeHtml(stats.observed)} safe matches</strong></div>
+          <div><span>Mode</span><strong>${escapeHtml(automationModeLabel())}</strong></div>
         </div>
         ${renderAutomationCanvas(true)}
       </section>
@@ -2608,6 +2744,38 @@ async function sendBroadcastLive() {
   showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
 }
 
+async function simulateAutomationEvent() {
+  const response = await fetch(`${INBOX_API_BASE}/api/automations/test-event`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      topic: "orders/create",
+      payload: {
+        id: `sample_cod_${Date.now()}`,
+        total_price: "1899.00",
+        currency: "INR",
+        gateway: "Cash on Delivery",
+        tags: "cod, whatsapp-observe",
+        phone: "+916291909628",
+        email: "customer@example.com",
+        customer: {
+          id: "sample_customer",
+          email: "customer@example.com",
+          phone: "+916291909628",
+        },
+        created_at: new Date().toISOString(),
+      },
+    }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.detail || result?.error || "Could not simulate automation event.");
+  }
+  automationsLoadedAt = 0;
+  await loadAutomationData({ force: true });
+  showToast(`Observed ${result.matches?.length || 0} matching automation signals.`);
+}
+
 function saveCustomSegment() {
   const name = document.getElementById("segment-name")?.value?.trim();
   const source = document.getElementById("segment-source")?.value || "Combined";
@@ -3007,6 +3175,7 @@ document.addEventListener("click", (event) => {
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
       loadInboxData({ force: true });
+      loadAutomationData({ force: true });
       loadSystemStatus();
       showToast("Live data refreshed.");
     },
@@ -3015,7 +3184,15 @@ document.addEventListener("click", (event) => {
       loadInboxData({ force: true });
       showToast("Diagnostics refreshed.");
     },
-    "refresh-dashboard": () => showToast("Signals refreshed."),
+    "refresh-dashboard": () => {
+      loadInboxData({ force: true });
+      loadAutomationData({ force: true });
+      loadSystemStatus();
+      showToast("Signals refreshed.");
+    },
+    "simulate-automation-event": () => {
+      simulateAutomationEvent().catch((error) => showToast(error.message || "Could not simulate trigger."));
+    },
     "topup": () => showToast("Wallet top-up flow will connect to billing."),
     "save-settings": () => showToast("Settings updated."),
     "save-flow": () => showToast("Flow changes saved."),

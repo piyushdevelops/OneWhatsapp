@@ -123,6 +123,49 @@ create table if not exists webhook_events (
   unique (provider, event_fingerprint)
 );
 
+create table if not exists commerce_events (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  provider text not null default 'shopify',
+  event_type text not null,
+  topic text not null,
+  event_fingerprint text not null,
+  order_id text,
+  customer_id text,
+  customer_email text,
+  phone_e164 text,
+  amount numeric(14, 2) not null default 0,
+  currency text not null default 'INR',
+  raw_payload jsonb not null default '{}'::jsonb,
+  received_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  unique (provider, event_fingerprint)
+);
+
+create table if not exists automation_runs (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  automation_id text not null,
+  automation_name text not null,
+  automation_group text not null,
+  status text not null default 'would_trigger',
+  mode text not null default 'observe',
+  trigger_event_id uuid references commerce_events(id) on delete cascade,
+  trigger_event_type text not null,
+  trigger_reason text,
+  order_id text,
+  customer_id text,
+  customer_email text,
+  phone_e164 text,
+  amount numeric(14, 2) not null default 0,
+  currency text not null default 'INR',
+  setup_gap text,
+  raw_context jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (automation_id, trigger_event_id)
+);
+
 create table if not exists conversation_notes (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
@@ -165,6 +208,10 @@ create index if not exists conversations_assignee_idx on conversations (organiza
 create index if not exists messages_conversation_created_idx on messages (conversation_id, created_at asc);
 create index if not exists messages_status_idx on messages (organization_id, status, created_at desc);
 create index if not exists webhook_events_status_idx on webhook_events (processing_status, received_at asc);
+create index if not exists commerce_events_org_received_idx on commerce_events (organization_id, received_at desc);
+create index if not exists commerce_events_phone_idx on commerce_events (organization_id, phone_e164, received_at desc);
+create index if not exists automation_runs_org_created_idx on automation_runs (organization_id, created_at desc);
+create index if not exists automation_runs_status_idx on automation_runs (organization_id, status, created_at desc);
 
 -- Optional seed for local MVP development.
 insert into organizations (id, name, slug)

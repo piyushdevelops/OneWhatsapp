@@ -2220,6 +2220,190 @@ tr:last-child td {
   align-content: center;
 }
 
+.automation-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+  gap: 18px;
+  border: 1px solid rgba(120, 222, 201, 0.22);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(135deg, rgba(12, 25, 31, 0.98), rgba(25, 42, 45, 0.96)),
+    radial-gradient(circle at 90% 15%, rgba(124, 212, 183, 0.22), transparent 32%);
+  color: #f8fffb;
+  padding: 22px;
+  overflow: hidden;
+}
+
+.automation-hero-copy h2 {
+  max-width: 760px;
+  margin-top: 8px;
+  font-size: 30px;
+  line-height: 1.1;
+}
+
+.automation-hero-copy p {
+  max-width: 780px;
+  margin-top: 10px;
+  color: #cdd8d5;
+  line-height: 1.55;
+}
+
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.automation-signal-board {
+  display: grid;
+  align-content: space-between;
+  gap: 18px;
+  min-height: 210px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 18px;
+}
+
+.signal-light {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 9px rgba(255, 255, 255, 0.06);
+}
+
+.signal-light.green {
+  background: #7be09a;
+  box-shadow: 0 0 0 9px rgba(123, 224, 154, 0.12), 0 0 30px rgba(123, 224, 154, 0.55);
+}
+
+.signal-light.red {
+  background: #ff7d7d;
+  box-shadow: 0 0 0 9px rgba(255, 125, 125, 0.12), 0 0 30px rgba(255, 125, 125, 0.5);
+}
+
+.automation-signal-board strong {
+  display: block;
+  font-size: 18px;
+}
+
+.automation-signal-board p {
+  margin-top: 6px;
+  color: #d8e1df;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.signal-route {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  color: #dce9e5;
+  font-size: 12px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.signal-route i {
+  display: block;
+  height: 2px;
+  border-radius: 99px;
+  background: linear-gradient(90deg, rgba(123, 224, 154, 0.2), rgba(123, 224, 154, 0.95));
+}
+
+.automation-command-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 18px;
+  align-items: start;
+}
+
+.automation-feed {
+  position: sticky;
+  top: 92px;
+}
+
+.run-feed {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.run-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  border: 1px solid #dce4dc;
+  border-radius: 8px;
+  background: #fbfdf8;
+  padding: 12px;
+}
+
+.run-card strong,
+.run-card p,
+.run-card span,
+.run-card small {
+  display: block;
+}
+
+.run-card strong {
+  margin-top: 5px;
+  font-size: 14px;
+}
+
+.run-card p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.run-type {
+  color: #2f9381;
+  font-size: 11px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.run-meta {
+  min-width: 78px;
+  text-align: right;
+}
+
+.run-meta span {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.run-meta small {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.empty-signal {
+  border: 1px dashed #cfd8d3;
+  border-radius: 8px;
+  background: #fbfdfb;
+  padding: 18px;
+}
+
+.empty-signal strong,
+.empty-signal p {
+  display: block;
+}
+
+.empty-signal p {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .automation-workbench {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -2395,6 +2579,25 @@ tr:last-child td {
 .flow-item span,
 .flow-item small {
   display: block;
+}
+
+.flow-item span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.flow-item b {
+  min-width: 24px;
+  min-height: 20px;
+  border-radius: 99px;
+  background: #dff7ef;
+  color: #28745d;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 7px;
+  font-size: 11px;
 }
 
 .flow-item small {
@@ -2956,8 +3159,14 @@ tr:last-child td {
   .ops-hero,
   .command-grid,
   .task-panel,
-  .automation-workbench {
+  .automation-workbench,
+  .automation-hero,
+  .automation-command-grid {
     grid-template-columns: 1fr;
+  }
+
+  .automation-feed {
+    position: static;
   }
 
   .health-strip,
@@ -3063,8 +3272,22 @@ tr:last-child td {
   .capability-grid,
   .mode-grid,
   .diagnostics-grid,
-  .checklist {
+  .checklist,
+  .automation-hero,
+  .automation-command-grid {
     grid-template-columns: 1fr;
+  }
+
+  .automation-hero-copy h2 {
+    font-size: 24px;
+  }
+
+  .signal-route {
+    grid-template-columns: 1fr;
+  }
+
+  .signal-route i {
+    display: none;
   }
 
   .diagnostics-head {
