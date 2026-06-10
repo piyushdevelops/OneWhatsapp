@@ -289,6 +289,90 @@ h1 {
   gap: 24px;
 }
 
+.business-hero {
+  border: 1px solid #dce4dc;
+  border-radius: var(--radius);
+  background: #fff;
+  padding: 22px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(520px, 0.95fr);
+  gap: 20px;
+  align-items: center;
+  box-shadow: var(--shadow);
+}
+
+.business-hero h2 {
+  margin-top: 9px;
+  font-size: 27px;
+  line-height: 1.16;
+}
+
+.business-hero p {
+  margin-top: 10px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.health-strip,
+.health-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.health-board {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.health-light {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcf8;
+  min-height: 66px;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.health-light strong,
+.health-light small {
+  display: block;
+}
+
+.health-light strong {
+  font-size: 13px;
+}
+
+.health-light small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.light-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--red);
+  box-shadow: 0 0 0 4px rgba(217, 77, 77, 0.12);
+  flex: 0 0 auto;
+}
+
+.health-light.ok .light-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(74, 163, 95, 0.14);
+}
+
+.revenue-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.revenue-card {
+  min-height: 128px;
+}
+
 .live-command {
   display: grid;
   grid-template-columns: minmax(0, 0.95fr) minmax(420px, 1.05fr);
@@ -529,6 +613,121 @@ h1 {
 .command-side {
   display: grid;
   gap: 18px;
+}
+
+.task-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
+  gap: 0;
+}
+
+.task-summary {
+  border-right: 1px solid var(--line);
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.task-summary .metric-card {
+  min-height: 96px;
+  box-shadow: none;
+}
+
+.crm-task-list {
+  display: grid;
+  gap: 0;
+  align-content: start;
+}
+
+.crm-task {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-left: 5px solid var(--blue);
+  background: #fff;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  text-align: left;
+}
+
+.crm-task:last-child {
+  border-bottom: 0;
+}
+
+.crm-task:hover {
+  background: #f7f9ff;
+}
+
+.crm-task.orange {
+  border-left-color: var(--orange);
+}
+
+.crm-task.red {
+  border-left-color: var(--red);
+}
+
+.crm-task.blue {
+  border-left-color: var(--blue);
+}
+
+.crm-task strong,
+.crm-task small {
+  display: block;
+}
+
+.crm-task small {
+  margin-top: 4px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.crm-task em {
+  color: var(--blue);
+  font-style: normal;
+  font-weight: 850;
+}
+
+.empty-inline {
+  padding: 22px;
+  display: grid;
+  gap: 6px;
+}
+
+.empty-inline strong {
+  font-size: 15px;
+}
+
+.empty-inline span {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.compact-status-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.roadmap-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.roadmap-step {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcf8;
+  padding: 12px;
+  display: grid;
+  gap: 5px;
+}
+
+.roadmap-step span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .action-stack,
@@ -2519,11 +2718,23 @@ tr:last-child td {
 }
 
 @media (max-width: 1180px) {
+  .business-hero,
   .live-command,
   .ops-hero,
   .command-grid,
+  .task-panel,
   .automation-workbench {
     grid-template-columns: 1fr;
+  }
+
+  .health-strip,
+  .revenue-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .task-summary {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
   }
 
   .ops-scoreboard {
@@ -2614,6 +2825,8 @@ tr:last-child td {
   .metric-grid,
   .metric-grid.three,
   .ops-scoreboard,
+  .health-strip,
+  .revenue-grid,
   .capability-grid,
   .mode-grid,
   .diagnostics-grid,

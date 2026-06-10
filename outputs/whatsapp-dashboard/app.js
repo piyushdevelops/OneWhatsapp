@@ -322,6 +322,110 @@ function liveInboxStats() {
   };
 }
 
+function parseMoney(value) {
+  const amount = Number(String(value || "").replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function formatMoney(value, currency = "INR") {
+  const amount = Number(value || 0);
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: amount % 1 ? 2 : 0,
+  }).format(amount);
+}
+
+function shopifyOrdersFor(conversation) {
+  return conversation.shopify?.orders || [];
+}
+
+function hasLiveOutbound(conversation) {
+  return (conversation.messages || []).some((message) => (
+    message.from === "out"
+    && message.status !== "local"
+    && message.status !== "failed"
+    && message.delivery_mode !== "local_only"
+  ));
+}
+
+function revenueStats() {
+  const conversations = liveConversations();
+  const matchedOrders = conversations.flatMap((conversation) => (
+    shopifyOrdersFor(conversation).map((order) => ({ conversation, order }))
+  ));
+  const outboundOrders = matchedOrders.filter(({ conversation }) => hasLiveOutbound(conversation));
+  const currency = matchedOrders[0]?.order?.currency || "INR";
+  const assistedRevenue = matchedOrders.reduce((sum, { order }) => sum + parseMoney(order.total_price), 0);
+  const outboundRevenue = outboundOrders.reduce((sum, { order }) => sum + parseMoney(order.total_price), 0);
+  const outboundMessages = conversations.flatMap((conversation) => (
+    (conversation.messages || []).filter((message) => message.from === "out")
+  ));
+  const delivered = outboundMessages.filter((message) => ["delivered", "read"].includes(message.status)).length;
+  const sent = outboundMessages.filter((message) => ["submitted", "sent", "delivered", "read"].includes(message.status)).length;
+
+  return {
+    currency,
+    assistedRevenue,
+    outboundRevenue,
+    matchedOrders: matchedOrders.length,
+    outboundOrders: outboundOrders.length,
+    outboundMessages: outboundMessages.length,
+    delivered,
+    sent,
+    deliveryRate: sent ? Math.round((delivered / sent) * 100) : 0,
+    trackedCampaigns: 0,
+    utmCoverage: 0,
+  };
+}
+
+function latestInboundFor(conversation) {
+  return [...(conversation.messages || [])].reverse().find((message) => message.from === "in") || null;
+}
+
+function crmTasks() {
+  const conversations = liveConversations();
+  const tasks = [];
+
+  conversations.forEach((conversation) => {
+    const latestInbound = latestInboundFor(conversation);
+    const text = `${conversation.preview || ""} ${latestInbound?.text || ""}`.toLowerCase();
+    const unread = Number(conversation.unread || 0);
+
+    if (unread > 0) {
+      tasks.push({
+        conversation,
+        tone: "orange",
+        title: "Customer awaiting reply",
+        detail: latestInbound?.text || conversation.preview || "New WhatsApp message",
+        next: "Open chat",
+      });
+    }
+
+    if (/(angry|upset|bad|issue|problem|not received|delay|late|where|delivery|delivered)/i.test(text)) {
+      tasks.push({
+        conversation,
+        tone: "red",
+        title: "Monitor delivery concern",
+        detail: latestInbound?.text || conversation.preview || "Check delivery/order context",
+        next: "Review",
+      });
+    }
+
+    if (/(return|refund|exchange|damaged|wrong|cancel)/i.test(text)) {
+      tasks.push({
+        conversation,
+        tone: "blue",
+        title: "After-sales action needed",
+        detail: "Check Shopify order history before replying.",
+        next: "Open",
+      });
+    }
+  });
+
+  return tasks.slice(0, 6);
+}
+
 function emptyPanel(title, detail, actionLabel = "", action = "") {
   return `
     <section class="empty-panel">
@@ -557,89 +661,154 @@ function metric(label, value, delta, tone = "") {
 function renderDashboard() {
   const stats = liveInboxStats();
   const latest = stats.latest;
-  const healthTone = stats.apiState === "Connected" ? "green" : stats.apiState === "Loading" ? "blue" : "red";
-  const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
+  const outboundTone = systemStatus.outboundEnabled ? "green" : "red";
   const outboundLabel = systemStatus.outboundEnabled ? "WhatsApp live" : "Local only";
-  const outboundCopy = systemStatus.outboundEnabled
-    ? "Dashboard replies are being sent through WhatsApp, with delivery status updating the thread."
-    : "Dashboard replies are saved locally until a secure Meta token is configured.";
-  const lastMessage = latest
-    ? `${latest.name}: ${latest.preview}`
-    : inboxLastError
-      ? inboxLastError
-      : "Waiting for the first real WhatsApp message.";
+  const revenue = revenueStats();
+  const tasks = crmTasks();
+  const shopifyReady = Boolean(systemStatus.shopify?.enabled);
+  const lastMessage = latest ? `${latest.name}: ${latest.preview}` : "Waiting for the first customer conversation.";
+  const strictAttributionReady = revenue.trackedCampaigns > 0 && revenue.utmCoverage > 0;
+  const strictAttributionTone = strictAttributionReady ? "green" : "red";
+  const strictAttributionLabel = strictAttributionReady ? "Tracking" : "Not live";
+  const revenueCards = [
+    {
+      label: "WhatsApp-assisted revenue",
+      value: formatMoney(revenue.assistedRevenue, revenue.currency),
+      detail: `${revenue.matchedOrders} Shopify order${revenue.matchedOrders === 1 ? "" : "s"} linked to WhatsApp customers`,
+      tone: revenue.matchedOrders ? "green" : "warn",
+    },
+    {
+      label: "Outbound-influenced revenue",
+      value: formatMoney(revenue.outboundRevenue, revenue.currency),
+      detail: revenue.outboundOrders
+        ? `${revenue.outboundOrders} order${revenue.outboundOrders === 1 ? "" : "s"} after WhatsApp replies`
+        : "Needs broadcast/UTM attribution for strict revenue",
+      tone: revenue.outboundOrders ? "green" : "warn",
+    },
+    {
+      label: "Outbound delivery",
+      value: revenue.sent ? `${revenue.deliveryRate}%` : "0%",
+      detail: `${revenue.delivered}/${revenue.sent} delivered or read`,
+      tone: revenue.sent ? "green" : "warn",
+    },
+    {
+      label: "Campaign attribution",
+      value: strictAttributionLabel,
+      detail: "UTM/campaign IDs will unlock BiteSpeed-style revenue views",
+      tone: strictAttributionReady ? "green" : "warn",
+    },
+  ];
 
   return `
     <div class="ops-page">
-      <section class="live-command">
-        <div class="command-intro">
-          <span class="eyebrow">Live workspace</span>
-          <h2>The dashboard is now clean: only real customer conversations and drafts are shown.</h2>
+      <section class="business-hero">
+        <div>
+          <span class="eyebrow">The June Shop WhatsApp OS</span>
+          <h2>Sales, support and customer work from WhatsApp.</h2>
           <p>${escapeHtml(lastMessage)}</p>
-          <div class="hero-actions">
-            <button class="primary-button" data-screen-shortcut="inbox">Open live inbox</button>
-            <button class="secondary-button" data-screen-shortcut="audience">View customers</button>
-          </div>
         </div>
-        <div class="metric-grid three">
-          ${metric("Customer conversations", stats.conversations, latest ? `${latest.time} latest activity` : "No customer message yet")}
-          ${metric("Unread customer messages", stats.unread, stats.unread ? "Needs reply" : "All clear", stats.unread ? "warn" : "")}
-          ${metric("Inbox API", stats.apiState, inboxLastError || "Local backend connected", healthTone === "red" ? "warn" : "")}
+        <div class="health-strip">
+          ${healthLight("Inbox", stats.apiState === "Connected", stats.apiState)}
+          ${healthLight("Replies", systemStatus.outboundEnabled, outboundLabel)}
+          ${healthLight("Shopify", shopifyReady, shopifyReady ? "Connected" : "Pending")}
+          ${healthLight("Attribution", strictAttributionReady, strictAttributionLabel)}
         </div>
+      </section>
+
+      <section class="metric-grid revenue-grid">
+        ${revenueCards.map((item) => revenueCard(item)).join("")}
       </section>
 
       <section class="command-grid">
         <div class="command-main">
-          <div class="section-title">Current Signals</div>
-          <section class="panel pad">
-            <div class="signal-list">
-              ${commandSignal("Customer chat intake", stats.apiState, inboxLastError ? inboxLastError : "Receiving live WhatsApp conversations into your inbox.", healthTone)}
-              ${commandSignal("Outbound delivery", outboundLabel, outboundCopy, outboundTone)}
-              ${commandSignal("Templates", syncedTemplates.length ? `${syncedTemplates.length} synced` : "Not synced", "No real template sync is connected yet, so template tables stay empty.", "blue")}
+          <div class="section-title">CRM Focus</div>
+          <section class="panel task-panel">
+            <div class="task-summary">
+              ${metric("Active customers", stats.conversations, stats.conversations ? "Live WhatsApp inbox" : "No active chat yet")}
+              ${metric("Need attention", tasks.length, tasks.length ? "Open from queue below" : "All clear", tasks.length ? "warn" : "")}
+              ${metric("Unread messages", stats.unread, stats.unread ? "Reply queue active" : "No unread messages", stats.unread ? "warn" : "")}
+            </div>
+            <div class="crm-task-list">
+              ${tasks.length ? tasks.map((task) => crmTaskCard(task)).join("") : emptyInline("No urgent customer work", "Chats that need reply, refund checks, delivery monitoring or after-sales action will appear here.")}
             </div>
           </section>
 
-          <div class="section-title">Latest Conversations</div>
+          <div class="section-title">Latest Customers</div>
           <section class="panel">
-            ${stats.conversations ? renderMiniConversationList(liveConversations().slice(0, 5)) : emptyPanel("No live customers yet", "Send a WhatsApp message to the connected test number and it will appear here automatically.")}
+            ${stats.conversations ? renderMiniConversationList(liveConversations().slice(0, 5)) : emptyPanel("No live customers yet", "New WhatsApp conversations will appear here automatically.")}
           </section>
         </div>
 
         <aside class="command-side">
-          <div class="section-title">Setup Reality</div>
-          <div class="move-stack">
-            <article class="move-card">
-              <h3>WhatsApp receiving</h3>
-              <p>Customer messages are arriving in the shared TJS inbox.</p>
-              <span class="badge ${healthTone}">${escapeHtml(stats.apiState)}</span>
-            </article>
-            <article class="move-card">
-              <h3>WhatsApp sending</h3>
-              <p>${escapeHtml(outboundCopy)}</p>
-              <span class="badge ${outboundTone}">${escapeHtml(outboundLabel)}</span>
-            </article>
-            <article class="move-card">
-              <h3>Real data policy</h3>
-              <p>Demo customers, fake revenue, wallet balance, old campaigns and placeholder templates are hidden.</p>
-              <span class="badge green">Clean</span>
-            </article>
-          </div>
+          <div class="section-title">Revenue Engine</div>
+          <section class="panel pad compact-status-panel">
+            ${commandSignal("Shopify order match", shopifyReady ? "Green light" : "Red light", shopifyReady ? "Customer cards can show order value and history." : "Add Shopify token/domain in Railway.", shopifyReady ? "green" : "red")}
+            ${commandSignal("WhatsApp outbound", systemStatus.outboundEnabled ? "Green light" : "Red light", systemStatus.outboundEnabled ? "Replies can be sent from the dashboard." : "Outbound token is missing or rejected.", outboundTone)}
+            ${commandSignal("UTM revenue tracking", strictAttributionLabel, "Next build: campaign IDs, UTM links and Shopify order attribution per broadcast.", strictAttributionTone)}
+          </section>
 
-          <div class="section-title">Automation Flow</div>
-          <div class="lane-grid">
-            ${automationFlow.map((node) => `
-              <button class="lane-card flow-node-list ${node.id === state.selectedFlowNode ? "active" : ""}" data-flow-node="${node.id}">
-                <div class="lane-head">
-                  <strong>${escapeHtml(node.title)}</strong>
-                  <span class="badge ${node.tone}">${escapeHtml(node.status)}</span>
-                </div>
-                <div class="lane-count">${escapeHtml(node.type)}</div>
-              </button>
-            `).join("")}
-          </div>
+          <div class="section-title">Next Build</div>
+          <section class="panel pad roadmap-panel">
+            <div class="roadmap-step">
+              <strong>1. Broadcast campaign ledger</strong>
+              <span>Store campaign, template, audience and Meta message IDs.</span>
+            </div>
+            <div class="roadmap-step">
+              <strong>2. UTM and coupon tracking</strong>
+              <span>Attach UTM/source tags to links and discount codes.</span>
+            </div>
+            <div class="roadmap-step">
+              <strong>3. Shopify attribution</strong>
+              <span>Match orders back to WhatsApp sends and show revenue by campaign.</span>
+            </div>
+          </section>
         </aside>
       </section>
     </div>
+  `;
+}
+
+function healthLight(label, isOk, detail) {
+  return `
+    <article class="health-light ${isOk ? "ok" : "bad"}">
+      <span class="light-dot"></span>
+      <div>
+        <strong>${escapeHtml(label)}</strong>
+        <small>${escapeHtml(detail)}</small>
+      </div>
+    </article>
+  `;
+}
+
+function revenueCard(item) {
+  return `
+    <article class="metric-card revenue-card">
+      <div class="metric-label">${escapeHtml(item.label)}</div>
+      <div class="metric-value">${escapeHtml(item.value)}</div>
+      <div class="metric-delta ${item.tone === "warn" ? "warn" : ""}">${escapeHtml(item.detail)}</div>
+    </article>
+  `;
+}
+
+function emptyInline(title, detail) {
+  return `
+    <div class="empty-inline">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(detail)}</span>
+    </div>
+  `;
+}
+
+function crmTaskCard(task) {
+  return `
+    <button class="crm-task ${task.tone}" data-screen-shortcut="inbox" data-conversation-id="${escapeHtml(task.conversation.id)}">
+      <span class="avatar">${escapeHtml(task.conversation.initials)}</span>
+      <span>
+        <strong>${escapeHtml(task.title)}</strong>
+        <small>${escapeHtml(task.conversation.name)} - ${escapeHtml(task.detail)}</small>
+      </span>
+      <em>${escapeHtml(task.next)}</em>
+    </button>
   `;
 }
 
@@ -1537,53 +1706,46 @@ function diagnosticRow(label, value, tone = "") {
 function renderDiagnosticsPanel() {
   const webhook = systemStatus.webhookDiagnostics || {};
   const outbound = systemStatus.outboundDiagnostics || {};
-  const storageTone = systemStatus.storageFallbackUsed ? "orange" : systemStatus.storageMode ? "green" : "gray";
-  const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
-  const webhookTone = diagnosticsStateTone(webhook.last_post_ok);
-  const replyTone = diagnosticsStateTone(outbound.last_attempt_ok);
   const shopify = systemStatus.shopify || {};
-  const shopifyTone = shopify.enabled ? "green" : "orange";
+  const healthItems = [
+    {
+      label: "Dashboard",
+      ok: systemStatus.healthLoaded,
+      detail: systemStatus.healthLoaded ? "Live" : "Offline",
+    },
+    {
+      label: "Customer inbox",
+      ok: webhook.last_post_ok !== false && !inboxLastError,
+      detail: webhook.last_post_at ? `Last signal ${formatClientRelative(webhook.last_post_at)} ago` : "Waiting",
+    },
+    {
+      label: "WhatsApp replies",
+      ok: systemStatus.outboundEnabled && outbound.last_attempt_ok !== false,
+      detail: systemStatus.outboundEnabled ? "Ready" : "Needs token",
+    },
+    {
+      label: "Shopify data",
+      ok: Boolean(shopify.enabled),
+      detail: shopify.enabled ? "Connected" : "Pending",
+    },
+    {
+      label: "Revenue tracking",
+      ok: false,
+      detail: "Campaign attribution pending",
+    },
+  ];
 
   return `
     <section class="panel pad diagnostics-panel">
       <div class="diagnostics-head">
         <div>
-          <div class="setting-title">Live platform diagnostics</div>
-          <p class="setting-copy">Current Railway, Postgres, webhook and WhatsApp send status.</p>
+          <div class="setting-title">Platform health</div>
+          <p class="setting-copy">Simple status lights for daily operations.</p>
         </div>
-        <button class="secondary-button" data-action="refresh-diagnostics">Refresh diagnostics</button>
+        <button class="secondary-button" data-action="refresh-diagnostics">Refresh</button>
       </div>
-      <div class="diagnostics-grid">
-        <article class="diagnostic-card">
-          <span class="badge ${systemStatus.healthLoaded ? "green" : "red"}">${systemStatus.healthLoaded ? "Health online" : "Health offline"}</span>
-          ${diagnosticRow("Storage", systemStatus.storageMode || "unknown", storageTone)}
-          ${diagnosticRow("Attempted storage", systemStatus.attemptedStorageMode || systemStatus.storageMode || "unknown")}
-          ${diagnosticRow("Fallback used", boolLabel(systemStatus.storageFallbackUsed), systemStatus.storageFallbackUsed ? "orange" : "green")}
-        </article>
-        <article class="diagnostic-card">
-          <span class="badge ${outboundTone}">${systemStatus.outboundEnabled ? "WhatsApp live" : "Local only"}</span>
-          ${diagnosticRow("Graph API", systemStatus.graphApiVersion || "unknown")}
-          ${diagnosticRow("Phone number", boolLabel(systemStatus.phoneNumberConfigured), systemStatus.phoneNumberConfigured ? "green" : "red")}
-          ${diagnosticRow("Token fingerprint", systemStatus.runtime?.access_token_fingerprint || "-")}
-        </article>
-        <article class="diagnostic-card">
-          <span class="badge ${webhookTone}">Webhook ${diagnosticsStateLabel(webhook.last_post_ok)}</span>
-          ${diagnosticRow("Last webhook", webhook.last_post_at ? formatClientRelative(webhook.last_post_at) : "none")}
-          ${diagnosticRow("Reason", webhook.last_post_reason || "-")}
-          ${diagnosticRow("Last inbound", webhook.last_post_summary?.messages?.[0]?.text || webhook.last_post_summary?.statuses?.[0]?.status || "-")}
-        </article>
-        <article class="diagnostic-card">
-          <span class="badge ${replyTone}">Outbound ${diagnosticsStateLabel(outbound.last_attempt_ok)}</span>
-          ${diagnosticRow("Last attempt", outbound.last_attempt_at ? formatClientRelative(outbound.last_attempt_at) : "none")}
-          ${diagnosticRow("Reason", outbound.last_attempt_reason || "-")}
-          ${diagnosticRow("Recipient", outbound.last_recipient_wa_id || "-")}
-        </article>
-        <article class="diagnostic-card">
-          <span class="badge ${shopifyTone}">Shopify ${shopify.enabled ? "Connected" : "Pending"}</span>
-          ${diagnosticRow("Shop domain", boolLabel(shopify.shop_domain_configured), shopify.shop_domain_configured ? "green" : "orange")}
-          ${diagnosticRow("Admin token", boolLabel(shopify.admin_token_configured), shopify.admin_token_configured ? "green" : "orange")}
-          ${diagnosticRow("API version", shopify.api_version || "-")}
-        </article>
+      <div class="health-board">
+        ${healthItems.map((item) => healthLight(item.label, item.ok, item.detail)).join("")}
       </div>
     </section>
   `;

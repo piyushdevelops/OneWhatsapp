@@ -33,6 +33,7 @@ const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPI
 const SHOPIFY_ADMIN_ACCESS_TOKEN =
   process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
+const SHOPIFY_LOOKUP_TTL_MS = Number(process.env.SHOPIFY_LOOKUP_TTL_MS || 300000);
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -66,6 +67,8 @@ let outboundDiagnostics = {
   last_provider_message_id: "",
   last_error: null,
 };
+
+const shopifyLookupCache = new Map();
 
 function ensureDataDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -625,19 +628,30 @@ async function lookupShopifyCustomerByPhone(phone) {
     };
   }
 
-  for (const candidate of phoneCandidates(phone)) {
+  const candidates = phoneCandidates(phone);
+  const cacheKey = candidates[0] || String(phone || "");
+  const cached = shopifyLookupCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < SHOPIFY_LOOKUP_TTL_MS) {
+    return cached.value;
+  }
+  const remember = (value) => {
+    if (cacheKey) shopifyLookupCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  };
+
+  for (const candidate of candidates) {
     const result = await shopifyGet("customers/search.json", {
       query: `phone:${candidate}`,
       limit: "1",
     });
     if (!result.ok) {
-      return {
+      return remember({
         connected: true,
         matched: false,
         reason: result.payload?.errors || result.payload?.error || `shopify_http_${result.status}`,
         customer: null,
         orders: [],
-      };
+      });
     }
 
     const customer = result.payload?.customers?.[0];
@@ -650,16 +664,16 @@ async function lookupShopifyCustomerByPhone(phone) {
       order: "created_at desc",
     });
     const orders = ordersResult.ok ? (ordersResult.payload?.orders || []) : [];
-    return normalizeShopifyCustomer(customer, orders);
+    return remember(normalizeShopifyCustomer(customer, orders));
   }
 
-  return {
+  return remember({
     connected: true,
     matched: false,
     reason: "no_customer_match",
     customer: null,
     orders: [],
-  };
+  });
 }
 
 function suggestedReply(conversation) {
@@ -1697,8 +1711,12 @@ async function handleWebhook(req, res, parsed) {
 async function handleApi(req, res, parsed) {
   if (req.method === "GET" && parsed.pathname === "/api/inbox/conversations") {
     const conversations = await storage.listConversations();
-    return sendJson(res, 200, {
-      items: conversations.map((conversation) => ({
+    const includeShopify = shopifyConfig().enabled;
+    const items = await Promise.all(conversations.map(async (conversation) => {
+      const shopify = includeShopify
+        ? await lookupShopifyCustomerByPhone(conversation.phone || conversation.wa_id)
+        : null;
+      return {
         id: conversation.id,
         status: conversation.status,
         priority: conversation.priority,
@@ -1715,7 +1733,12 @@ async function handleApi(req, res, parsed) {
         lastOrder: conversation.lastOrder,
         latest_message_at: conversation.last_message_at,
         service_window: conversation.service_window,
-      })),
+        messages: conversation.messages || [],
+        shopify,
+      };
+    }));
+    return sendJson(res, 200, {
+      items,
       next_cursor: null,
     });
   }
