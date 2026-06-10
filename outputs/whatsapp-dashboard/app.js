@@ -3,8 +3,10 @@ const state = {
   audienceTab: "profiles",
   broadcastTab: "all",
   journeyTab: "all",
+  automationTab: "revenue",
+  selectedAutomationId: "checkout_abandonment",
   selectedConversationId: "",
-  selectedFlowNode: "incoming-message",
+  selectedFlowNode: "trigger",
   search: "",
   replyDrafts: {},
   copilotPrompts: {},
@@ -519,6 +521,16 @@ function approvedTemplates() {
   return metaTemplates.filter((template) => template.status === "APPROVED");
 }
 
+function templateUsageLabel(template) {
+  const name = `${template.name || ""} ${template.body || ""}`.toLowerCase();
+  if (/(checkout|cod|delivery|delivered|refund|return|review|winback|order|shipment)/.test(name)) {
+    return "Automation";
+  }
+  if (template.category === "UTILITY" || template.category === "AUTHENTICATION") return "Automation";
+  if (/(sale|offer|clearance|broadcast|campaign|collection)/.test(name)) return "Broadcast";
+  return "Both";
+}
+
 function liveInboxStats() {
   const conversations = liveConversations();
   const unread = conversations.reduce((sum, item) => sum + Number(item.unread || 0), 0);
@@ -673,46 +685,152 @@ const metaMessageCapabilities = [
   },
 ];
 
-const automationFlow = [
+const automationTemplates = [
   {
-    id: "incoming-message",
-    title: "Incoming WhatsApp message",
-    type: "Trigger",
-    detail: "Starts when a customer sends a WhatsApp message.",
-    status: "Live",
+    id: "checkout_abandonment",
+    name: "Checkout Abandonment",
+    group: "revenue",
+    status: "Setup ready",
     tone: "green",
-    x: 70,
-    y: 180,
+    trigger: "Shopify checkout abandoned",
+    audience: "Checkout started, no order placed",
+    templateUsage: "Automation template",
+    revenueGoal: "Recover high-intent carts",
+    nextSetup: "Connect Shopify checkout webhook and approved recovery template",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "Checkout abandoned", type: "Shopify trigger", detail: "Starts when checkout is created/updated but no order is placed.", status: "Needs webhook", tone: "green", x: 70, y: 210 },
+      { id: "wait", title: "Wait 30 minutes", type: "Control", detail: "Avoid messaging customers who complete payment quickly.", status: "Draft", tone: "blue", x: 330, y: 210 },
+      { id: "condition", title: "Order still missing?", type: "Condition", detail: "Checks whether a Shopify order exists for the same checkout/customer.", status: "Draft", tone: "orange", x: 590, y: 210 },
+      { id: "send", title: "Send recovery template", type: "WhatsApp", detail: "Uses an approved automation template with cart/order variables.", status: "Needs template", tone: "purple", x: 850, y: 130 },
+      { id: "followup", title: "Follow up after 24h", type: "WhatsApp", detail: "Optional second reminder only if no order is attributed.", status: "Optional", tone: "blue", x: 850, y: 315 },
+    ],
+    edges: [["trigger", "wait"], ["wait", "condition"], ["condition", "send"], ["condition", "followup"]],
   },
   {
-    id: "intent-check",
-    title: "Detect customer intent",
-    type: "Rule",
-    detail: "Classifies order status, return, payment or general support from the latest message.",
-    status: "Local rules",
+    id: "cod_confirmation",
+    name: "COD Confirmation",
+    group: "revenue",
+    status: "Setup ready",
     tone: "blue",
-    x: 350,
-    y: 180,
+    trigger: "Shopify order placed with COD",
+    audience: "COD orders",
+    templateUsage: "Automation template",
+    revenueGoal: "Reduce fake/COD RTO orders",
+    nextSetup: "Map payment gateway COD value and confirmation template",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "COD order placed", type: "Shopify trigger", detail: "Starts when order payment method is COD.", status: "Needs payment mapping", tone: "green", x: 70, y: 210 },
+      { id: "send", title: "Ask customer to confirm", type: "WhatsApp", detail: "Approved utility template with confirm/cancel quick replies.", status: "Needs template", tone: "purple", x: 330, y: 210 },
+      { id: "condition", title: "Customer response", type: "Condition", detail: "Branches on confirmed, cancelled, or no reply.", status: "Draft", tone: "orange", x: 590, y: 210 },
+      { id: "tag", title: "Tag confirmed order", type: "Shopify action", detail: "Adds a confirmed COD tag or creates a cancel-review task.", status: "Draft", tone: "blue", x: 850, y: 130 },
+      { id: "task", title: "Manual review", type: "Task", detail: "Creates an operations task for no-reply or cancelled COD orders.", status: "Ready", tone: "orange", x: 850, y: 315 },
+    ],
+    edges: [["trigger", "send"], ["send", "condition"], ["condition", "tag"], ["condition", "task"]],
   },
   {
-    id: "suggested-reply",
-    title: "Prepare suggested reply",
-    type: "Assistant",
-    detail: "Creates an agent-ready response without sending anything automatically.",
-    status: "Ready",
-    tone: "purple",
-    x: 630,
-    y: 120,
+    id: "cod_to_prepaid",
+    name: "COD to Prepaid",
+    group: "revenue",
+    status: "Setup ready",
+    tone: "blue",
+    trigger: "COD order placed",
+    audience: "COD customers eligible for prepaid offer",
+    templateUsage: "Automation template",
+    revenueGoal: "Move COD buyers to prepaid before fulfillment",
+    nextSetup: "Add payment-link generation and approved incentive template",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "COD order eligible", type: "Shopify trigger", detail: "Checks COD order value, city, and fulfillment state.", status: "Needs rules", tone: "green", x: 70, y: 210 },
+      { id: "condition", title: "Prepaid offer allowed?", type: "Condition", detail: "Skips excluded products or already packed orders.", status: "Draft", tone: "orange", x: 330, y: 210 },
+      { id: "send", title: "Send prepaid link", type: "WhatsApp", detail: "Uses approved marketing/utility template with payment link.", status: "Needs template", tone: "purple", x: 590, y: 210 },
+      { id: "wait", title: "Wait for payment", type: "Control", detail: "Waits for payment/update event before fulfillment action.", status: "Draft", tone: "blue", x: 850, y: 210 },
+      { id: "tag", title: "Update order tag", type: "Shopify action", detail: "Marks converted-to-prepaid or needs COD follow-up.", status: "Draft", tone: "blue", x: 1110, y: 210 },
+    ],
+    edges: [["trigger", "condition"], ["condition", "send"], ["send", "wait"], ["wait", "tag"]],
   },
   {
-    id: "handoff",
-    title: "Human review",
-    type: "Handoff",
-    detail: "Agent checks the customer context, attaches files if needed and saves the reply.",
-    status: "Required",
+    id: "delivery_failure",
+    name: "Delivery Failure Recovery",
+    group: "support",
+    status: "Setup ready",
     tone: "orange",
-    x: 630,
-    y: 310,
+    trigger: "Delivery failed / NDR event",
+    audience: "Orders with failed delivery",
+    templateUsage: "Automation template",
+    revenueGoal: "Save orders before RTO",
+    nextSetup: "Connect logistics/NDR event or Shopify tag trigger",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "Delivery failed", type: "Event trigger", detail: "Starts from logistics webhook, Shopify tag, or failed fulfillment note.", status: "Needs event source", tone: "green", x: 70, y: 210 },
+      { id: "send", title: "Ask for delivery help", type: "WhatsApp", detail: "Template asks customer to confirm address/availability.", status: "Needs template", tone: "purple", x: 330, y: 210 },
+      { id: "condition", title: "Customer replied?", type: "Condition", detail: "Branches on customer response or no response after wait.", status: "Draft", tone: "orange", x: 590, y: 210 },
+      { id: "task", title: "Create delivery task", type: "Task", detail: "Queues manual follow-up if customer is upset or delivery is time-sensitive.", status: "Ready", tone: "orange", x: 850, y: 130 },
+      { id: "tag", title: "Update order note", type: "Shopify action", detail: "Stores corrected address or preferred delivery timing.", status: "Draft", tone: "blue", x: 850, y: 315 },
+    ],
+    edges: [["trigger", "send"], ["send", "condition"], ["condition", "task"], ["condition", "tag"]],
+  },
+  {
+    id: "post_purchase_review",
+    name: "Post Purchase Review",
+    group: "revenue",
+    status: "Setup ready",
+    tone: "green",
+    trigger: "Order fulfilled + wait",
+    audience: "Delivered customers",
+    templateUsage: "Automation template",
+    revenueGoal: "Collect reviews and repeat purchase signals",
+    nextSetup: "Confirm fulfillment timing and review link template",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "Order fulfilled", type: "Shopify trigger", detail: "Starts when fulfillment is marked complete.", status: "Needs webhook", tone: "green", x: 70, y: 210 },
+      { id: "wait", title: "Wait 3 days", type: "Control", detail: "Gives customer time to receive/use product.", status: "Draft", tone: "blue", x: 330, y: 210 },
+      { id: "condition", title: "No return/refund open", type: "Condition", detail: "Skips customers with open return or support issue.", status: "Draft", tone: "orange", x: 590, y: 210 },
+      { id: "send", title: "Send review request", type: "WhatsApp", detail: "Approved review template with review link or reply prompt.", status: "Needs template", tone: "purple", x: 850, y: 210 },
+    ],
+    edges: [["trigger", "wait"], ["wait", "condition"], ["condition", "send"]],
+  },
+  {
+    id: "winback",
+    name: "Winback",
+    group: "revenue",
+    status: "Setup ready",
+    tone: "green",
+    trigger: "Customer enters winback segment",
+    audience: "No purchase in 30/45/60 days",
+    templateUsage: "Automation template",
+    revenueGoal: "Bring back dormant buyers",
+    nextSetup: "Choose segment window and approved offer template",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "Enter winback segment", type: "Segment trigger", detail: "Starts when Shopify/WhatsApp rules place customer in winback.", status: "Ready", tone: "green", x: 70, y: 210 },
+      { id: "condition", title: "Suppress recent buyers", type: "Condition", detail: "Excludes customers with very recent order, opt-out, or open support issue.", status: "Draft", tone: "orange", x: 330, y: 210 },
+      { id: "send", title: "Send winback offer", type: "WhatsApp", detail: "Approved marketing template with UTM offer link.", status: "Needs template", tone: "purple", x: 590, y: 210 },
+      { id: "wait", title: "Wait 3 days", type: "Control", detail: "Waits for purchase/reply before follow-up.", status: "Draft", tone: "blue", x: 850, y: 210 },
+      { id: "followup", title: "Last chance follow-up", type: "WhatsApp", detail: "Optional second send for non-purchasers only.", status: "Optional", tone: "purple", x: 1110, y: 210 },
+    ],
+    edges: [["trigger", "condition"], ["condition", "send"], ["send", "wait"], ["wait", "followup"]],
+  },
+  {
+    id: "return_refund",
+    name: "Return / Refund Follow-up",
+    group: "support",
+    status: "Setup ready",
+    tone: "orange",
+    trigger: "Return delivered / refund pending",
+    audience: "Customers with after-sales cases",
+    templateUsage: "Automation template",
+    revenueGoal: "Reduce angry support and missed refunds",
+    nextSetup: "Map return-delivered/refund event from Shopify or logistics",
+    metrics: { sent: 0, revenue: "Rs. 0", conversion: "0%" },
+    nodes: [
+      { id: "trigger", title: "Return delivered", type: "Event trigger", detail: "Starts when return package is delivered or refund is pending.", status: "Needs event source", tone: "green", x: 70, y: 210 },
+      { id: "condition", title: "Refund already processed?", type: "Condition", detail: "Checks Shopify refund/order status before messaging.", status: "Draft", tone: "orange", x: 330, y: 210 },
+      { id: "send", title: "Send refund update", type: "WhatsApp", detail: "Approved utility template with refund timeline.", status: "Needs template", tone: "purple", x: 590, y: 130 },
+      { id: "task", title: "Create refund task", type: "Task", detail: "Queues internal work if refund is overdue or customer is upset.", status: "Ready", tone: "orange", x: 590, y: 315 },
+      { id: "end", title: "Close loop", type: "Control", detail: "Ends when refund/status is resolved.", status: "Draft", tone: "blue", x: 850, y: 210 },
+    ],
+    edges: [["trigger", "condition"], ["condition", "send"], ["condition", "task"], ["send", "end"], ["task", "end"]],
   },
 ];
 
@@ -1376,55 +1494,117 @@ function renderTemplateTable(rowsData) {
       <td><span class="row-title">${escapeHtml(template.name)}</span></td>
       <td><span class="badge ${template.status === "APPROVED" ? "green" : template.status === "REJECTED" ? "red" : "orange"}">${escapeHtml(template.status || "-")}</span></td>
       <td><strong>${escapeHtml(template.category)}</strong></td>
+      <td><span class="badge ${templateUsageLabel(template) === "Broadcast" ? "blue" : templateUsageLabel(template) === "Automation" ? "orange" : "green"}">${escapeHtml(templateUsageLabel(template))}</span></td>
       <td>${escapeHtml(template.language || "-")}</td>
       <td>${escapeHtml(template.created ? formatContextDate(template.created) : "-")}</td>
       <td>${escapeHtml(template.disabled || "-")}</td>
       <td><button class="ghost-button" data-action="open-broadcast-modal" ${template.status !== "APPROVED" ? "disabled" : ""}>Use</button></td>
     </tr>
   `).join("");
-  return table(["Template Name", "Approval Status", "Category", "Language", "Created At", "Disabled At", ""], rows);
+  return table(["Template Name", "Approval Status", "Category", "Usage", "Language", "Created At", "Disabled At", ""], rows);
 }
 
 function renderJourneys() {
+  const filtered = automationTemplates.filter((item) => item.group === state.automationTab);
+  const liveTemplates = approvedTemplates().length;
+  const readyCount = automationTemplates.length;
   return `
     <div class="page-stack">
-      <div class="metric-grid three">
-        ${metric("New message trigger", "1", "Incoming WhatsApp message")}
-        ${metric("Auto-sent messages", "0", "Human review is required")}
-        ${metric("Flow status", "Draft", "Ready to connect outbound token", "warn")}
+      <section class="panel pad">
+        <div class="campaign-head">
+          <div>
+            <span class="eyebrow">Automation command center</span>
+            <h2>Revenue and support flows are setup-ready.</h2>
+            <p>Each automation has a trigger, conditions, WhatsApp template slot, fallback path and execution gap list. Studio opens the exact flow map.</p>
+          </div>
+          <button class="primary-button" data-screen-shortcut="bot">Open Studio</button>
+        </div>
+      </section>
+
+      <div class="metric-grid four">
+        ${metric("Automation blueprints", readyCount, "Prebuilt for The June Shop")}
+        ${metric("Approved templates", liveTemplates, liveTemplates ? "Available for journeys" : "Create automation templates", liveTemplates ? "" : "warn")}
+        ${metric("Shopify triggers", systemStatus.shopify?.enabled ? "Connected" : "Pending", "Order, checkout and customer events", systemStatus.shopify?.enabled ? "" : "warn")}
+        ${metric("Execution engine", "Draft", "Next backend layer: scheduler + logs", "warn")}
       </div>
-      <section class="automation-workbench">
-        ${renderAutomationCanvas()}
-        ${renderAutomationInspector()}
+
+      <div class="toolbar">
+        <div class="tabs">
+          ${tab("revenue", "Revenue Automations", state.automationTab, "automationTab")}
+          ${tab("support", "Support Automations", state.automationTab, "automationTab")}
+        </div>
+        <div class="toolbar-right">
+          <span class="badge gray">Templates split by Broadcast / Automation / Both</span>
+        </div>
+      </div>
+
+      <section class="automation-table-wrap">
+        ${renderAutomationTable(filtered)}
       </section>
     </div>
   `;
 }
 
+function renderAutomationTable(items) {
+  const rows = items.map((item) => `
+    <tr>
+      <td>
+        <span class="row-title">${escapeHtml(item.name)}</span>
+        <div class="row-subtle">${escapeHtml(item.revenueGoal)}</div>
+      </td>
+      <td><span class="badge ${item.group === "revenue" ? "green" : "orange"}">${escapeHtml(item.status)}</span></td>
+      <td>${escapeHtml(item.trigger)}</td>
+      <td>${escapeHtml(item.audience)}</td>
+      <td>${escapeHtml(item.templateUsage)}</td>
+      <td>${escapeHtml(item.metrics.sent)}</td>
+      <td>${escapeHtml(item.metrics.revenue)}</td>
+      <td>${escapeHtml(item.nextSetup)}</td>
+      <td><button class="ghost-button" data-automation-id="${escapeHtml(item.id)}" data-screen-shortcut="bot">Open</button></td>
+    </tr>
+  `).join("");
+  return table(["Automation", "Status", "Trigger", "Audience", "Template", "Sent", "Revenue", "Next setup", ""], rows);
+}
+
+function selectedAutomation() {
+  return automationTemplates.find((item) => item.id === state.selectedAutomationId) || automationTemplates[0];
+}
+
 function selectedAutomationNode() {
-  return automationFlow.find((node) => node.id === state.selectedFlowNode) || automationFlow[0];
+  const automation = selectedAutomation();
+  return automation.nodes.find((node) => node.id === state.selectedFlowNode) || automation.nodes[0];
 }
 
 function renderAutomationCanvas(compact = false) {
+  const automation = selectedAutomation();
+  const nodeById = Object.fromEntries(automation.nodes.map((node) => [node.id, node]));
   return `
     <section class="automation-canvas ${compact ? "compact" : ""}">
-      ${automationFlow.map((node) => `
+      ${automation.nodes.map((node) => `
         <button class="automation-node ${node.tone} ${node.id === state.selectedFlowNode ? "active" : ""}" style="left:${node.x}px; top:${node.y}px;" data-flow-node="${node.id}">
           <span>${escapeHtml(node.type)}</span>
           <strong>${escapeHtml(node.title)}</strong>
           <small>${escapeHtml(node.status)}</small>
         </button>
       `).join("")}
-      <svg class="automation-lines" viewBox="0 0 930 520" aria-hidden="true">
-        <path d="M260 230 C310 230 315 230 350 230" />
-        <path d="M540 230 C590 230 585 170 630 170" />
-        <path d="M540 230 C590 230 585 360 630 360" />
+      <svg class="automation-lines" viewBox="0 0 1360 560" aria-hidden="true">
+        ${automation.edges.map(([from, to]) => automationConnector(nodeById[from], nodeById[to])).join("")}
       </svg>
     </section>
   `;
 }
 
+function automationConnector(from, to) {
+  if (!from || !to) return "";
+  const startX = from.x + 210;
+  const startY = from.y + 56;
+  const endX = to.x;
+  const endY = to.y + 56;
+  const mid = Math.max(55, Math.abs(endX - startX) / 2);
+  return `<path d="M${startX} ${startY} C ${startX + mid} ${startY}, ${endX - mid} ${endY}, ${endX} ${endY}" />`;
+}
+
 function renderAutomationInspector() {
+  const automation = selectedAutomation();
   const node = selectedAutomationNode();
   return `
     <aside class="automation-inspector">
@@ -1432,11 +1612,13 @@ function renderAutomationInspector() {
       <h2>${escapeHtml(node.title)}</h2>
       <p>${escapeHtml(node.detail)}</p>
       <div class="inspector-list">
+        ${profileRow("Automation", automation.name)}
         ${profileRow("Node type", node.type)}
-        ${profileRow("Current mode", node.id === "handoff" ? "Agent-owned" : "Local draft")}
-        ${profileRow("Sends to WhatsApp", node.id === "handoff" ? "After token setup" : "No")}
+        ${profileRow("Template slot", automation.templateUsage)}
+        ${profileRow("Current mode", automation.status)}
+        ${profileRow("Next setup", automation.nextSetup)}
       </div>
-      <button class="secondary-button" data-screen-shortcut="bot">Edit in Studio</button>
+      <button class="secondary-button" data-screen-shortcut="templates">Manage templates</button>
     </aside>
   `;
 }
@@ -1900,35 +2082,58 @@ function customerContextPanel(selected, messages, brief) {
 }
 
 function renderBot() {
+  const automation = selectedAutomation();
   return `
     <div class="flow-shell">
       <aside class="flow-sidebar">
-        <button class="secondary-button" style="width: 100%;" data-action="new-flow">Create automation draft</button>
-        <div class="flow-list-title">YOUR FLOWS</div>
-        <button class="flow-item active">Customer message triage</button>
+        <button class="secondary-button" style="width: 100%;" data-action="new-flow">Create custom automation</button>
+        <div class="flow-list-title">YOUR AUTOMATIONS</div>
+        ${automationTemplates.map((item) => `
+          <button class="flow-item ${item.id === state.selectedAutomationId ? "active" : ""}" data-automation-id="${escapeHtml(item.id)}">
+            <span>${escapeHtml(item.name)}</span>
+            <small>${escapeHtml(item.trigger)}</small>
+          </button>
+        `).join("")}
       </aside>
       <section class="canvas">
         <div class="flow-top">
-          <div class="flow-name">Customer message triage <button class="ghost-button icon-only" aria-label="Rename flow">...</button></div>
+          <div class="flow-name">${escapeHtml(automation.name)} <button class="ghost-button icon-only" aria-label="Rename flow">...</button></div>
           <button class="primary-button" data-action="save-flow">Save automation draft</button>
         </div>
         <div class="flow-health-board">
-          <div><span>Trigger</span><strong>WhatsApp live</strong></div>
-          <div><span>Outbound mode</span><strong>Local only</strong></div>
-          <div><span>Human fallback</span><strong>Required</strong></div>
+          <div><span>Trigger</span><strong>${escapeHtml(automation.trigger)}</strong></div>
+          <div><span>Audience</span><strong>${escapeHtml(automation.audience)}</strong></div>
+          <div><span>Template</span><strong>${escapeHtml(automation.templateUsage)}</strong></div>
         </div>
         ${renderAutomationCanvas(true)}
       </section>
       <aside class="palette studio-panel">
         ${renderAutomationInspector()}
-        <div class="panel-title" style="margin: 18px 0 12px;">Useful nodes</div>
+        <div class="panel-title" style="margin: 18px 0 12px;">Node library</div>
         <div class="palette-grid">
-          ${palette("Template")}
-          ${palette("Media Upload")}
-          ${palette("Intent Rule")}
-          ${palette("Agent Handoff")}
-          ${palette("Quick Reply")}
+          ${palette("Shopify Trigger")}
+          ${palette("Segment Entry")}
+          ${palette("Wait")}
+          ${palette("Condition Split")}
+          ${palette("Send Template")}
+          ${palette("Wait For Event")}
+          ${palette("Create Task")}
           ${palette("Tag Customer")}
+          ${palette("AI Intent Check")}
+          ${palette("End Journey")}
+        </div>
+        <div class="panel-title" style="margin: 18px 0 12px;">Template rules</div>
+        <div class="studio-advice">
+          <article>
+            <span class="badge blue">Automation</span>
+            <h3>Triggered templates</h3>
+            <p>Use for checkout, COD, delivery, refund, review and winback journeys.</p>
+          </article>
+          <article>
+            <span class="badge green">Broadcast</span>
+            <h3>One-time campaigns</h3>
+            <p>Use for manual or scheduled campaign sends from Campaigns.</p>
+          </article>
         </div>
       </aside>
     </div>
@@ -2607,6 +2812,10 @@ function openTemplateModal() {
               <select id="template-create-language" class="select"><option value="en_US">English</option><option value="hi">Hindi</option></select>
             </div>
             <div>
+              <label class="label">Usage in platform</label>
+              <select id="template-create-usage" class="select"><option>Automation</option><option>Broadcast</option><option>Both</option></select>
+            </div>
+            <div>
               <label class="label">Sender number</label>
               <input class="field" value="${escapeHtml(systemStatus.runtime?.phone_number_id ? "Connected WhatsApp number" : "Connect Meta number first")}" disabled />
             </div>
@@ -2720,6 +2929,10 @@ document.addEventListener("click", (event) => {
 
   const shortcut = event.target.closest("[data-screen-shortcut]");
   if (shortcut) {
+    if (shortcut.dataset.automationId) {
+      state.selectedAutomationId = shortcut.dataset.automationId;
+      state.selectedFlowNode = selectedAutomation().nodes[0]?.id || "trigger";
+    }
     if (shortcut.dataset.conversationId) {
       state.selectedConversationId = shortcut.dataset.conversationId;
       inboxLoadedAt = 0;
@@ -2731,6 +2944,14 @@ document.addEventListener("click", (event) => {
   const tabButton = event.target.closest("[data-tab-key]");
   if (tabButton) {
     state[tabButton.dataset.tabKey] = tabButton.dataset.tabValue;
+    render();
+    return;
+  }
+
+  const automationButton = event.target.closest("[data-automation-id]");
+  if (automationButton) {
+    state.selectedAutomationId = automationButton.dataset.automationId;
+    state.selectedFlowNode = selectedAutomation().nodes[0]?.id || "trigger";
     render();
     return;
   }
