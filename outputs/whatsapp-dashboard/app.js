@@ -10,6 +10,7 @@ const state = {
   search: "",
   replyDrafts: {},
   copilotPrompts: {},
+  broadcastSegmentSeed: "",
 };
 
 const BRAND_NAME = "The June Shop";
@@ -64,6 +65,7 @@ let systemStatus = {
   outboundDiagnostics: null,
   shopify: null,
   automation: null,
+  broadcasts: null,
   healthLoaded: false,
 };
 
@@ -96,6 +98,7 @@ async function loadSystemStatus() {
       outboundDiagnostics: payload.outbound_diagnostics || null,
       shopify: payload.shopify || null,
       automation: payload.automation || null,
+      broadcasts: payload.broadcasts || null,
       healthLoaded: true,
     };
   } catch {
@@ -112,6 +115,7 @@ async function loadSystemStatus() {
       outboundDiagnostics: null,
       shopify: null,
       automation: null,
+      broadcasts: null,
       healthLoaded: false,
     };
   } finally {
@@ -352,6 +356,11 @@ function customerShopifyStats(customer) {
   const orderCount = Number(shopifyCustomer.orders_count || orders.length || 0);
   const averageOrder = orderCount ? totalSpent / orderCount : 0;
   const latestOrder = orders[0] || null;
+  const latestAddress = latestOrder?.shipping_address || {};
+  const productText = orders
+    .flatMap((order) => order.line_items || [])
+    .map((item) => item.name || "")
+    .join(" ");
   return {
     matched: Boolean(shopify.matched),
     totalSpent,
@@ -359,6 +368,12 @@ function customerShopifyStats(customer) {
     averageOrder,
     tags: shopifyCustomer.tags || "",
     latestOrder,
+    latestOrderDays: daysSince(latestOrder?.processed_at || latestOrder?.created_at),
+    financialStatus: latestOrder?.financial_status || "",
+    fulfillmentStatus: latestOrder?.fulfillment_status || "",
+    city: latestAddress.city || "",
+    province: latestAddress.province || "",
+    productText,
   };
 }
 
@@ -367,6 +382,68 @@ function customerTextBlob(customer) {
     customer.lastMessage,
     ...(customer.messages || []).map((message) => message.text || message.body || ""),
   ].join(" ");
+}
+
+function daysSince(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
+}
+
+function textContains(value, query) {
+  if (!query) return true;
+  return String(value || "").toLowerCase().includes(String(query).toLowerCase());
+}
+
+function segmentHasShopifyRules(rules = {}) {
+  return Boolean(
+    Number(rules.min_orders || 0)
+    || Number(rules.max_orders || 0)
+    || Number(rules.min_spend || 0)
+    || Number(rules.max_spend || 0)
+    || Number(rules.min_aov || 0)
+    || Number(rules.last_order_within_days || 0)
+    || Number(rules.last_order_older_than_days || 0)
+    || rules.tag
+    || rules.product_keyword
+    || rules.city
+    || rules.province
+    || rules.financial_status
+    || rules.fulfillment_status
+    || rules.shopify_segment
+  );
+}
+
+function customSegmentMatches(customer, segment) {
+  const stats = customerShopifyStats(customer);
+  const text = customerTextBlob(customer);
+  const rules = segment.rules || {};
+  const checks = [];
+  const source = segment.source || "Combined";
+  if (source === "Shopify" || segmentHasShopifyRules(rules)) checks.push(stats.matched);
+  if (Number(rules.min_orders || 0)) checks.push(stats.orderCount >= Number(rules.min_orders));
+  if (Number(rules.max_orders || 0)) checks.push(stats.orderCount <= Number(rules.max_orders));
+  if (Number(rules.min_spend || 0)) checks.push(stats.totalSpent >= Number(rules.min_spend));
+  if (Number(rules.max_spend || 0)) checks.push(stats.totalSpent <= Number(rules.max_spend));
+  if (Number(rules.min_aov || 0)) checks.push(stats.averageOrder >= Number(rules.min_aov));
+  if (Number(rules.last_order_within_days || 0)) {
+    checks.push(stats.latestOrderDays !== null && stats.latestOrderDays <= Number(rules.last_order_within_days));
+  }
+  if (Number(rules.last_order_older_than_days || 0)) {
+    checks.push(stats.latestOrderDays !== null && stats.latestOrderDays >= Number(rules.last_order_older_than_days));
+  }
+  if (rules.keyword) checks.push(textContains(text, rules.keyword));
+  if (rules.tag) checks.push(textContains(stats.tags, rules.tag));
+  if (rules.product_keyword) checks.push(textContains(stats.productText, rules.product_keyword));
+  if (rules.city) checks.push(textContains(stats.city, rules.city));
+  if (rules.province) checks.push(textContains(stats.province, rules.province));
+  if (rules.financial_status) checks.push(textContains(stats.financialStatus, rules.financial_status));
+  if (rules.fulfillment_status) checks.push(textContains(stats.fulfillmentStatus, rules.fulfillment_status));
+  if (rules.has_unread === true || rules.has_unread === "true") checks.push(Number(customer.unread || 0) > 0);
+  if (rules.has_unread === false || rules.has_unread === "false") checks.push(Number(customer.unread || 0) === 0);
+  if (!checks.length) return true;
+  return (segment.match_mode || segment.matchMode || "all") === "any" ? checks.some(Boolean) : checks.every(Boolean);
 }
 
 const localSegmentRules = [
@@ -443,24 +520,7 @@ function localSegments() {
     };
   });
   const stored = [...savedSegments, ...customSegments].map((segment) => {
-    const members = customers.filter((customer) => {
-      const stats = customerShopifyStats(customer);
-      const text = customerTextBlob(customer);
-      const rules = [];
-      const segmentRules = segment.rules || {};
-      const matchMode = segment.match_mode || segment.matchMode || "all";
-      const minOrders = Number(segmentRules.min_orders ?? segment.minOrders ?? 0);
-      const minSpend = Number(segmentRules.min_spend ?? segment.minSpend ?? 0);
-      const keyword = segmentRules.keyword ?? segment.intentKeyword ?? "";
-      const tag = segmentRules.tag ?? segment.tag ?? "";
-      if (segment.source === "Shopify" || segment.source === "Combined") rules.push(stats.matched);
-      if (minOrders) rules.push(stats.orderCount >= minOrders);
-      if (minSpend) rules.push(stats.totalSpent >= minSpend);
-      if (keyword) rules.push(new RegExp(escapeRegExp(keyword), "i").test(text));
-      if (tag) rules.push(stats.tags.toLowerCase().includes(String(tag).toLowerCase()));
-      if (!rules.length) return true;
-      return matchMode === "any" ? rules.some(Boolean) : rules.every(Boolean);
-    });
+    const members = customers.filter((customer) => customSegmentMatches(customer, segment));
     return {
       id: segment.id,
       name: segment.name,
@@ -480,9 +540,22 @@ function segmentRuleText(segment) {
   const rules = segment.rules || {};
   const parts = [
     rules.min_orders ? `orders >= ${rules.min_orders}` : "",
+    rules.max_orders ? `orders <= ${rules.max_orders}` : "",
     rules.min_spend ? `spend >= Rs. ${rules.min_spend}` : "",
+    rules.max_spend ? `spend <= Rs. ${rules.max_spend}` : "",
+    rules.min_aov ? `AOV >= Rs. ${rules.min_aov}` : "",
+    rules.last_order_within_days ? `ordered within ${rules.last_order_within_days} days` : "",
+    rules.last_order_older_than_days ? `last order older than ${rules.last_order_older_than_days} days` : "",
     rules.keyword ? `message contains "${rules.keyword}"` : "",
     rules.tag ? `Shopify tag contains "${rules.tag}"` : "",
+    rules.product_keyword ? `product contains "${rules.product_keyword}"` : "",
+    rules.city ? `city contains "${rules.city}"` : "",
+    rules.province ? `state contains "${rules.province}"` : "",
+    rules.financial_status ? `payment is "${rules.financial_status}"` : "",
+    rules.fulfillment_status ? `fulfillment is "${rules.fulfillment_status}"` : "",
+    rules.has_unread === true || rules.has_unread === "true" ? "has unread WhatsApp" : "",
+    rules.has_unread === false || rules.has_unread === "false" ? "no unread WhatsApp" : "",
+    rules.shopify_segment ? `Shopify segment: ${rules.shopify_segment}` : "",
   ].filter(Boolean);
   return parts.join((segment.match_mode || "all") === "any" ? " OR " : " AND ") || "All current customers";
 }
@@ -1547,7 +1620,7 @@ function renderSegmentTable(segments) {
       <td><span class="badge ${segment.source === "Shopify" ? "blue" : segment.source.includes("Shopify") ? "green" : "gray"}">${escapeHtml(segment.source)}</span></td>
       <td>${escapeHtml(segment.ruleText || "-")}</td>
       <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
     </tr>
   `).join("");
   return table(["Segment Name", "Segment Size", "Source", "Rule", "Updated At", ""], rows);
@@ -1572,7 +1645,7 @@ function renderShopifySegmentsTable() {
       <td>${segment.size === null || segment.size === undefined ? "-" : segment.size}</td>
       <td><span class="badge blue">Shopify</span></td>
       <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "-")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal">Use in broadcast</button></td>
+      <td><button class="ghost-button" data-action="open-segment-modal">Build local rules</button></td>
     </tr>
   `).join("");
   return table(["Shopify Segment", "Segment Size", "Source", "Updated At", ""], rows);
@@ -1670,10 +1743,49 @@ function renderBroadcastCampaigns() {
       <td>${draft.analytics?.read_rate || 0}%</td>
       <td>${formatMoney(draft.analytics?.attributed_revenue || 0, draft.analytics?.currency || "INR")}</td>
       <td>${draft.analytics?.order_rate || 0}%</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal">Duplicate</button></td>
+      <td>
+        <button class="ghost-button" data-action="open-broadcast-report" data-campaign-id="${escapeHtml(draft.id)}">Report</button>
+        <button class="ghost-button" data-action="open-broadcast-modal">Duplicate</button>
+      </td>
     </tr>
   `).join("");
   return table(["Campaign", "Status", "Send Time", "Recipients", "Delivered", "Read Rate", "Revenue", "Order Rate", ""], rows);
+}
+
+function openBroadcastReportModal(campaignId) {
+  const campaign = savedBroadcasts.find((item) => item.id === campaignId);
+  if (!campaign) {
+    showToast("Campaign report is not loaded yet.");
+    return;
+  }
+  const analytics = campaign.analytics || {};
+  openModal(
+    `${campaign.name} report`,
+    `
+      <div class="page-stack">
+        <div class="metric-grid four">
+          ${metric("Sent", analytics.sent || 0, "Accepted by Meta")}
+          ${metric("Delivered", analytics.delivered || 0, `${analytics.delivery_rate || 0}% delivery rate`)}
+          ${metric("Read", analytics.read || 0, `${analytics.read_rate || 0}% read rate`)}
+          ${metric("Revenue", formatMoney(analytics.attributed_revenue || 0, analytics.currency || "INR"), `${analytics.attributed_orders || 0} attributed orders`)}
+        </div>
+        <section class="panel pad">
+          <div class="setting-title">Campaign setup</div>
+          <div class="context-grid">
+            ${contextMetric("Template", campaign.template_name || "-")}
+            ${contextMetric("Audience", campaign.audience_label || "-")}
+            ${contextMetric("Recipients", String(campaign.recipient_count || 0))}
+            ${contextMetric("Status", broadcastStatusLabel(campaign.status))}
+            ${contextMetric("UTM source", campaign.utm_source || "-")}
+            ${contextMetric("UTM medium", campaign.utm_medium || "-")}
+            ${contextMetric("UTM campaign", campaign.utm_campaign || "-")}
+            ${contextMetric("Last error", campaign.last_send_error || "-")}
+          </div>
+        </section>
+      </div>
+    `,
+    `<button class="ghost-button" data-action="close-modal">Close</button><button class="primary-button" data-action="open-broadcast-modal">Duplicate campaign</button>`
+  );
 }
 
 function broadcastStatusLabel(status) {
@@ -2755,8 +2867,8 @@ function renderDiagnosticsPanel() {
     },
     {
       label: "Revenue tracking",
-      ok: false,
-      detail: "Campaign attribution pending",
+      ok: Boolean(systemStatus.broadcasts?.scheduler_enabled),
+      detail: systemStatus.broadcasts?.scheduler_enabled ? "Broadcast attribution ready" : "Waiting",
     },
   ];
 
@@ -3242,9 +3354,21 @@ async function saveCustomSegment() {
   const source = document.getElementById("segment-source")?.value || "Combined";
   const matchMode = document.getElementById("segment-match-mode")?.value || "all";
   const minOrders = document.getElementById("segment-min-orders")?.value?.trim();
+  const maxOrders = document.getElementById("segment-max-orders")?.value?.trim();
   const minSpend = document.getElementById("segment-min-spend")?.value?.trim();
+  const maxSpend = document.getElementById("segment-max-spend")?.value?.trim();
+  const minAov = document.getElementById("segment-min-aov")?.value?.trim();
+  const lastOrderWithin = document.getElementById("segment-last-order-within")?.value?.trim();
+  const lastOrderOlder = document.getElementById("segment-last-order-older")?.value?.trim();
   const intentKeyword = document.getElementById("segment-keyword")?.value?.trim();
   const tag = document.getElementById("segment-tag")?.value?.trim();
+  const productKeyword = document.getElementById("segment-product-keyword")?.value?.trim();
+  const city = document.getElementById("segment-city")?.value?.trim();
+  const province = document.getElementById("segment-province")?.value?.trim();
+  const financialStatus = document.getElementById("segment-financial-status")?.value?.trim();
+  const fulfillmentStatus = document.getElementById("segment-fulfillment-status")?.value?.trim();
+  const hasUnread = document.getElementById("segment-has-unread")?.value || "";
+  const shopifySegment = document.getElementById("segment-shopify-segment")?.value?.trim();
   const description = document.getElementById("segment-description")?.value?.trim();
   if (!name) {
     showToast("Segment name is required.");
@@ -3256,16 +3380,40 @@ async function saveCustomSegment() {
     match_mode: matchMode,
     rules: {
       min_orders: Number(minOrders || 0),
+      max_orders: Number(maxOrders || 0),
       min_spend: Number(minSpend || 0),
+      max_spend: Number(maxSpend || 0),
+      min_aov: Number(minAov || 0),
+      last_order_within_days: Number(lastOrderWithin || 0),
+      last_order_older_than_days: Number(lastOrderOlder || 0),
       keyword: intentKeyword || "",
       tag: tag || "",
+      product_keyword: productKeyword || "",
+      city: city || "",
+      province: province || "",
+      financial_status: financialStatus || "",
+      fulfillment_status: fulfillmentStatus || "",
+      has_unread: hasUnread === "" ? "" : hasUnread === "true",
+      shopify_segment: shopifySegment || "",
     },
     description: description || "Custom live segment",
     ruleText: [
       minOrders ? `orders >= ${minOrders}` : "",
+      maxOrders ? `orders <= ${maxOrders}` : "",
       minSpend ? `spend >= Rs. ${minSpend}` : "",
+      maxSpend ? `spend <= Rs. ${maxSpend}` : "",
+      minAov ? `AOV >= Rs. ${minAov}` : "",
+      lastOrderWithin ? `ordered within ${lastOrderWithin} days` : "",
+      lastOrderOlder ? `last order older than ${lastOrderOlder} days` : "",
       intentKeyword ? `message contains "${intentKeyword}"` : "",
       tag ? `Shopify tag contains "${tag}"` : "",
+      productKeyword ? `product contains "${productKeyword}"` : "",
+      city ? `city contains "${city}"` : "",
+      province ? `state contains "${province}"` : "",
+      financialStatus ? `payment is "${financialStatus}"` : "",
+      fulfillmentStatus ? `fulfillment is "${fulfillmentStatus}"` : "",
+      hasUnread ? (hasUnread === "true" ? "has unread WhatsApp" : "no unread WhatsApp") : "",
+      shopifySegment ? `Shopify segment: ${shopifySegment}` : "",
     ].filter(Boolean).join(matchMode === "any" ? " OR " : " AND ") || "All current customers",
   };
   const response = await fetch(`${INBOX_API_BASE}/api/audience/segments`, {
@@ -3333,14 +3481,16 @@ function openBroadcastModal() {
   const templates = approvedTemplates();
   const customers = liveCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
-  const selectedSegmentId = "all_customers";
+  const seededSegmentId = state.broadcastSegmentSeed;
+  const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
+  state.broadcastSegmentSeed = "";
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
-    `<option value="all_customers">All current WhatsApp customers (${customers.length})</option>`,
-    ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}">${escapeHtml(segment.name)} (${segment.size})</option>`),
+    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All current WhatsApp customers (${customers.length})</option>`,
+    ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
   const customerRows = broadcastRecipientRows(defaultRecipients);
   openModal(
@@ -3533,6 +3683,9 @@ function openTemplateModal() {
 }
 
 function openSegmentModal() {
+  const shopifySegmentOptions = shopifySegments.length
+    ? shopifySegments.map((segment) => `<option value="${escapeHtml(segment.name)}">${escapeHtml(segment.name)}</option>`).join("")
+    : "";
   openModal(
     "Create live segment",
     `
@@ -3550,12 +3703,32 @@ function openSegmentModal() {
           <select id="segment-match-mode" class="select"><option value="all">Match all rules</option><option value="any">Match any rule</option></select>
         </div>
         <div>
-          <label class="label">Minimum Shopify orders</label>
+          <label class="label">Min orders</label>
           <input id="segment-min-orders" class="field" type="number" min="0" placeholder="3" />
         </div>
         <div>
-          <label class="label">Minimum lifetime spend</label>
+          <label class="label">Max orders</label>
+          <input id="segment-max-orders" class="field" type="number" min="0" placeholder="10" />
+        </div>
+        <div>
+          <label class="label">Min lifetime spend</label>
           <input id="segment-min-spend" class="field" type="number" min="0" placeholder="5000" />
+        </div>
+        <div>
+          <label class="label">Max lifetime spend</label>
+          <input id="segment-max-spend" class="field" type="number" min="0" placeholder="25000" />
+        </div>
+        <div>
+          <label class="label">Min AOV</label>
+          <input id="segment-min-aov" class="field" type="number" min="0" placeholder="2000" />
+        </div>
+        <div>
+          <label class="label">Ordered within days</label>
+          <input id="segment-last-order-within" class="field" type="number" min="0" placeholder="30" />
+        </div>
+        <div>
+          <label class="label">Last order older than days</label>
+          <input id="segment-last-order-older" class="field" type="number" min="0" placeholder="60" />
         </div>
         <div>
           <label class="label">Message keyword / intent</label>
@@ -3564,6 +3737,53 @@ function openSegmentModal() {
         <div>
           <label class="label">Shopify tag contains</label>
           <input id="segment-tag" class="field" placeholder="vip, wholesale, repeat" />
+        </div>
+        <div>
+          <label class="label">Product contains</label>
+          <input id="segment-product-keyword" class="field" placeholder="planner, lamp, glassware" />
+        </div>
+        <div>
+          <label class="label">City contains</label>
+          <input id="segment-city" class="field" placeholder="Mumbai" />
+        </div>
+        <div>
+          <label class="label">State contains</label>
+          <input id="segment-province" class="field" placeholder="Maharashtra" />
+        </div>
+        <div>
+          <label class="label">Payment status</label>
+          <select id="segment-financial-status" class="select">
+            <option value="">Any payment status</option>
+            <option value="paid">Paid</option>
+            <option value="pending">Pending</option>
+            <option value="refunded">Refunded</option>
+            <option value="partially_refunded">Partially refunded</option>
+          </select>
+        </div>
+        <div>
+          <label class="label">Fulfillment status</label>
+          <select id="segment-fulfillment-status" class="select">
+            <option value="">Any fulfillment status</option>
+            <option value="fulfilled">Fulfilled</option>
+            <option value="unfulfilled">Unfulfilled</option>
+            <option value="partial">Partial</option>
+            <option value="delivered">Delivered</option>
+          </select>
+        </div>
+        <div>
+          <label class="label">WhatsApp unread</label>
+          <select id="segment-has-unread" class="select">
+            <option value="">Any conversation state</option>
+            <option value="true">Has unread message</option>
+            <option value="false">No unread message</option>
+          </select>
+        </div>
+        <div>
+          <label class="label">Shopify segment source</label>
+          <select id="segment-shopify-segment" class="select">
+            <option value="">No imported Shopify segment</option>
+            ${shopifySegmentOptions}
+          </select>
         </div>
         <div class="wide">
           <label class="label">Description</label>
@@ -3640,11 +3860,16 @@ document.addEventListener("click", (event) => {
     toggle.classList.toggle("on");
   }
 
-  const action = event.target.closest("[data-action]")?.dataset.action;
+  const actionTarget = event.target.closest("[data-action]");
+  const action = actionTarget?.dataset.action;
   if (!action) return;
 
   const handlers = {
-    "open-broadcast-modal": openBroadcastModal,
+    "open-broadcast-modal": () => {
+      state.broadcastSegmentSeed = actionTarget.dataset.segmentId || "";
+      openBroadcastModal();
+    },
+    "open-broadcast-report": () => openBroadcastReportModal(actionTarget.dataset.campaignId),
     "open-template-modal": openTemplateModal,
     "open-segment-modal": openSegmentModal,
     "close-modal": closeModal,
