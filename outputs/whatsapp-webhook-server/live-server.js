@@ -1252,6 +1252,54 @@ async function shopifyGet(pathname, query = {}) {
   };
 }
 
+function parseShopifyNextPageInfo(linkHeader) {
+  const nextLink = String(linkHeader || "")
+    .split(",")
+    .find((part) => /rel="?next"?/i.test(part));
+  const href = nextLink?.match(/<([^>]+)>/)?.[1];
+  if (!href) return "";
+  try {
+    return new URL(href).searchParams.get("page_info") || "";
+  } catch {
+    return "";
+  }
+}
+
+async function shopifyGetWithHeaders(pathname, query = {}) {
+  const config = shopifyConfig();
+  if (!config.enabled) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: "shopify_not_configured" },
+      headers: {},
+      nextPageInfo: "",
+    };
+  }
+
+  const url = new URL(`https://${config.domain}/admin/api/${config.api_version}/${pathname}`);
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
+  }
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      "Content-Type": "application/json",
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  const linkHeader = response.headers.get("link") || "";
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
+    headers: Object.fromEntries(response.headers.entries()),
+    nextPageInfo: parseShopifyNextPageInfo(linkHeader),
+  };
+}
+
 async function shopifyGraphql(query, variables = {}) {
   const config = shopifyConfig();
   if (!config.enabled) {
@@ -1326,6 +1374,94 @@ function normalizeShopifyCustomer(customer, orders) {
       created_at: customer.created_at || "",
     },
     orders: orders.map(normalizeShopifyOrder),
+  };
+}
+
+function shopifyCustomerName(customer) {
+  return [customer.first_name, customer.last_name].filter(Boolean).join(" ")
+    || customer.email
+    || customer.phone
+    || customer.default_address?.phone
+    || "Shopify customer";
+}
+
+function shopifyCustomerPhone(customer) {
+  const raw = firstTruthy(
+    customer.phone,
+    customer.default_address?.phone,
+    ...(customer.addresses || []).map((address) => address.phone)
+  );
+  const digits = compactDigits(raw);
+  if (!digits) return "";
+  if (digits.length === 10) return `+91${digits}`;
+  return `+${digits}`;
+}
+
+function normalizeShopifyContactAttributes(customer) {
+  return {
+    source: "shopify",
+    shopify: {
+      customer: {
+        id: customer.id ? String(customer.id) : "",
+        name: shopifyCustomerName(customer),
+        email: customer.email || "",
+        phone: customer.phone || customer.default_address?.phone || "",
+        orders_count: Number(customer.orders_count || 0),
+        total_spent: customer.total_spent || "0.00",
+        display_total_spent: customer.total_spent ? `${customer.currency ? `${customer.currency} ` : ""}${customer.total_spent}` : "-",
+        tags: customer.tags || "",
+        state: customer.state || "",
+        accepts_marketing: Boolean(customer.accepts_marketing),
+        created_at: customer.created_at || "",
+        updated_at: customer.updated_at || "",
+        default_address: customer.default_address
+          ? {
+              city: customer.default_address.city || "",
+              province: customer.default_address.province || "",
+              country: customer.default_address.country || "",
+              zip: customer.default_address.zip || "",
+            }
+          : null,
+      },
+    },
+  };
+}
+
+async function fetchShopifyCustomers(maxPages = 50) {
+  const customers = [];
+  let pageInfo = "";
+  let pages = 0;
+
+  do {
+    const query = pageInfo
+      ? { limit: "250", page_info: pageInfo }
+      : { limit: "250" };
+    const result = await shopifyGetWithHeaders("customers.json", query);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: result.status,
+        payload: result.payload,
+        customers,
+        pages,
+      };
+    }
+
+    customers.push(...(result.payload?.customers || []));
+    pageInfo = result.nextPageInfo;
+    pages += 1;
+  } while (pageInfo && pages < maxPages);
+
+  return {
+    ok: true,
+    status: 200,
+    payload: {
+      customers,
+      pages,
+      truncated: Boolean(pageInfo),
+    },
+    customers,
+    pages,
   };
 }
 
@@ -1881,6 +2017,35 @@ function createJsonStorage() {
     async listConversations() {
       return buildInbox().map((item) => normalizeConversation(item, "json"));
     },
+    async listContacts() {
+      return buildInbox().map((item) => {
+        const conversation = normalizeConversation(item, "json");
+        return {
+          id: conversation.id,
+          conversation_id: conversation.id,
+          wa_id: conversation.wa_id,
+          name: conversation.name,
+          initials: conversation.initials,
+          phone: conversation.phone,
+          email: conversation.email || "",
+          channel: "WhatsApp",
+          segment: conversation.segment || "Webhook contact",
+          unread: conversation.unread || 0,
+          lastMessage: conversation.preview || "",
+          lastSeen: conversation.time || "",
+          intent: conversation.intent || "general_support",
+          shopify: null,
+          messages: conversation.messages || [],
+        };
+      });
+    },
+    async upsertShopifyCustomers() {
+      return {
+        synced: 0,
+        skipped: 0,
+        note: "Shopify customer sync requires Postgres storage.",
+      };
+    },
     async getConversation(id) {
       return buildInbox().find((item) => item.id === id) || null;
     },
@@ -2235,6 +2400,166 @@ function createPostgresStorage() {
         }
       }
     }
+  }
+
+  async function upsertShopifyCustomers(customers) {
+    const organizationId = await ensureOrganization();
+    let synced = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const customer of customers || []) {
+      const phone = shopifyCustomerPhone(customer);
+      if (!phone) {
+        skipped += 1;
+        continue;
+      }
+
+      const attributes = normalizeShopifyContactAttributes(customer);
+      try {
+        await query(
+          `
+          insert into contacts (
+            id,
+            organization_id,
+            wa_id,
+            phone_e164,
+            display_name,
+            email,
+            opt_in_status,
+            opt_in_source,
+            attributes,
+            updated_at
+          )
+          values ($1, $2, $3, $4, $5, $6, 'unknown', 'shopify_sync', $7::jsonb, now())
+          on conflict (organization_id, phone_e164) do update
+          set wa_id = coalesce(contacts.wa_id, excluded.wa_id),
+              display_name = coalesce(nullif(excluded.display_name, ''), contacts.display_name),
+              email = coalesce(nullif(excluded.email, ''), contacts.email),
+              opt_in_source = coalesce(contacts.opt_in_source, excluded.opt_in_source),
+              attributes = contacts.attributes || excluded.attributes,
+              updated_at = now()
+          `,
+          [
+            uuid(),
+            organizationId,
+            compactDigits(phone),
+            phone,
+            shopifyCustomerName(customer),
+            customer.email || "",
+            JSON.stringify(attributes),
+          ]
+        );
+        synced += 1;
+      } catch (error) {
+        errors.push({
+          customer_id: customer.id ? String(customer.id) : "",
+          reason: error?.message || "contact_upsert_failed",
+        });
+      }
+    }
+
+    return { synced, skipped, errors };
+  }
+
+  async function listContacts() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select
+        ct.id as contact_id,
+        ct.wa_id,
+        ct.phone_e164,
+        ct.display_name,
+        ct.email,
+        ct.opt_in_status,
+        ct.opt_in_source,
+        ct.attributes,
+        ct.created_at as contact_created_at,
+        ct.updated_at as contact_updated_at,
+        c.id as conversation_id,
+        c.status,
+        c.intent,
+        c.unread_count,
+        c.last_message_at,
+        lm.message_type as latest_message_type,
+        lm.body as latest_body,
+        lm.direction as latest_direction,
+        lm.status as latest_status,
+        lm.created_at as latest_created_at,
+        lm.template_name as latest_template_name,
+        lm.media_url as latest_media_url
+      from contacts ct
+      left join lateral (
+        select *
+        from conversations c
+        where c.organization_id = ct.organization_id
+          and c.contact_id = ct.id
+        order by coalesce(c.last_message_at, c.updated_at, c.created_at) desc
+        limit 1
+      ) c on true
+      left join lateral (
+        select direction, message_type, body, status, created_at, template_name, media_url
+        from messages m
+        where m.conversation_id = c.id
+        order by m.created_at desc
+        limit 1
+      ) lm on true
+      where ct.organization_id = $1
+      order by coalesce(c.last_message_at, lm.created_at, ct.updated_at, ct.created_at) desc
+      `,
+      [organizationId]
+    );
+
+    return result.rows.map((row) => {
+      const attributes = safeJsonParse(row.attributes, {});
+      const shopifyCustomer = attributes.shopify?.customer || null;
+      const displayName = row.display_name || shopifyCustomer?.name || row.email || row.phone_e164 || row.wa_id || "Customer";
+      const latestCreatedAt = row.latest_created_at || row.last_message_at || row.contact_updated_at || row.contact_created_at;
+      return {
+        id: row.contact_id,
+        conversation_id: row.conversation_id || "",
+        wa_id: row.wa_id || compactDigits(row.phone_e164),
+        name: displayName,
+        initials: initials(displayName, row.phone_e164 || row.wa_id),
+        phone: row.phone_e164 || formatPhone(row.wa_id),
+        email: row.email || shopifyCustomer?.email || "",
+        channel: row.conversation_id ? "WhatsApp" : "Shopify",
+        segment: attributes.source === "shopify" ? "Shopify customer" : "Webhook contact",
+        unread: Number(row.unread_count || 0),
+        lastMessage: row.latest_created_at ? previewForStoredMessage({
+          direction: row.latest_direction,
+          message_type: row.latest_message_type,
+          body: row.latest_body,
+          template_name: row.latest_template_name,
+          media_url: row.latest_media_url,
+        }) : attributes.source === "shopify" ? "Synced from Shopify" : "No conversation yet",
+        lastSeen: latestCreatedAt ? formatRelative(latestCreatedAt) : "-",
+        latest_message_at: row.last_message_at || row.latest_created_at || "",
+        intent: row.intent || "customer_profile",
+        opt_in_status: row.opt_in_status,
+        opt_in_source: row.opt_in_source,
+        shopify: attributes.shopify
+          ? {
+              connected: true,
+              matched: true,
+              customer: shopifyCustomer || {},
+              orders: attributes.shopify.orders || [],
+            }
+          : null,
+        messages: row.latest_created_at
+          ? [{
+              direction: row.latest_direction,
+              message_type: row.latest_message_type,
+              body: row.latest_body,
+              status: row.latest_status,
+              created_at: row.latest_created_at,
+              template_name: row.latest_template_name,
+              media_url: row.latest_media_url,
+            }]
+          : [],
+      };
+    });
   }
 
   async function listConversations() {
@@ -3212,6 +3537,8 @@ function createPostgresStorage() {
       return true;
     },
     ingestWebhook,
+    listContacts,
+    upsertShopifyCustomers,
     listConversations,
     getConversation,
     saveReply,
@@ -3277,6 +3604,14 @@ function createStorage() {
     async listConversations() {
       await storage.ready();
       return storage._impl.listConversations();
+    },
+    async listContacts() {
+      await storage.ready();
+      return storage._impl.listContacts();
+    },
+    async upsertShopifyCustomers(...args) {
+      await storage.ready();
+      return storage._impl.upsertShopifyCustomers(...args);
     },
     async getConversation(id) {
       await storage.ready();
@@ -3784,6 +4119,46 @@ async function handleApi(req, res, parsed) {
       ok: result.ok,
       items: result.payload?.segments || [],
       error: result.ok ? null : result.payload?.errors || result.payload?.error || result.payload,
+    });
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/shopify/sync-customers") {
+    const maxPages = Math.max(1, Math.min(100, Number(parsed.searchParams.get("pages") || 50) || 50));
+    const result = await fetchShopifyCustomers(maxPages);
+    if (!result.ok) {
+      return sendJson(res, result.status || 500, {
+        ok: false,
+        error: result.payload?.errors || result.payload?.error || result.payload || "shopify_customer_sync_failed",
+        synced: 0,
+        skipped: 0,
+        total_seen: result.customers?.length || 0,
+        pages: result.pages || 0,
+      });
+    }
+
+    const saved = await storage.upsertShopifyCustomers(result.customers);
+    return sendJson(res, 200, {
+      ok: true,
+      synced: saved.synced || 0,
+      skipped: saved.skipped || 0,
+      total_seen: result.customers.length,
+      pages: result.pages || result.payload?.pages || 0,
+      truncated: Boolean(result.payload?.truncated),
+      errors: saved.errors || [],
+      note: saved.note || "",
+    });
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/customers") {
+    const items = await storage.listContacts();
+    return sendJson(res, 200, {
+      ok: true,
+      items,
+      counts: {
+        total: items.length,
+        shopify: items.filter((item) => item.shopify?.matched || item.channel === "Shopify").length,
+        whatsapp: items.filter((item) => item.conversation_id).length,
+      },
     });
   }
 

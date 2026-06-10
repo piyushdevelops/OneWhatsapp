@@ -35,6 +35,10 @@ let shopifySegments = [];
 let shopifySegmentsLoading = false;
 let shopifySegmentsLoadedAt = 0;
 let shopifySegmentsLastError = "";
+let syncedCustomers = [];
+let customersLoading = false;
+let customersLoadedAt = 0;
+let customersLastError = "";
 let savedSegments = [];
 let savedSegmentsLoading = false;
 let savedSegmentsLoadedAt = 0;
@@ -336,6 +340,7 @@ function liveConversations() {
 function liveCustomers() {
   return liveConversations().map((conversation) => ({
     id: conversation.id,
+    conversationId: conversation.id,
     name: conversation.name,
     initials: conversation.initials,
     phone: conversation.phone,
@@ -349,6 +354,29 @@ function liveCustomers() {
     shopify: conversation.shopify || null,
     messages: conversation.messages || [],
   }));
+}
+
+function normalizeAudienceCustomer(item) {
+  return {
+    id: item.id || item.conversation_id || item.wa_id || item.phone || "",
+    conversationId: item.conversation_id || item.conversationId || "",
+    name: item.name || "Customer",
+    initials: item.initials || initialsFor(item.name || item.phone || item.email),
+    phone: item.phone || "-",
+    email: item.email || "",
+    channel: item.channel || (item.conversation_id ? "WhatsApp" : "Shopify"),
+    segment: item.segment || "Customer",
+    unread: Number(item.unread || 0),
+    lastMessage: item.lastMessage || item.preview || "Synced customer",
+    lastSeen: item.lastSeen || item.time || "-",
+    intent: item.intent || "customer_profile",
+    shopify: item.shopify || null,
+    messages: item.messages || [],
+  };
+}
+
+function audienceCustomers() {
+  return syncedCustomers.length ? syncedCustomers : liveCustomers();
 }
 
 function customerShopifyStats(customer) {
@@ -647,7 +675,7 @@ const localSegmentRules = [
 ];
 
 function localSegments() {
-  const customers = liveCustomers();
+  const customers = audienceCustomers();
   const computed = localSegmentRules.map((definition) => {
     const members = customers.filter(definition.matches);
     return {
@@ -727,9 +755,57 @@ function labelForSegmentOption(options, value) {
 }
 
 function recipientsForSegment(segmentId) {
-  if (!segmentId || segmentId === "all_customers") return liveCustomers();
+  if (!segmentId || segmentId === "all_customers") return audienceCustomers();
   const segment = localSegments().find((item) => item.id === segmentId);
   return segment?.members || [];
+}
+
+async function loadCustomers({ force = false } = {}) {
+  if (customersLoading) return;
+  if (!force && Date.now() - customersLoadedAt < 60000) return;
+  customersLoading = true;
+  customersLastError = "";
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/customers`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Customers returned ${response.status}`);
+    }
+    syncedCustomers = (payload.items || []).map(normalizeAudienceCustomer);
+    customersLoadedAt = Date.now();
+  } catch (error) {
+    customersLastError = error.message || "Customer sync unavailable";
+    customersLoadedAt = Date.now();
+  } finally {
+    customersLoading = false;
+    if (state.screen === "audience" || state.screen === "broadcasts") render();
+  }
+}
+
+async function syncShopifyCustomers() {
+  customersLoading = true;
+  customersLastError = "";
+  render();
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/shopify/sync-customers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Shopify sync returned ${response.status}`);
+    }
+    customersLoadedAt = 0;
+    customersLoading = false;
+    await loadCustomers({ force: true });
+    showToast(`Synced ${payload.synced || 0} Shopify customers${payload.skipped ? `, skipped ${payload.skipped} without phone` : ""}.`);
+  } catch (error) {
+    customersLastError = error.message || "Shopify customer sync failed";
+    showToast(customersLastError);
+  } finally {
+    customersLoading = false;
+    if (state.screen === "audience") render();
+  }
 }
 
 async function loadShopifySegments({ force = false } = {}) {
@@ -977,7 +1053,7 @@ function liveInboxStats() {
   return {
     conversations: conversations.length,
     unread,
-    customers: liveCustomers().length,
+    customers: audienceCustomers().length,
     latest,
     apiState: inboxLastError ? "Offline" : inboxLoading && !inboxLoadedAt ? "Loading" : "Connected",
   };
@@ -1277,7 +1353,7 @@ const automationTemplates = [
 
 const screenMeta = {
   dashboard: ["Command Center", "Live WhatsApp signals for The June Shop."],
-  audience: ["Customers", "Only real WhatsApp customers appear here."],
+  audience: ["Customers", "WhatsApp and Shopify customer audiences for campaigns."],
   broadcasts: ["Campaigns", "Build Meta-compliant WhatsApp campaign drafts before connecting sends."],
   templates: ["Templates", "Show approved Meta templates only after template sync is connected."],
   journeys: ["Automations", "A working flow map for routing live WhatsApp conversations."],
@@ -1315,9 +1391,11 @@ function setScreen(next) {
     loadInboxData({ force: true });
   }
   if (next === "audience") {
+    loadCustomers({ force: true });
     loadSavedSegments({ force: true });
   }
   if (next === "broadcasts") {
+    loadCustomers({ force: true });
     loadSavedBroadcasts({ force: true });
     loadSavedSegments({ force: true });
   }
@@ -1762,9 +1840,10 @@ function legend(label, value, color) {
 }
 
 function renderAudience() {
+  loadCustomers();
   loadSavedSegments();
   if (state.segmentBuilderOpen) return renderSegmentBuilder();
-  const customers = filterBySearch(liveCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
+  const customers = filterBySearch(audienceCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
   const segments = filterBySearch(localSegments(), ["name", "source", "description", "ruleText"]);
   if (state.audienceTab === "shopify_segments") loadShopifySegments();
   return `
@@ -1779,11 +1858,13 @@ function renderAudience() {
           </div>
         </div>
         <div class="toolbar-right">
-          <button class="secondary-button" data-action="sync-shopify-segments">Sync Shopify</button>
+          <button class="secondary-button" data-action="sync-shopify-customers">Sync Shopify Customers</button>
+          <button class="ghost-button" data-action="sync-shopify-segments">Sync Segments</button>
           <button class="primary-button" data-action="open-segment-builder">Create Segment</button>
         </div>
       </div>
       <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
+      ${customersLastError ? `<section class="panel pad"><span class="badge red">Customer sync issue</span><p class="setting-copy">${escapeHtml(customersLastError)}</p></section>` : ""}
       ${savedSegmentsLastError ? `<section class="panel pad"><span class="badge red">Segment storage issue</span><p class="setting-copy">${escapeHtml(savedSegmentsLastError)}</p></section>` : ""}
       ${renderAudienceTab(customers, segments)}
     </div>
@@ -1816,7 +1897,7 @@ function renderAudienceTab(customers, segments) {
   }
   return customers.length
     ? renderCustomersTable(customers)
-    : emptyPanel("No live customers yet", "Customers will appear here after they message The June Shop on WhatsApp.");
+    : emptyPanel("No customers synced yet", "Sync Shopify customers or receive WhatsApp messages to build your customer list.", "Sync Shopify Customers", "sync-shopify-customers");
 }
 
 function renderSegmentTable(segments) {
@@ -1887,7 +1968,7 @@ function selectOptions(options, selected = "") {
 
 function renderSegmentBuilder() {
   const segmentCount = localSegments().length;
-  const customerCount = liveCustomers().length;
+  const customerCount = audienceCustomers().length;
   const syncedShopifyCount = shopifySegments.length || 0;
   return `
     <div id="segment-builder" class="segment-builder-page">
@@ -1899,7 +1980,7 @@ function renderSegmentBuilder() {
           <p>Combine WhatsApp intent, Shopify order history and customer fields into one reusable audience.</p>
           <div class="segment-builder-pills">
             <span>${segmentCount} saved segments</span>
-            <span>${customerCount} WhatsApp customers</span>
+            <span>${customerCount} reachable customers</span>
             <span>${syncedShopifyCount || "No"} Shopify segments</span>
           </div>
         </div>
@@ -2137,11 +2218,13 @@ function renderCustomersTable(customers) {
       </td>
       <td>${customer.email ? escapeHtml(customer.email) : "-"}</td>
       <td>${escapeHtml(customer.phone)}</td>
-      <td><span class="badge green">WhatsApp</span></td>
+      <td><span class="badge ${customer.channel === "Shopify" ? "blue" : "green"}">${escapeHtml(customer.channel || "WhatsApp")}</span></td>
       <td>${escapeHtml(customer.segment)}</td>
       <td>${customer.unread}</td>
       <td>${escapeHtml(customer.lastSeen)}</td>
-      <td><button class="ghost-button" data-screen-shortcut="inbox" data-conversation-id="${escapeHtml(customer.id)}">Open</button></td>
+      <td>${customer.conversationId
+        ? `<button class="ghost-button" data-screen-shortcut="inbox" data-conversation-id="${escapeHtml(customer.conversationId)}">Open</button>`
+        : `<button class="ghost-button" disabled>No chat</button>`}</td>
     </tr>
   `).join("");
 
@@ -2296,7 +2379,7 @@ function renderBroadcastTable() {
       <td><span class="badge green">Ready</span></td>
       <td>${escapeHtml(template.category || "-")}</td>
       <td>${escapeHtml(template.language || "-")}</td>
-      <td>${liveCustomers().length}</td>
+      <td>${audienceCustomers().length}</td>
       <td><button class="ghost-button" data-action="open-broadcast-builder">Use template</button></td>
     </tr>
   `).join("");
@@ -4096,7 +4179,7 @@ function broadcastEligibleCustomers(customers) {
 
 function broadcastBuilderData() {
   const templates = approvedTemplates();
-  const customers = liveCustomers();
+  const customers = audienceCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
   const seededSegmentId = state.broadcastSegmentSeed;
   const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
@@ -4105,7 +4188,7 @@ function broadcastBuilderData() {
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
-    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All current WhatsApp customers (${customers.length})</option>`,
+    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
     ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
   return {
@@ -4252,7 +4335,7 @@ function renderBroadcastBuilderPage() {
 
 function openBroadcastModal() {
   const templates = approvedTemplates();
-  const customers = liveCustomers();
+  const customers = audienceCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
   const seededSegmentId = state.broadcastSegmentSeed;
   const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
@@ -4262,7 +4345,7 @@ function openBroadcastModal() {
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
-    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All current WhatsApp customers (${customers.length})</option>`,
+    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
     ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
   const customerRows = broadcastRecipientRows(defaultRecipients);
@@ -4875,6 +4958,10 @@ document.addEventListener("click", (event) => {
       showToast("Syncing Shopify segments.");
       render();
     },
+    "sync-shopify-customers": () => {
+      state.audienceTab = "profiles";
+      syncShopifyCustomers().catch((error) => showToast(error.message || "Shopify customer sync failed."));
+    },
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
       loadInboxData({ force: true });
@@ -5080,3 +5167,4 @@ document.addEventListener("keydown", (event) => {
 render();
 loadSystemStatus();
 loadInboxData({ force: true });
+loadCustomers({ force: true });
