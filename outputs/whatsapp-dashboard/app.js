@@ -3291,8 +3291,8 @@ function closeModal() {
 
 function openModal(title, body, footer) {
   modalRoot.innerHTML = `
-    <div class="modal-backdrop" data-action="close-modal">
-      <div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}" onclick="event.stopPropagation()">
+    <div class="modal-backdrop" data-modal-backdrop="true">
+      <div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
         <div class="modal-header">
           <h2 class="panel-title">${escapeHtml(title)}</h2>
           <button class="ghost-button icon-only" data-action="close-modal" aria-label="Close">x</button>
@@ -3305,8 +3305,9 @@ function openModal(title, body, footer) {
 }
 
 function broadcastRecipientRows(customers) {
-  return customers.length
-    ? customers.map((customer) => `
+  const validCustomers = broadcastEligibleCustomers(customers);
+  return validCustomers.length
+    ? validCustomers.map((customer) => `
         <label class="recipient-row">
           <input type="checkbox" class="broadcast-recipient" value="${escapeHtml(customer.phone.replace(/\D/g, ""))}" checked />
           <span>
@@ -3318,12 +3319,22 @@ function broadcastRecipientRows(customers) {
     : `<div class="empty-inline"><strong>No customers in this audience</strong><span>Choose another segment or wait for matching customers.</span></div>`;
 }
 
+function broadcastEligibleCustomers(customers) {
+  return (customers || [])
+    .map((customer) => ({
+      ...customer,
+      phone: String(customer.phone || customer.wa_id || "").trim(),
+      name: customer.name || customer.phone || customer.wa_id || "WhatsApp customer",
+    }))
+    .filter((customer) => customer.phone.replace(/\D/g, ""));
+}
+
 function openBroadcastModal() {
   const templates = approvedTemplates();
   const customers = liveCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
   const selectedSegmentId = "all_customers";
-  const defaultRecipients = recipientsForSegment(selectedSegmentId);
+  const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
@@ -3569,6 +3580,11 @@ function openSegmentModal() {
 }
 
 document.addEventListener("click", (event) => {
+  if (event.target?.dataset?.modalBackdrop === "true") {
+    closeModal();
+    return;
+  }
+
   const nav = event.target.closest("[data-screen]");
   if (nav) {
     setScreen(nav.dataset.screen);
@@ -3791,7 +3807,13 @@ document.addEventListener("click", (event) => {
     "add-hours": () => showToast("Additional time slot added."),
   };
 
-  if (handlers[action]) handlers[action]();
+  if (handlers[action]) {
+    try {
+      handlers[action]();
+    } catch (error) {
+      showToast(error?.message || "Action could not be completed.");
+    }
+  }
 });
 
 document.addEventListener("input", (event) => {
@@ -3820,7 +3842,7 @@ document.addEventListener("change", (event) => {
     if (input) input.value = language;
   }
   if (target.id === "broadcast-audience-segment") {
-    const recipients = recipientsForSegment(target.value);
+    const recipients = broadcastEligibleCustomers(recipientsForSegment(target.value));
     const list = document.querySelector(".recipient-list");
     const count = document.getElementById("broadcast-recipient-count");
     if (list) list.innerHTML = broadcastRecipientRows(recipients);
