@@ -1419,6 +1419,9 @@ function renderActions(current) {
     return `<button class="primary-button" data-screen-shortcut="bot">Open Studio</button>`;
   }
   if (current === "audience") {
+    if (state.segmentBuilderOpen) {
+      return `<button class="secondary-button" data-action="close-segment-builder">Back to segments</button>`;
+    }
     return `<button class="secondary-button" data-action="refresh-live-data">Refresh customers</button>`;
   }
   if (current === "settings") {
@@ -1847,22 +1850,47 @@ function selectOptions(options, selected = "") {
 
 function renderSegmentBuilder() {
   const segmentCount = localSegments().length;
+  const customerCount = liveCustomers().length;
+  const syncedShopifyCount = shopifySegments.length || 0;
   return `
     <div id="segment-builder" class="segment-builder-page">
       <div class="segment-builder-header">
-        <button class="ghost-button icon-only" data-action="close-segment-builder" aria-label="Back">‹</button>
-        <div>
-          <h2>Segment</h2>
-          <p>Build an audience from WhatsApp behaviour and Shopify customer data.</p>
+        <button class="segment-back-button" data-action="close-segment-builder" aria-label="Back">‹</button>
+        <div class="segment-builder-title">
+          <span class="eyebrow">Audience rules</span>
+          <h2>Create live segment</h2>
+          <p>Combine WhatsApp intent, Shopify order history and customer fields into one reusable audience.</p>
+          <div class="segment-builder-pills">
+            <span>${segmentCount} saved segments</span>
+            <span>${customerCount} WhatsApp customers</span>
+            <span>${syncedShopifyCount || "No"} Shopify segments</span>
+          </div>
         </div>
         <button id="segment-save-button" class="primary-button" data-action="save-segment" disabled>Save Segment</button>
       </div>
       <div class="segment-builder-shell">
-        <section class="segment-builder-main">
-          <label class="label">Segment Name</label>
-          <input id="segment-name" class="field segment-name-field" placeholder="Abandoned Users Last 30 Days" />
+        <section class="segment-builder-main segment-composer-card">
+          <div class="segment-composer-head">
+            <div>
+              <span class="eyebrow">Segment name</span>
+              <input id="segment-name" class="field segment-name-field" placeholder="Abandoned Users Last 30 Days" />
+            </div>
+            <div class="segment-save-hint">
+              <strong>Live audience</strong>
+              <span>Updates automatically as WhatsApp and Shopify data changes.</span>
+            </div>
+          </div>
 
-          <label class="label segment-criteria-label">Segment Criteria</label>
+          <div class="segment-criteria-head">
+            <div>
+              <span class="eyebrow">Segment criteria</span>
+              <h3>Rules customers must match</h3>
+            </div>
+            <div class="segment-rule-status">
+              <span>Ready for campaigns</span>
+              <strong>Live rules</strong>
+            </div>
+          </div>
           <div class="segment-criteria-card">
             <div id="segment-rules">
               ${renderSegmentRuleRow(0, true)}
@@ -1874,15 +1902,26 @@ function renderSegmentBuilder() {
           </div>
         </section>
         <aside class="segment-builder-side">
-          <section class="panel pad">
-            <span class="eyebrow">Audience builder</span>
-            <h3>Built for campaign precision</h3>
-            <p class="setting-copy">Use Shopify order history, customer profile fields, and WhatsApp activity to create audiences for broadcasts and automations.</p>
+          <section class="segment-insight-card">
+            <span class="eyebrow">Builder intent</span>
+            <h3>Precision without technical clutter</h3>
+            <p>Use this segment later in broadcasts, automations and CRM queues. Keep the rules business-readable so anyone can audit who will receive a campaign.</p>
           </section>
-          <section class="panel pad segment-builder-hints">
+          <section class="segment-score-card">
             <div><strong>${segmentCount}</strong><span>saved/live segments</span></div>
-            <div><strong>${liveCustomers().length}</strong><span>current WhatsApp customers</span></div>
-            <div><strong>${shopifySegments.length || "-"}</strong><span>Shopify segments synced</span></div>
+            <div><strong>${customerCount}</strong><span>current WhatsApp customers</span></div>
+            <div><strong>${syncedShopifyCount || "-"}</strong><span>Shopify segments synced</span></div>
+          </section>
+          <section class="segment-insight-card muted">
+            <span class="eyebrow">Recommended first segment</span>
+            <h3>Abandoned users last 30 days</h3>
+            <p>Last order before a date plus no recent checkout activity is a good recovery audience once Shopify event history is flowing.</p>
+          </section>
+          <section class="segment-use-card">
+            <span class="eyebrow">Can be used in</span>
+            <div><strong>Broadcasts</strong><span>One-time campaigns</span></div>
+            <div><strong>Automations</strong><span>Triggered recovery flows</span></div>
+            <div><strong>CRM view</strong><span>Priority customer queues</span></div>
           </section>
         </aside>
       </div>
@@ -1899,9 +1938,12 @@ function renderSegmentRuleRow(index, isFirst = false) {
           : `<select class="select segment-logic"><option value="and">AND</option><option value="or">OR</option></select>`}
       </div>
       <div class="segment-rule-main">
-        <select class="select segment-condition-type">
-          ${selectOptions(segmentConditionTypes, "property")}
-        </select>
+        <div class="segment-condition-wrap">
+          <span>Condition</span>
+          <select class="select segment-condition-type">
+            ${selectOptions(segmentConditionTypes, "property")}
+          </select>
+        </div>
         <div class="segment-rule-detail">
           ${renderSegmentPropertyControls()}
         </div>
