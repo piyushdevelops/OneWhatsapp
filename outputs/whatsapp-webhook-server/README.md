@@ -125,6 +125,11 @@ Confirm Shopify setup with:
 
 Use a permanent Meta system-user token for `WHATSAPP_ACCESS_TOKEN` instead of a temporary user token.
 
+For inbox replies, template broadcasts and template submission to Meta approval, the token needs:
+
+- `whatsapp_business_messaging`
+- `whatsapp_business_management`
+
 Recommended path:
 
 1. Business Settings -> Users -> System Users

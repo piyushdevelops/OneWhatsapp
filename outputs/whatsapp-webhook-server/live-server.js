@@ -512,6 +512,166 @@ async function metaGet(pathname) {
   };
 }
 
+async function metaRequest(pathname, { method = "GET", body = null } = {}) {
+  if (!WHATSAPP_ACCESS_TOKEN) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: { message: "missing_access_token" } },
+    };
+  }
+
+  const response = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${pathname}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = await response.json().catch(() => ({}));
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
+  };
+}
+
+function normalizeTemplate(template) {
+  return {
+    id: template.id || "",
+    name: template.name || "",
+    status: template.status || "",
+    category: template.category || "",
+    language: template.language || "",
+    created_at: template.created_time || template.created_at || "",
+    disabled_at: template.disabled_at || "",
+    quality_score: template.quality_score || null,
+    components: template.components || [],
+  };
+}
+
+function validateTemplateName(value) {
+  const name = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  return name.replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function createTemplatePayload(input) {
+  const name = validateTemplateName(input.name);
+  const category = String(input.category || "MARKETING").toUpperCase();
+  const language = input.language || "en_US";
+  const bodyText = String(input.body || "").trim();
+  const headerType = String(input.header_type || "none").toLowerCase();
+  const buttonType = String(input.button_type || "none").toLowerCase();
+  const components = [];
+
+  if (!name) throw new Error("template_name_required");
+  if (!bodyText) throw new Error("template_body_required");
+
+  if (headerType !== "none") {
+    if (headerType === "text") {
+      components.push({
+        type: "HEADER",
+        format: "TEXT",
+        text: String(input.header_text || "").trim() || "The June Shop",
+      });
+    } else {
+      components.push({
+        type: "HEADER",
+        format: headerType.toUpperCase(),
+        example: {
+          header_handle: input.header_handle ? [input.header_handle] : [],
+        },
+      });
+    }
+  }
+
+  components.push({
+    type: "BODY",
+    text: bodyText,
+    ...(Array.isArray(input.body_examples) && input.body_examples.length
+      ? { example: { body_text: [input.body_examples.map((item) => String(item || ""))] } }
+      : {}),
+  });
+
+  if (input.footer) {
+    components.push({
+      type: "FOOTER",
+      text: String(input.footer).trim(),
+    });
+  }
+
+  if (buttonType !== "none") {
+    const buttonText = String(input.button_text || "").trim() || "Shop Now";
+    if (buttonType === "url") {
+      components.push({
+        type: "BUTTONS",
+        buttons: [
+          {
+            type: "URL",
+            text: buttonText,
+            url: String(input.button_url || "").trim() || "https://thejuneshop.com",
+          },
+        ],
+      });
+    } else if (buttonType === "phone") {
+      components.push({
+        type: "BUTTONS",
+        buttons: [
+          {
+            type: "PHONE_NUMBER",
+            text: buttonText,
+            phone_number: String(input.button_phone || "").trim(),
+          },
+        ],
+      });
+    } else if (buttonType === "quick_reply") {
+      components.push({
+        type: "BUTTONS",
+        buttons: [
+          {
+            type: "QUICK_REPLY",
+            text: buttonText,
+          },
+        ],
+      });
+    }
+  }
+
+  return {
+    name,
+    category,
+    language,
+    components,
+  };
+}
+
+async function listMetaTemplates() {
+  const fields = "id,name,status,category,language,components,quality_score";
+  const result = await metaRequest(
+    `${WHATSAPP_BUSINESS_ACCOUNT_ID}/message_templates?fields=${encodeURIComponent(fields)}&limit=100`
+  );
+  return {
+    ...result,
+    payload: {
+      ...result.payload,
+      data: (result.payload?.data || []).map(normalizeTemplate),
+    },
+  };
+}
+
+async function createMetaTemplate(input) {
+  const payload = createTemplatePayload(input);
+  const result = await metaRequest(`${WHATSAPP_BUSINESS_ACCOUNT_ID}/message_templates`, {
+    method: "POST",
+    body: payload,
+  });
+  return {
+    ...result,
+    request_payload: payload,
+  };
+}
+
 function shopifyConfig() {
   const domain = SHOPIFY_SHOP_DOMAIN
     .replace(/^https?:\/\//, "")
@@ -1709,6 +1869,86 @@ async function handleWebhook(req, res, parsed) {
 }
 
 async function handleApi(req, res, parsed) {
+  if (req.method === "GET" && parsed.pathname === "/api/meta/templates") {
+    const result = await listMetaTemplates();
+    return sendJson(res, result.ok ? 200 : result.status || 500, {
+      ok: result.ok,
+      items: result.payload?.data || [],
+      paging: result.payload?.paging || null,
+      error: result.ok ? null : result.payload?.error || result.payload,
+    });
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/meta/templates") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const result = await createMetaTemplate(body);
+      return sendJson(res, result.ok ? 200 : result.status || 500, {
+        ok: result.ok,
+        template: result.payload,
+        request_payload: result.request_payload,
+        error: result.ok ? null : result.payload?.error || result.payload,
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "template_submission_failed",
+      });
+    }
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/broadcasts/send") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const templateName = validateTemplateName(body.template_name);
+      const recipients = Array.isArray(body.recipients)
+        ? body.recipients.map((item) => String(item || "").replace(/\D/g, "")).filter(Boolean)
+        : [];
+      if (!templateName) return sendJson(res, 400, { ok: false, error: "template_name_required" });
+      if (!recipients.length) return sendJson(res, 400, { ok: false, error: "recipients_required" });
+      if (recipients.length > 250) return sendJson(res, 400, { ok: false, error: "recipient_limit_exceeded" });
+
+      const results = [];
+      for (const recipient of recipients) {
+        const outbound = await sendWhatsAppMessage(
+          {
+            id: `broadcast_${Date.now()}_${recipient}`,
+            wa_id: recipient,
+          },
+          {
+            type: "template",
+            template_name: templateName,
+            language: body.language || "en_US",
+            variables: Array.isArray(body.variables) ? body.variables : [],
+          }
+        );
+        results.push({
+          recipient,
+          ok: Boolean(outbound.ok),
+          reason: outbound.reason || "",
+          provider_message_id: outbound.providerMessageId || "",
+          error: outbound.error || null,
+        });
+      }
+
+      const accepted = results.filter((item) => item.ok).length;
+      return sendJson(res, 200, {
+        ok: accepted > 0,
+        accepted,
+        failed: results.length - accepted,
+        total: results.length,
+        results,
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "broadcast_send_failed",
+      });
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/inbox/conversations") {
     const conversations = await storage.listConversations();
     const includeShopify = shopifyConfig().enabled;

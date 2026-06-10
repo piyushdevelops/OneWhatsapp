@@ -81,3 +81,8 @@ Inside `/health`, check:
 ## 6. Permanent token
 
 Replace temporary user tokens with a permanent Meta system-user token as soon as possible.
+
+Required Meta permissions for this dashboard:
+
+- `whatsapp_business_messaging`
+- `whatsapp_business_management`

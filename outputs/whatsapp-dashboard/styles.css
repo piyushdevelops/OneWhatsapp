@@ -730,6 +730,61 @@ h1 {
   line-height: 1.4;
 }
 
+.broadcast-builder-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.builder-copy {
+  display: grid;
+  gap: 5px;
+}
+
+.builder-copy span {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.builder-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.recipient-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.recipient-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.recipient-row:last-child {
+  border-bottom: 0;
+}
+
+.recipient-row strong,
+.recipient-row small {
+  display: block;
+}
+
+.recipient-row small {
+  color: var(--muted);
+  margin-top: 3px;
+}
+
 .action-stack,
 .move-stack {
   display: grid;

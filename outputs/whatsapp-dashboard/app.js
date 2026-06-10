@@ -21,6 +21,10 @@ let inboxLoadedAt = 0;
 let inboxLastError = "";
 let inboxPollTimer = null;
 let inboxDataSignature = "";
+let metaTemplates = [];
+let metaTemplatesLoading = false;
+let metaTemplatesLoadedAt = 0;
+let metaTemplatesLastError = "";
 let systemStatus = {
   outboundMode: "local_only",
   outboundEnabled: false,
@@ -307,6 +311,51 @@ function liveCustomers() {
     lastSeen: conversation.time,
     intent: conversation.intent || "general_support",
   }));
+}
+
+function normalizeMetaTemplate(item) {
+  const body = (item.components || []).find((component) => component.type === "BODY") || {};
+  const header = (item.components || []).find((component) => component.type === "HEADER") || {};
+  const buttons = (item.components || []).find((component) => component.type === "BUTTONS") || {};
+  return {
+    id: item.id || item.name || "",
+    name: item.name || "",
+    status: item.status || "",
+    category: item.category || "",
+    language: item.language || "",
+    created: item.created_at || "",
+    disabled: item.disabled_at || "",
+    body: body.text || "",
+    headerType: header.format || "",
+    buttons: buttons.buttons || [],
+    components: item.components || [],
+  };
+}
+
+async function loadMetaTemplates({ force = false } = {}) {
+  if (metaTemplatesLoading) return;
+  if (!force && Date.now() - metaTemplatesLoadedAt < 60000) return;
+  metaTemplatesLoading = true;
+  metaTemplatesLastError = "";
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/meta/templates`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Template sync returned ${response.status}`);
+    }
+    metaTemplates = (payload.items || []).map(normalizeMetaTemplate);
+    metaTemplatesLoadedAt = Date.now();
+  } catch (error) {
+    metaTemplatesLastError = error.message || "Template sync unavailable";
+    metaTemplatesLoadedAt = Date.now();
+  } finally {
+    metaTemplatesLoading = false;
+    if (["templates", "broadcasts"].includes(state.screen)) render();
+  }
+}
+
+function approvedTemplates() {
+  return metaTemplates.filter((template) => template.status === "APPROVED");
 }
 
 function liveInboxStats() {
@@ -980,29 +1029,42 @@ function renderCustomersTable(customers) {
 }
 
 function renderBroadcasts() {
+  loadMetaTemplates();
+  const templates = approvedTemplates();
+  const customers = liveCustomers();
+  const revenue = revenueStats();
   return `
     <div class="page-stack">
       <section class="panel pad">
         <div class="campaign-head">
           <div>
-            <span class="eyebrow">Meta-ready campaign design</span>
-            <h2>Build drafts around what WhatsApp can actually send.</h2>
-            <p>Broadcast sends need approved templates and opt-in. Free-form text or attachments are only for customers inside the service window.</p>
+            <span class="eyebrow">Meta-connected broadcasts</span>
+            <h2>Send approved WhatsApp templates to real customers.</h2>
+            <p>Broadcasts use templates approved by Meta. Template approval happens in Templates; broadcast sends go through your connected WhatsApp Cloud API number.</p>
           </div>
           <button class="primary-button" data-action="open-broadcast-modal">Create campaign draft</button>
         </div>
       </section>
 
-      <div class="capability-grid">
-        ${metaMessageCapabilities.map((item) => `
-          <article class="capability-card">
-            <h3>${escapeHtml(item.title)}</h3>
-            <p>${escapeHtml(item.detail)}</p>
-          </article>
-        `).join("")}
+      <div class="metric-grid four">
+        ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
+        ${metric("Reachable customers", customers.length, "Current WhatsApp customer list")}
+        ${metric("Outbound messages", revenue.outboundMessages, `${revenue.delivered}/${revenue.sent} delivered or read`)}
+        ${metric("UTM tracking", "Ready", "Stored on campaign draft before send")}
       </div>
 
-      ${campaignDrafts.length ? renderCampaignDrafts() : emptyPanel("No campaign drafts yet", "Create a draft when you are ready. Sent campaign analytics will stay empty until real sends are connected.")}
+      <section class="panel pad broadcast-builder-card">
+        <div class="builder-copy">
+          <strong>What can be sent now</strong>
+          <span>${templates.length ? "Choose any approved Meta template and send it to selected WhatsApp customers." : "Sync or submit a template first. Broadcast sending requires an approved template."}</span>
+        </div>
+        <div class="builder-actions">
+          <button class="secondary-button" data-action="sync-templates">Sync templates</button>
+          <button class="primary-button" data-action="open-broadcast-modal">Create broadcast</button>
+        </div>
+      </section>
+
+      ${renderBroadcastTable()}
     </div>
   `;
 }
@@ -1019,19 +1081,49 @@ function renderCampaignDrafts() {
   return table(["Campaign", "Mode", "Audience", "Status"], rows);
 }
 
+function renderBroadcastTable() {
+  const rows = approvedTemplates().map((template) => `
+    <tr>
+      <td>
+        <div class="row-main">
+          <span class="channel-icon">WA</span>
+          <div>
+            <span class="row-title">${escapeHtml(template.name)}</span>
+            <div class="row-subtle">${escapeHtml(template.body || "Approved template")}</div>
+          </div>
+        </div>
+      </td>
+      <td><span class="badge green">Ready</span></td>
+      <td>${escapeHtml(template.category || "-")}</td>
+      <td>${escapeHtml(template.language || "-")}</td>
+      <td>${liveCustomers().length}</td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal">Use template</button></td>
+    </tr>
+  `).join("");
+
+  if (!approvedTemplates().length) {
+    return emptyPanel("No approved templates available", "Sync templates from Meta or submit a new template for approval before sending broadcasts.", "Create template", "open-template-modal");
+  }
+
+  return table(["Template", "Status", "Category", "Language", "Current Audience", ""], rows);
+}
+
 function renderTemplates() {
-  const filtered = filterBySearch(syncedTemplates, ["name", "category", "status"]);
+  loadMetaTemplates();
+  const filtered = filterBySearch(metaTemplates, ["name", "category", "status", "language"]);
 
   return `
     <div class="page-stack">
-      <div class="tabs">
-        <button class="tab active">WhatsApp</button>
-      </div>
       <div class="toolbar">
-        <span class="badge gray">No local template sync connected</span>
+        <div class="toolbar-right">
+          <span class="badge ${metaTemplatesLastError ? "red" : metaTemplates.length ? "green" : "orange"}">${metaTemplatesLastError ? "Sync issue" : metaTemplates.length ? "Meta synced" : "Waiting"}</span>
+          <button class="secondary-button" data-action="sync-templates">Sync Templates</button>
+          <button class="primary-button" data-action="open-template-modal">Create New Template</button>
+        </div>
         <input class="search" data-search placeholder="Search by template name" value="${escapeHtml(state.search)}" />
       </div>
-      ${filtered.length ? renderTemplateTable(filtered) : emptyPanel("No actual templates synced", "This page now shows only real templates returned by Meta. Connect template sync or create a new template draft to submit for approval.", "Create template", "open-template-modal")}
+      ${metaTemplatesLastError ? `<section class="panel pad"><span class="badge red">Meta sync failed</span><p class="setting-copy">${escapeHtml(metaTemplatesLastError)}</p></section>` : ""}
+      ${filtered.length ? renderTemplateTable(filtered) : emptyPanel("No templates synced yet", "Click Sync Templates to pull live WhatsApp templates from Meta, or create a template here and send it to Meta for approval.", "Create template", "open-template-modal")}
     </div>
   `;
 }
@@ -1040,13 +1132,15 @@ function renderTemplateTable(rowsData) {
   const rows = rowsData.map((template) => `
     <tr>
       <td><span class="row-title">${escapeHtml(template.name)}</span></td>
-      <td><span class="badge ${template.status === "Approved" ? "green" : "orange"}">${escapeHtml(template.status)}</span></td>
+      <td><span class="badge ${template.status === "APPROVED" ? "green" : template.status === "REJECTED" ? "red" : "orange"}">${escapeHtml(template.status || "-")}</span></td>
       <td><strong>${escapeHtml(template.category)}</strong></td>
-      <td>${escapeHtml(template.created || "-")}</td>
+      <td>${escapeHtml(template.language || "-")}</td>
+      <td>${escapeHtml(template.created ? formatContextDate(template.created) : "-")}</td>
       <td>${escapeHtml(template.disabled || "-")}</td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal" ${template.status !== "APPROVED" ? "disabled" : ""}>Use</button></td>
     </tr>
   `).join("");
-  return table(["Template Name", "Approval Status", "Category", "Created At", "Disabled At"], rows);
+  return table(["Template Name", "Approval Status", "Category", "Language", "Created At", "Disabled At", ""], rows);
 }
 
 function renderJourneys() {
@@ -1950,6 +2044,95 @@ async function sendConversationPayload(payload, { successMessage, pendingDraftCl
   showToast(result?.outbound?.reason || "Reply saved.");
 }
 
+async function submitMetaTemplate() {
+  const name = document.getElementById("template-create-name")?.value?.trim();
+  const category = document.getElementById("template-create-category")?.value || "MARKETING";
+  const language = document.getElementById("template-create-language")?.value || "en_US";
+  const headerType = document.getElementById("template-create-header-type")?.value || "none";
+  const headerValue = document.getElementById("template-create-header-value")?.value?.trim() || "";
+  const body = document.getElementById("template-create-body")?.value?.trim();
+  const examples = splitVariables(document.getElementById("template-create-examples")?.value);
+  const buttonType = document.getElementById("template-create-button-type")?.value || "none";
+  const buttonText = document.getElementById("template-create-button-text")?.value?.trim();
+  const buttonValue = document.getElementById("template-create-button-value")?.value?.trim();
+  const footer = document.getElementById("template-create-footer")?.value?.trim();
+
+  if (!name || !body) {
+    showToast("Template name and body are required.");
+    return;
+  }
+
+  const payload = {
+    name,
+    category,
+    language,
+    header_type: headerType,
+    header_text: headerType === "text" ? headerValue : "",
+    header_handle: headerType !== "text" ? headerValue : "",
+    body,
+    body_examples: examples,
+    button_type: buttonType,
+    button_text: buttonText,
+    button_url: buttonType === "url" ? buttonValue : "",
+    button_phone: buttonType === "phone" ? buttonValue : "",
+    footer,
+  };
+
+  const response = await fetch(`${INBOX_API_BASE}/api/meta/templates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.error?.message || result?.error || "Meta rejected the template.");
+  }
+
+  closeModal();
+  metaTemplatesLoadedAt = 0;
+  await loadMetaTemplates({ force: true });
+  showToast("Template sent to Meta for approval.");
+}
+
+async function sendBroadcastLive() {
+  const template_name = document.getElementById("broadcast-template-name")?.value;
+  const language = document.getElementById("broadcast-template-language")?.value?.trim() || "en_US";
+  const variables = splitVariables(document.getElementById("broadcast-template-vars")?.value);
+  const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
+    .map((input) => input.value)
+    .filter(Boolean);
+  const optInOk = document.getElementById("broadcast-optin-check")?.checked;
+  const templateOk = document.getElementById("broadcast-template-check")?.checked;
+
+  if (!template_name) {
+    showToast("Select an approved template first.");
+    return;
+  }
+  if (!recipients.length) {
+    showToast("Select at least one recipient.");
+    return;
+  }
+  if (!optInOk || !templateOk) {
+    showToast("Confirm opt-in and approved template before sending.");
+    return;
+  }
+
+  const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ template_name, language, variables, recipients }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
+  }
+
+  closeModal();
+  inboxLoadedAt = 0;
+  await loadInboxData({ force: true });
+  showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
+}
+
 function closeModal() {
   modalRoot.innerHTML = "";
 }
@@ -1970,62 +2153,63 @@ function openModal(title, body, footer) {
 }
 
 function openBroadcastModal() {
+  const templates = approvedTemplates();
+  const customers = liveCustomers();
+  const templateOptions = templates.length
+    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
+    : `<option value="">No approved templates synced</option>`;
+  const customerRows = customers.length
+    ? customers.map((customer) => `
+        <label class="recipient-row">
+          <input type="checkbox" class="broadcast-recipient" value="${escapeHtml(customer.phone.replace(/\D/g, ""))}" checked />
+          <span>
+            <strong>${escapeHtml(customer.name)}</strong>
+            <small>${escapeHtml(customer.phone)}</small>
+          </span>
+        </label>
+      `).join("")
+    : `<div class="empty-inline"><strong>No customers yet</strong><span>WhatsApp customers will appear here after they message you.</span></div>`;
   openModal(
-    "Create WhatsApp campaign",
+    "Create WhatsApp broadcast",
     `
       <div class="campaign-modal">
         <div class="wide">
           <label class="label">Campaign name</label>
-          <input class="field" placeholder="Example: TJS order update or opt-in winback" />
+          <input id="broadcast-name" class="field" placeholder="Example: TJS clearance sale" />
         </div>
-        <section class="mode-grid wide">
-          <label class="mode-card">
-            <input type="radio" name="campaign-mode" checked />
-            <strong>Template broadcast</strong>
-            <span>Use approved marketing, utility, or authentication templates for opted-in contacts.</span>
-          </label>
-          <label class="mode-card">
-            <input type="radio" name="campaign-mode" />
-            <strong>Service-window reply</strong>
-            <span>Free-form text, media or interactive messages only after the customer has messaged you.</span>
-          </label>
-          <label class="mode-card">
-            <input type="radio" name="campaign-mode" />
-            <strong>Interactive commerce</strong>
-            <span>Buttons, list messages, catalog/product messages, location or contact details where supported.</span>
-          </label>
-        </section>
         <div class="form-grid wide">
           <div>
-            <label class="label">Audience source</label>
-            <select class="select"><option>WhatsApp customers only</option><option>Uploaded opt-in list</option><option>Segment after CRM sync</option></select>
+            <label class="label">Approved Meta template</label>
+            <select id="broadcast-template-name" class="select">${templateOptions}</select>
           </div>
           <div>
-            <label class="label">Template category</label>
-            <select class="select"><option>MARKETING</option><option>UTILITY</option><option>AUTHENTICATION</option></select>
+            <label class="label">Language</label>
+            <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
           </div>
           <div>
-            <label class="label">Header/media</label>
-            <select class="select"><option>No header</option><option>Text header</option><option>Image</option><option>Video</option><option>Document</option></select>
+            <label class="label">UTM source</label>
+            <input id="broadcast-utm-source" class="field" value="onewhatsapp" />
           </div>
           <div>
-            <label class="label">Buttons</label>
-            <select class="select"><option>None</option><option>Quick replies</option><option>URL CTA</option><option>Phone CTA</option><option>Copy code</option><option>Flow CTA</option></select>
+            <label class="label">UTM campaign</label>
+            <input id="broadcast-utm-campaign" class="field" placeholder="clearance_june" />
           </div>
         </div>
         <div class="wide">
-          <label class="label">Message body</label>
-          <textarea class="textarea" placeholder="Hi {{1}}, write the approved template copy or service-window reply here."></textarea>
+          <label class="label">Template variables</label>
+          <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
+        </div>
+        <div class="wide">
+          <label class="label">Recipients</label>
+          <div class="recipient-list">${customerRows}</div>
         </div>
         <div class="checklist wide">
-          <label><input type="checkbox" /> Contact has WhatsApp opt-in</label>
-          <label><input type="checkbox" /> Template is approved before broadcast send</label>
-          <label><input type="checkbox" /> Free-form send is inside the 24-hour service window</label>
-          <label><input type="checkbox" /> Media is uploaded through Meta before send</label>
+          <label><input id="broadcast-optin-check" type="checkbox" /> I confirm these contacts have WhatsApp opt-in.</label>
+          <label><input id="broadcast-template-check" type="checkbox" /> I confirm this is an approved Meta template.</label>
         </div>
       </div>
     `,
-    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="save-broadcast">Create draft</button>`
+    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="secondary-button" data-action="save-broadcast">Save Draft</button><button class="primary-button" data-action="send-broadcast-live">Send broadcast</button>`
   );
 }
 
@@ -2036,23 +2220,47 @@ function openTemplateModal() {
       <div class="form-grid">
         <div>
           <label class="label">Template name</label>
-          <input class="field" placeholder="order_delivered_followup" />
+          <input id="template-create-name" class="field" placeholder="order_delivered_followup" />
         </div>
         <div>
           <label class="label">Category</label>
-          <select class="select"><option>UTILITY</option><option>MARKETING</option><option>AUTHENTICATION</option></select>
-        </div>
-        <div class="wide">
-          <label class="label">Message body</label>
-          <textarea class="textarea" placeholder="Hi {{1}}, your order {{2}} has been delivered. Reply if you need help."></textarea>
+          <select id="template-create-category" class="select"><option>MARKETING</option><option>UTILITY</option><option>AUTHENTICATION</option></select>
         </div>
         <div>
           <label class="label">Language</label>
-          <select class="select"><option>English</option><option>Hindi</option></select>
+          <select id="template-create-language" class="select"><option value="en_US">English</option><option value="hi">Hindi</option></select>
+        </div>
+        <div>
+          <label class="label">Header</label>
+          <select id="template-create-header-type" class="select"><option value="none">No header</option><option value="text">Text header</option><option value="image">Image header</option><option value="video">Video header</option><option value="document">Document header</option></select>
+        </div>
+        <div class="wide">
+          <label class="label">Header text or uploaded media handle</label>
+          <input id="template-create-header-value" class="field" placeholder="Optional. Media headers need a Meta media handle." />
+        </div>
+        <div class="wide">
+          <label class="label">Message body</label>
+          <textarea id="template-create-body" class="textarea" placeholder="Hi {{1}}, your order {{2}} has been delivered. Reply if you need help."></textarea>
+        </div>
+        <div class="wide">
+          <label class="label">Example variables</label>
+          <input id="template-create-examples" class="field" placeholder="Piyush, #301887" />
         </div>
         <div>
           <label class="label">Button type</label>
-          <select class="select"><option>No button</option><option>Quick reply</option><option>Call to action</option></select>
+          <select id="template-create-button-type" class="select"><option value="none">No button</option><option value="url">URL CTA</option><option value="quick_reply">Quick reply</option><option value="phone">Phone CTA</option></select>
+        </div>
+        <div>
+          <label class="label">Button text</label>
+          <input id="template-create-button-text" class="field" placeholder="Shop Now" />
+        </div>
+        <div class="wide">
+          <label class="label">Button URL or phone</label>
+          <input id="template-create-button-value" class="field" placeholder="https://thejuneshop.com" />
+        </div>
+        <div class="wide">
+          <label class="label">Footer</label>
+          <input id="template-create-footer" class="field" value="Reply STOP to unsubscribe." />
         </div>
       </div>
     `,
@@ -2141,17 +2349,20 @@ document.addEventListener("click", (event) => {
     "close-modal": closeModal,
     "save-broadcast": () => {
       closeModal();
-      showToast("Campaign draft saved locally.");
+      showToast("Broadcast draft saved for this session.");
     },
     "submit-template": () => {
-      closeModal();
-      showToast("Template submitted for Meta approval.");
+      submitMetaTemplate().catch((error) => showToast(error.message || "Could not submit template."));
     },
     "save-segment": () => {
       closeModal();
       showToast("Live segment created.");
     },
-    "sync-templates": () => showToast("Template sync needs a secure Meta token first."),
+    "sync-templates": () => {
+      metaTemplatesLoadedAt = 0;
+      loadMetaTemplates({ force: true });
+      showToast("Syncing templates from Meta.");
+    },
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
       loadInboxData({ force: true });
@@ -2267,6 +2478,9 @@ document.addEventListener("click", (event) => {
         { successMessage: "Template submitted to WhatsApp.", pendingDraftClear: false }
       ).catch((error) => showToast(error.message || "Could not send template."));
     },
+    "send-broadcast-live": () => {
+      sendBroadcastLive().catch((error) => showToast(error.message || "Could not send broadcast."));
+    },
     "add-node": () => showToast("Node added to canvas draft."),
     "new-flow": () => showToast("New flow draft created."),
     "previous-page": () => showToast("Previous page"),
@@ -2291,6 +2505,15 @@ document.addEventListener("input", (event) => {
   }
   if (target.id === "copilot-prompt" && state.selectedConversationId) {
     state.copilotPrompts[state.selectedConversationId] = target.value;
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (target.id === "broadcast-template-name") {
+    const language = target.selectedOptions[0]?.dataset.language || "en_US";
+    const input = document.getElementById("broadcast-template-language");
+    if (input) input.value = language;
   }
 });
 
