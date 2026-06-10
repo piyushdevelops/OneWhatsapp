@@ -206,6 +206,7 @@ create table if not exists broadcast_campaigns (
   audience_segment_id text,
   audience_label text,
   recipient_count integer not null default 0,
+  recipients jsonb not null default '[]'::jsonb,
   send_mode text not null default 'now',
   scheduled_at timestamptz,
   status text not null default 'draft',
@@ -216,6 +217,46 @@ create table if not exists broadcast_campaigns (
   safety_checks jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
+);
+
+alter table broadcast_campaigns
+  add column if not exists recipients jsonb not null default '[]'::jsonb;
+
+alter table broadcast_campaigns
+  add column if not exists last_send_error text;
+
+create table if not exists broadcast_messages (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  campaign_id uuid not null references broadcast_campaigns(id) on delete cascade,
+  recipient_wa_id text not null,
+  provider_message_id text,
+  status text not null default 'queued',
+  error_message text,
+  raw_payload jsonb not null default '{}'::jsonb,
+  queued_at timestamptz not null default now(),
+  sent_at timestamptz,
+  delivered_at timestamptz,
+  read_at timestamptz,
+  failed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index if not exists broadcast_messages_provider_uidx
+  on broadcast_messages (organization_id, provider_message_id)
+  where provider_message_id is not null;
+
+create table if not exists broadcast_attributions (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  campaign_id uuid not null references broadcast_campaigns(id) on delete cascade,
+  commerce_event_id uuid not null references commerce_events(id) on delete cascade,
+  match_type text not null,
+  amount numeric(14, 2) not null default 0,
+  currency text not null default 'INR',
+  created_at timestamptz not null default now(),
+  unique (campaign_id, commerce_event_id)
 );
 
 create table if not exists conversation_notes (
@@ -269,6 +310,9 @@ create index if not exists audience_segments_org_updated_idx on audience_segment
 create index if not exists broadcast_campaigns_org_status_idx on broadcast_campaigns (organization_id, status, updated_at desc);
 create index if not exists broadcast_campaigns_scheduled_idx on broadcast_campaigns (organization_id, scheduled_at)
   where scheduled_at is not null;
+create index if not exists broadcast_messages_campaign_idx on broadcast_messages (campaign_id, created_at desc);
+create index if not exists broadcast_messages_status_idx on broadcast_messages (organization_id, status, updated_at desc);
+create index if not exists broadcast_attributions_campaign_idx on broadcast_attributions (campaign_id, created_at desc);
 
 -- Optional seed for local MVP development.
 insert into organizations (id, name, slug)

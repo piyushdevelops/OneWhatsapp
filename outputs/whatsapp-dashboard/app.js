@@ -1608,10 +1608,9 @@ function renderBroadcasts() {
   loadSavedBroadcasts();
   loadSavedSegments();
   const templates = approvedTemplates();
-  const customers = liveCustomers();
-  const revenue = revenueStats();
   const scheduled = savedBroadcasts.filter((campaign) => campaign.status === "scheduled").length;
-  const drafts = savedBroadcasts.filter((campaign) => campaign.status === "draft").length;
+  const sentMessages = savedBroadcasts.reduce((sum, campaign) => sum + Number(campaign.analytics?.sent || 0), 0);
+  const attributedRevenue = savedBroadcasts.reduce((sum, campaign) => sum + Number(campaign.analytics?.attributed_revenue || 0), 0);
   return `
     <div class="page-stack">
       <section class="panel pad">
@@ -1627,9 +1626,9 @@ function renderBroadcasts() {
 
       <div class="metric-grid four">
         ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
-        ${metric("Reachable customers", customers.length, "Current WhatsApp customer list")}
+        ${metric("Broadcast revenue", formatMoney(attributedRevenue, "INR"), "From Shopify attribution")}
+        ${metric("Sent via campaigns", sentMessages, "Meta accepted campaign messages")}
         ${metric("Scheduled", scheduled, scheduled ? "Ready in campaign queue" : "No scheduled sends")}
-        ${metric("Drafts", drafts, drafts ? "Campaigns waiting to send" : "No saved drafts")}
       </div>
 
       <section class="panel pad broadcast-builder-card">
@@ -1667,11 +1666,14 @@ function renderBroadcastCampaigns() {
       <td><span class="badge ${broadcastStatusTone(draft.status)}">${escapeHtml(broadcastStatusLabel(draft.status))}</span></td>
       <td>${escapeHtml(formatCampaignSchedule(draft))}</td>
       <td>${draft.recipient_count || 0}</td>
-      <td>${escapeHtml(draft.utm_campaign || "-")}</td>
+      <td>${draft.analytics?.delivered || 0}/${draft.analytics?.sent || 0}</td>
+      <td>${draft.analytics?.read_rate || 0}%</td>
+      <td>${formatMoney(draft.analytics?.attributed_revenue || 0, draft.analytics?.currency || "INR")}</td>
+      <td>${draft.analytics?.order_rate || 0}%</td>
       <td><button class="ghost-button" data-action="open-broadcast-modal">Duplicate</button></td>
     </tr>
   `).join("");
-  return table(["Campaign", "Status", "Send Time", "Recipients", "UTM Campaign", ""], rows);
+  return table(["Campaign", "Status", "Send Time", "Recipients", "Delivered", "Read Rate", "Revenue", "Order Rate", ""], rows);
 }
 
 function broadcastStatusLabel(status) {
@@ -3052,13 +3054,11 @@ async function submitMetaTemplate() {
 }
 
 async function sendBroadcastLive() {
-  const campaignPayload = collectBroadcastPayload("sent");
+  const campaignPayload = collectBroadcastPayload("sending");
   const template_name = campaignPayload.template_name;
   const language = campaignPayload.template_language;
   const variables = campaignPayload.variables;
-  const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
-    .map((input) => input.value)
-    .filter(Boolean);
+  const recipients = campaignPayload.recipients;
   const optInOk = document.getElementById("broadcast-optin-check")?.checked;
   const templateOk = document.getElementById("broadcast-template-check")?.checked;
 
@@ -3075,21 +3075,17 @@ async function sendBroadcastLive() {
     return;
   }
 
+  const campaign = await saveBroadcastCampaignRecord(campaignPayload, { silent: true });
   const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/send`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ template_name, language, variables, recipients }),
+    body: JSON.stringify({ campaign_id: campaign.id, template_name, language, variables, recipients }),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.ok === false) {
     throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
   }
 
-  await saveBroadcastCampaignRecord({
-    ...campaignPayload,
-    recipient_count: result.accepted || recipients.length,
-    status: "sent",
-  }, { silent: true });
   closeModal();
   inboxLoadedAt = 0;
   savedBroadcastsLoadedAt = 0;
@@ -3122,6 +3118,7 @@ function collectBroadcastPayload(status = "draft") {
     audience_segment_id: segmentSelect?.value || "all_customers",
     audience_label: segmentSelect?.selectedOptions?.[0]?.textContent || "All current WhatsApp customers",
     recipient_count: recipients.length,
+    recipients,
     send_mode: sendMode,
     scheduled_at: broadcastScheduledAt(),
     status: status === "draft" && sendMode === "later" ? "scheduled" : status,

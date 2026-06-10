@@ -39,6 +39,8 @@ const AUTOMATION_EVENTS_FILE =
   process.env.AUTOMATION_EVENTS_FILE || path.join(DATA_DIR, "automation-events.json");
 const PLATFORM_STATE_FILE = process.env.PLATFORM_STATE_FILE || path.join(DATA_DIR, "platform-state.json");
 const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
+const BROADCAST_SCHEDULER_INTERVAL_MS = Number(process.env.BROADCAST_SCHEDULER_INTERVAL_MS || 60000);
+const BROADCAST_ATTRIBUTION_WINDOW_DAYS = Number(process.env.BROADCAST_ATTRIBUTION_WINDOW_DAYS || 14);
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -409,6 +411,9 @@ function normalizeBroadcastCampaign(input = {}) {
     audience_segment_id: String(input.audience_segment_id || ""),
     audience_label: String(input.audience_label || ""),
     recipient_count: Number(input.recipient_count || 0),
+    recipients: Array.isArray(input.recipients)
+      ? Array.from(new Set(input.recipients.map((item) => String(item || "").replace(/\D/g, "")).filter(Boolean)))
+      : [],
     send_mode: String(input.send_mode || "now"),
     scheduled_at: input.scheduled_at || null,
     status,
@@ -419,6 +424,28 @@ function normalizeBroadcastCampaign(input = {}) {
     safety_checks: input.safety_checks && typeof input.safety_checks === "object" ? input.safety_checks : {},
     created_at: input.created_at || new Date().toISOString(),
     updated_at: new Date().toISOString(),
+  };
+}
+
+function broadcastAnalyticsFromJson(campaign = {}) {
+  const messages = Array.isArray(campaign.messages) ? campaign.messages : [];
+  const attributions = Array.isArray(campaign.attributions) ? campaign.attributions : [];
+  const sent = messages.filter((item) => ["submitted", "sent", "delivered", "read"].includes(item.status)).length;
+  const delivered = messages.filter((item) => ["delivered", "read"].includes(item.status)).length;
+  const read = messages.filter((item) => item.status === "read").length;
+  const failed = messages.filter((item) => item.status === "failed").length;
+  const revenue = attributions.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  return {
+    sent,
+    delivered,
+    read,
+    failed,
+    attributed_orders: attributions.length,
+    attributed_revenue: revenue,
+    currency: attributions[0]?.currency || "INR",
+    delivery_rate: sent ? Math.round((delivered / sent) * 100) : 0,
+    read_rate: sent ? Math.round((read / sent) * 100) : 0,
+    order_rate: sent ? Number(((attributions.length / sent) * 100).toFixed(2)) : 0,
   };
 }
 
@@ -599,6 +626,34 @@ function normalizeShopifyAutomationEvent(topic, payload, receivedAt) {
     currency: firstTruthy(payload?.currency, payload?.presentment_currency, "INR"),
     raw_payload: payload || {},
     received_at: receivedAt,
+  };
+}
+
+function extractUtmValue(payload, key) {
+  const direct = firstTruthy(
+    payload?.[key],
+    payload?.landing_site,
+    payload?.referring_site,
+    payload?.source_url,
+    payload?.note
+  );
+  const attributes = [
+    ...(payload?.note_attributes || []),
+    ...(payload?.attributes || []),
+    ...(payload?.client_details ? [{ name: "client_details", value: JSON.stringify(payload.client_details) }] : []),
+  ];
+  const found = attributes.find((item) => String(item.name || item.key || "").toLowerCase() === key.toLowerCase());
+  const blob = `${direct || ""} ${found?.value || ""} ${JSON.stringify(payload || {}).slice(0, 3000)}`;
+  const match = blob.match(new RegExp(`${key}=([^&#\\s]+)`, "i"));
+  return decodeURIComponent(match?.[1] || found?.value || "").trim();
+}
+
+function commerceAttributionSignals(payload) {
+  return {
+    utm_source: extractUtmValue(payload, "utm_source"),
+    utm_medium: extractUtmValue(payload, "utm_medium"),
+    utm_campaign: extractUtmValue(payload, "utm_campaign"),
+    raw_text: JSON.stringify(payload || {}).toLowerCase(),
   };
 }
 
@@ -1545,6 +1600,7 @@ function createJsonStorage() {
               target.status = status.status;
               target.error_message = status.errors?.[0]?.title || "";
             }
+            updateBroadcastMessageStatus(status);
           }
         }
       }
@@ -1699,7 +1755,12 @@ function createJsonStorage() {
 
   async function listBroadcastCampaigns() {
     const platform = readPlatformState();
-    return platform.broadcasts.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+    return platform.broadcasts
+      .map((campaign) => ({
+        ...campaign,
+        analytics: broadcastAnalyticsFromJson(campaign),
+      }))
+      .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
   }
 
   async function saveBroadcastCampaign(input) {
@@ -1714,6 +1775,77 @@ function createJsonStorage() {
     }
     writePlatformState(platform);
     return campaign;
+  }
+
+  async function markBroadcastCampaignStatus(id, status, patch = {}) {
+    const platform = readPlatformState();
+    const index = platform.broadcasts.findIndex((item) => item.id === id);
+    if (index < 0) return null;
+    platform.broadcasts[index] = {
+      ...platform.broadcasts[index],
+      ...patch,
+      status,
+      updated_at: new Date().toISOString(),
+    };
+    writePlatformState(platform);
+    return platform.broadcasts[index];
+  }
+
+  async function findDueBroadcastCampaigns(limit = 5) {
+    const now = Date.now();
+    const platform = readPlatformState();
+    return platform.broadcasts
+      .filter((campaign) => (
+        campaign.status === "scheduled"
+        && campaign.scheduled_at
+        && new Date(campaign.scheduled_at).getTime() <= now
+      ))
+      .slice(0, limit);
+  }
+
+  async function recordBroadcastMessages(campaignId, results) {
+    const platform = readPlatformState();
+    const campaign = platform.broadcasts.find((item) => item.id === campaignId);
+    if (!campaign) return [];
+    const records = (results || []).map((result) => ({
+      id: uuid(),
+      campaign_id: campaignId,
+      recipient_wa_id: result.recipient || "",
+      provider_message_id: result.provider_message_id || "",
+      status: result.ok ? "submitted" : "failed",
+      error_message: result.reason || result.error?.message || "",
+      raw_payload: result,
+      queued_at: new Date().toISOString(),
+      sent_at: result.ok ? new Date().toISOString() : null,
+      delivered_at: null,
+      read_at: null,
+      failed_at: result.ok ? null : new Date().toISOString(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }));
+    campaign.messages = [...(campaign.messages || []), ...records];
+    campaign.updated_at = new Date().toISOString();
+    writePlatformState(platform);
+    return records;
+  }
+
+  async function updateBroadcastMessageStatus(status) {
+    const platform = readPlatformState();
+    let changed = false;
+    for (const campaign of platform.broadcasts) {
+      for (const message of campaign.messages || []) {
+        if (message.provider_message_id !== status.id) continue;
+        message.status = status.status || message.status;
+        message.error_message = status.errors?.[0]?.title || status.errors?.[0]?.message || message.error_message || "";
+        message.updated_at = new Date().toISOString();
+        if (status.status === "sent" && !message.sent_at) message.sent_at = fromProviderTimestamp(status.timestamp, new Date().toISOString());
+        if (status.status === "delivered" && !message.delivered_at) message.delivered_at = fromProviderTimestamp(status.timestamp, new Date().toISOString());
+        if (status.status === "read" && !message.read_at) message.read_at = fromProviderTimestamp(status.timestamp, new Date().toISOString());
+        if (status.status === "failed" && !message.failed_at) message.failed_at = fromProviderTimestamp(status.timestamp, new Date().toISOString());
+        changed = true;
+      }
+    }
+    if (changed) writePlatformState(platform);
   }
 
   return {
@@ -1781,6 +1913,10 @@ function createJsonStorage() {
     saveCustomSegment,
     listBroadcastCampaigns,
     saveBroadcastCampaign,
+    markBroadcastCampaignStatus,
+    findDueBroadcastCampaigns,
+    recordBroadcastMessages,
+    updateBroadcastMessageStatus,
   };
 }
 
@@ -1966,6 +2102,7 @@ function createPostgresStorage() {
         [result.rows[0].conversation_id]
       );
     }
+    await updateBroadcastMessageStatus(status, receivedAt);
   }
 
   async function storeInboundMessage(channelId, contact, conversation, message, receivedAt) {
@@ -2390,6 +2527,7 @@ function createPostgresStorage() {
           [normalized.provider, normalized.event_fingerprint]
         );
     const event = eventResult.rows[0];
+    await attributeBroadcastRevenue(event, payload);
     const matches = evaluateAutomationMatches(topic, payload);
     const runs = [];
 
@@ -2711,6 +2849,7 @@ function createPostgresStorage() {
       audience_segment_id: row.audience_segment_id || "",
       audience_label: row.audience_label || "",
       recipient_count: Number(row.recipient_count || 0),
+      recipients: safeJsonParse(row.recipients, []),
       send_mode: row.send_mode || "now",
       scheduled_at: row.scheduled_at || null,
       status: row.status || "draft",
@@ -2719,6 +2858,25 @@ function createPostgresStorage() {
       utm_campaign: row.utm_campaign || "",
       variables: safeJsonParse(row.variables, []),
       safety_checks: safeJsonParse(row.safety_checks, {}),
+      last_send_error: row.last_send_error || "",
+      analytics: {
+        sent: Number(row.sent_count || 0),
+        delivered: Number(row.delivered_count || 0),
+        read: Number(row.read_count || 0),
+        failed: Number(row.failed_count || 0),
+        attributed_orders: Number(row.attributed_orders || 0),
+        attributed_revenue: Number(row.attributed_revenue || 0),
+        currency: row.attribution_currency || "INR",
+        delivery_rate: Number(row.sent_count || 0)
+          ? Math.round((Number(row.delivered_count || 0) / Number(row.sent_count || 0)) * 100)
+          : 0,
+        read_rate: Number(row.sent_count || 0)
+          ? Math.round((Number(row.read_count || 0) / Number(row.sent_count || 0)) * 100)
+          : 0,
+        order_rate: Number(row.sent_count || 0)
+          ? Number(((Number(row.attributed_orders || 0) / Number(row.sent_count || 0)) * 100).toFixed(2))
+          : 0,
+      },
       created_at: row.created_at || "",
       updated_at: row.updated_at || "",
     };
@@ -2728,10 +2886,41 @@ function createPostgresStorage() {
     const organizationId = await ensureOrganization();
     const result = await query(
       `
-      select *
-      from broadcast_campaigns
-      where organization_id = $1
-      order by updated_at desc
+      with message_stats as (
+        select
+          campaign_id,
+          count(id) filter (where status in ('submitted', 'sent', 'delivered', 'read'))::int as sent_count,
+          count(id) filter (where status in ('delivered', 'read'))::int as delivered_count,
+          count(id) filter (where status = 'read')::int as read_count,
+          count(id) filter (where status = 'failed')::int as failed_count
+        from broadcast_messages
+        where organization_id = $1
+        group by campaign_id
+      ),
+      attribution_stats as (
+        select
+          campaign_id,
+          count(id)::int as attributed_orders,
+          coalesce(sum(amount), 0)::numeric as attributed_revenue,
+          (array_agg(currency order by created_at desc))[1] as attribution_currency
+        from broadcast_attributions
+        where organization_id = $1
+        group by campaign_id
+      )
+      select
+        bc.*,
+        coalesce(ms.sent_count, 0) as sent_count,
+        coalesce(ms.delivered_count, 0) as delivered_count,
+        coalesce(ms.read_count, 0) as read_count,
+        coalesce(ms.failed_count, 0) as failed_count,
+        coalesce(ats.attributed_orders, 0) as attributed_orders,
+        coalesce(ats.attributed_revenue, 0) as attributed_revenue,
+        ats.attribution_currency
+      from broadcast_campaigns bc
+      left join message_stats ms on ms.campaign_id = bc.id
+      left join attribution_stats ats on ats.campaign_id = bc.id
+      where bc.organization_id = $1
+      order by bc.updated_at desc
       limit 200
       `,
       [organizationId]
@@ -2753,6 +2942,7 @@ function createPostgresStorage() {
         audience_segment_id,
         audience_label,
         recipient_count,
+        recipients,
         send_mode,
         scheduled_at,
         status,
@@ -2764,7 +2954,7 @@ function createPostgresStorage() {
         created_at,
         updated_at
       )
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, now(), now())
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb, now(), now())
       on conflict (id) do update
       set name = excluded.name,
           template_name = excluded.template_name,
@@ -2772,6 +2962,7 @@ function createPostgresStorage() {
           audience_segment_id = excluded.audience_segment_id,
           audience_label = excluded.audience_label,
           recipient_count = excluded.recipient_count,
+          recipients = excluded.recipients,
           send_mode = excluded.send_mode,
           scheduled_at = excluded.scheduled_at,
           status = excluded.status,
@@ -2792,6 +2983,7 @@ function createPostgresStorage() {
         campaign.audience_segment_id || null,
         campaign.audience_label || null,
         campaign.recipient_count,
+        JSON.stringify(campaign.recipients || []),
         campaign.send_mode,
         campaign.scheduled_at || null,
         campaign.status,
@@ -2803,6 +2995,180 @@ function createPostgresStorage() {
       ]
     );
     return mapBroadcastCampaign(result.rows[0]);
+  }
+
+  async function markBroadcastCampaignStatus(id, status, patch = {}) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      update broadcast_campaigns
+      set status = $3,
+          last_send_error = $4,
+          updated_at = now()
+      where id = $1 and organization_id = $2
+      returning *
+      `,
+      [id, organizationId, status, patch.last_send_error || null]
+    );
+    return result.rowCount ? mapBroadcastCampaign(result.rows[0]) : null;
+  }
+
+  async function findDueBroadcastCampaigns(limit = 5) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select *
+      from broadcast_campaigns
+      where organization_id = $1
+        and status = 'scheduled'
+        and scheduled_at is not null
+        and scheduled_at <= now()
+      order by scheduled_at asc
+      limit $2
+      `,
+      [organizationId, Math.max(1, Math.min(Number(limit) || 5, 20))]
+    );
+    return result.rows.map(mapBroadcastCampaign);
+  }
+
+  async function recordBroadcastMessages(campaignId, results) {
+    const organizationId = await ensureOrganization();
+    const records = [];
+    for (const item of results || []) {
+      const status = item.ok ? "submitted" : "failed";
+      const timestamp = new Date().toISOString();
+      const result = await query(
+        `
+        insert into broadcast_messages (
+          id,
+          organization_id,
+          campaign_id,
+          recipient_wa_id,
+          provider_message_id,
+          status,
+          error_message,
+          raw_payload,
+          queued_at,
+          sent_at,
+          failed_at,
+          created_at,
+          updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $9, now())
+        on conflict (organization_id, provider_message_id) where provider_message_id is not null do update
+        set status = excluded.status,
+            error_message = excluded.error_message,
+            raw_payload = excluded.raw_payload,
+            updated_at = now()
+        returning *
+        `,
+        [
+          uuid(),
+          organizationId,
+          campaignId,
+          item.recipient || "",
+          item.provider_message_id || null,
+          status,
+          item.reason || item.error?.message || "",
+          JSON.stringify(item || {}),
+          timestamp,
+          item.ok ? timestamp : null,
+          item.ok ? null : timestamp,
+        ]
+      );
+      records.push(result.rows[0]);
+    }
+    return records;
+  }
+
+  async function updateBroadcastMessageStatus(status, receivedAt = new Date().toISOString()) {
+    const statusTime = fromProviderTimestamp(status.timestamp, receivedAt);
+    const errorMessage = status.errors?.[0]?.title || status.errors?.[0]?.message || "";
+    await query(
+      `
+      update broadcast_messages
+      set status = $2,
+          error_message = case when $3 <> '' then $3 else error_message end,
+          sent_at = case when $2 = 'sent' and sent_at is null then $4 else sent_at end,
+          delivered_at = case when $2 = 'delivered' and delivered_at is null then $4 else delivered_at end,
+          read_at = case when $2 = 'read' and read_at is null then $4 else read_at end,
+          failed_at = case when $2 = 'failed' and failed_at is null then $4 else failed_at end,
+          updated_at = now()
+      where provider_message_id = $1
+      `,
+      [status.id, status.status || "sent", errorMessage, statusTime]
+    );
+  }
+
+  async function attributeBroadcastRevenue(event, payload) {
+    if (!event?.id) return [];
+    const organizationId = await ensureOrganization();
+    const signals = commerceAttributionSignals(payload);
+    const rawText = signals.raw_text || "";
+    const phone = String(event.phone_e164 || "").replace(/\D/g, "");
+    const windowDays = Math.max(1, BROADCAST_ATTRIBUTION_WINDOW_DAYS);
+    const result = await query(
+      `
+      with candidate_campaigns as (
+        select
+          bc.id,
+          case
+            when bc.utm_campaign is not null and bc.utm_campaign <> '' and $2 ilike '%' || lower(bc.utm_campaign) || '%' then 'utm_campaign'
+            when bc.utm_source is not null and bc.utm_source <> '' and $2 ilike '%' || lower(bc.utm_source) || '%' then 'utm_source'
+            when bm.id is not null then 'recipient_phone'
+            else 'campaign_context'
+          end as match_type
+        from broadcast_campaigns bc
+        left join broadcast_messages bm
+          on bm.campaign_id = bc.id
+          and regexp_replace(bm.recipient_wa_id, '\\D', '', 'g') = $3
+          and bm.sent_at is not null
+          and bm.sent_at <= $4
+          and bm.sent_at >= ($4::timestamptz - ($5::int * interval '1 day'))
+        where bc.organization_id = $1
+          and bc.status in ('sent', 'scheduled')
+          and (
+            (bc.utm_campaign is not null and bc.utm_campaign <> '' and $2 ilike '%' || lower(bc.utm_campaign) || '%')
+            or (bc.utm_source is not null and bc.utm_source <> '' and $2 ilike '%' || lower(bc.utm_source) || '%')
+            or bm.id is not null
+          )
+        order by
+          case
+            when bc.utm_campaign is not null and bc.utm_campaign <> '' and $2 ilike '%' || lower(bc.utm_campaign) || '%' then 1
+            when bc.utm_source is not null and bc.utm_source <> '' and $2 ilike '%' || lower(bc.utm_source) || '%' then 2
+            else 3
+          end,
+          bc.updated_at desc
+        limit 1
+      )
+      insert into broadcast_attributions (
+        id,
+        organization_id,
+        campaign_id,
+        commerce_event_id,
+        match_type,
+        amount,
+        currency,
+        created_at
+      )
+      select $6, $1, id, $7, match_type, $8, $9, now()
+      from candidate_campaigns
+      on conflict (campaign_id, commerce_event_id) do nothing
+      returning *
+      `,
+      [
+        organizationId,
+        rawText,
+        phone,
+        event.received_at || new Date().toISOString(),
+        windowDays,
+        uuid(),
+        event.id,
+        Number(event.amount || 0),
+        event.currency || "INR",
+      ]
+    );
+    return result.rows;
   }
 
   return {
@@ -2845,6 +3211,10 @@ function createPostgresStorage() {
     saveCustomSegment,
     listBroadcastCampaigns,
     saveBroadcastCampaign,
+    markBroadcastCampaignStatus,
+    findDueBroadcastCampaigns,
+    recordBroadcastMessages,
+    updateBroadcastMessageStatus,
   };
 }
 
@@ -2939,12 +3309,95 @@ function createStorage() {
       await storage.ready();
       return storage._impl.saveBroadcastCampaign(...args);
     },
+    async markBroadcastCampaignStatus(...args) {
+      await storage.ready();
+      return storage._impl.markBroadcastCampaignStatus(...args);
+    },
+    async findDueBroadcastCampaigns(...args) {
+      await storage.ready();
+      return storage._impl.findDueBroadcastCampaigns(...args);
+    },
+    async recordBroadcastMessages(...args) {
+      await storage.ready();
+      return storage._impl.recordBroadcastMessages(...args);
+    },
+    async updateBroadcastMessageStatus(...args) {
+      await storage.ready();
+      return storage._impl.updateBroadcastMessageStatus(...args);
+    },
   };
 
   return storage;
 }
 
 const storage = createStorage();
+
+let broadcastSchedulerRunning = false;
+
+async function executeBroadcastCampaign(campaign) {
+  const recipients = Array.isArray(campaign.recipients) ? campaign.recipients : [];
+  if (!recipients.length) {
+    await storage.markBroadcastCampaignStatus(campaign.id, "failed", {
+      last_send_error: "scheduled_campaign_has_no_recipients",
+    });
+    return { ok: false, accepted: 0, total: 0 };
+  }
+
+  await storage.markBroadcastCampaignStatus(campaign.id, "sending");
+  const results = [];
+  for (const recipient of recipients.slice(0, 250)) {
+    const outbound = await sendWhatsAppMessage(
+      {
+        id: `broadcast_${campaign.id}_${recipient}`,
+        wa_id: recipient,
+      },
+      {
+        type: "template",
+        template_name: campaign.template_name,
+        language: campaign.template_language || "en_US",
+        variables: Array.isArray(campaign.variables) ? campaign.variables : [],
+      }
+    );
+    results.push({
+      recipient,
+      ok: Boolean(outbound.ok),
+      reason: outbound.reason || "",
+      provider_message_id: outbound.providerMessageId || "",
+      error: outbound.error || null,
+    });
+  }
+
+  await storage.recordBroadcastMessages(campaign.id, results);
+  const accepted = results.filter((item) => item.ok).length;
+  await storage.markBroadcastCampaignStatus(
+    campaign.id,
+    accepted > 0 ? "sent" : "failed",
+    accepted > 0 ? {} : { last_send_error: results[0]?.reason || "scheduled_broadcast_failed" }
+  );
+  return {
+    ok: accepted > 0,
+    accepted,
+    total: results.length,
+  };
+}
+
+async function runBroadcastScheduler() {
+  if (broadcastSchedulerRunning) return;
+  broadcastSchedulerRunning = true;
+  try {
+    const dueCampaigns = await storage.findDueBroadcastCampaigns(5);
+    for (const campaign of dueCampaigns) {
+      const result = await executeBroadcastCampaign(campaign);
+      console.log(
+        `[broadcast.scheduler] campaign=${campaign.id} accepted=${result.accepted}/${result.total}`
+      );
+    }
+  } catch (error) {
+    console.error("[broadcast.scheduler] failed", error);
+  } finally {
+    broadcastSchedulerRunning = false;
+  }
+}
 
 function serveStatic(req, parsed, res) {
   const requestedPath = parsed.pathname === "/" ? "/index.html" : decodeURIComponent(parsed.pathname);
@@ -3289,6 +3742,14 @@ async function handleApi(req, res, parsed) {
       }
 
       const accepted = results.filter((item) => item.ok).length;
+      if (body.campaign_id) {
+        await storage.recordBroadcastMessages(String(body.campaign_id), results);
+        await storage.markBroadcastCampaignStatus(
+          String(body.campaign_id),
+          accepted > 0 ? "sent" : "failed",
+          accepted > 0 ? {} : { last_send_error: results[0]?.reason || "broadcast_send_failed" }
+        );
+      }
       return sendJson(res, 200, {
         ok: accepted > 0,
         accepted,
@@ -3475,6 +3936,11 @@ const server = http.createServer(async (req, res) => {
         sends_enabled: false,
         shopify_webhook: "/webhooks/shopify",
       },
+      broadcasts: {
+        scheduler_enabled: true,
+        scheduler_interval_ms: BROADCAST_SCHEDULER_INTERVAL_MS,
+        attribution_window_days: BROADCAST_ATTRIBUTION_WINDOW_DAYS,
+      },
       storage: {
         mode: storage.mode,
         attempted_mode: storage.initState?.attempted_mode || storage.mode,
@@ -3572,6 +4038,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, async () => {
   await storage.ready().catch(() => {});
+  runBroadcastScheduler();
+  setInterval(runBroadcastScheduler, BROADCAST_SCHEDULER_INTERVAL_MS).unref();
   console.log(`OneOperations live server listening on http://${HOST}:${PORT}`);
   console.log(`Dashboard directory: ${DASHBOARD_DIR}`);
   console.log(`Webhook callback path: /webhooks/whatsapp`);
