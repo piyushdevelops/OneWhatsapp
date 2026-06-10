@@ -12,6 +12,8 @@ const state = {
   copilotPrompts: {},
   broadcastSegmentSeed: "",
   segmentBuilderOpen: false,
+  broadcastBuilderOpen: false,
+  templateBuilderOpen: false,
 };
 
 const BRAND_NAME = "The June Shop";
@@ -1304,6 +1306,8 @@ function setScreen(next) {
   state.screen = next;
   state.search = "";
   if (next !== "audience") state.segmentBuilderOpen = false;
+  if (next !== "broadcasts") state.broadcastBuilderOpen = false;
+  if (next !== "templates") state.templateBuilderOpen = false;
   document.querySelectorAll(".nav-item").forEach((item) => {
     item.classList.toggle("active", item.dataset.screen === next);
   });
@@ -1380,10 +1384,9 @@ function restoreInboxUiState(snapshot) {
 function render() {
   const inboxSnapshot = captureInboxUiState();
   const [metaTitle, metaSubtitle] = screenMeta[state.screen];
-  const title = state.screen === "audience" && state.segmentBuilderOpen ? "Segment" : metaTitle;
-  const subtitle = state.screen === "audience" && state.segmentBuilderOpen
-    ? "Create precise audiences from WhatsApp and Shopify signals."
-    : metaSubtitle;
+  const builderMeta = currentBuilderMeta(metaTitle, metaSubtitle);
+  const title = builderMeta.title;
+  const subtitle = builderMeta.subtitle;
   pageTitle.textContent = title;
   pageSubtitle.textContent = subtitle;
   actions.innerHTML = renderActions(state.screen);
@@ -1402,17 +1405,51 @@ function render() {
 
   screen.innerHTML = renderers[state.screen]();
   screen.className = `screen screen-${state.screen}`;
+  if (state.templateBuilderOpen) {
+    setTimeout(() => {
+      updateTemplatePreview();
+      attachTemplateSubmitFallback();
+    }, 0);
+  }
   restoreInboxUiState(inboxSnapshot);
+}
+
+function currentBuilderMeta(defaultTitle, defaultSubtitle) {
+  if (state.screen === "audience" && state.segmentBuilderOpen) {
+    return {
+      title: "Segment",
+      subtitle: "Create precise audiences from WhatsApp and Shopify signals.",
+    };
+  }
+  if (state.screen === "broadcasts" && state.broadcastBuilderOpen) {
+    return {
+      title: "Campaign Builder",
+      subtitle: "Prepare the audience, approved template, UTM plan and send controls in one focused page.",
+    };
+  }
+  if (state.screen === "templates" && state.templateBuilderOpen) {
+    return {
+      title: "Template Builder",
+      subtitle: "Create Meta-compliant WhatsApp templates for broadcasts and automations.",
+    };
+  }
+  return { title: defaultTitle, subtitle: defaultSubtitle };
 }
 
 function renderActions(current) {
   if (current === "broadcasts") {
-    return `<button class="primary-button" data-action="open-broadcast-modal">Create campaign draft</button>`;
+    if (state.broadcastBuilderOpen) {
+      return `<button class="secondary-button" data-action="close-broadcast-builder">Back to campaigns</button>`;
+    }
+    return `<button class="primary-button" data-action="open-broadcast-builder">Create campaign draft</button>`;
   }
   if (current === "templates") {
+    if (state.templateBuilderOpen) {
+      return `<button class="secondary-button" data-action="close-template-builder">Back to templates</button>`;
+    }
     return `
       <button class="secondary-button" data-action="sync-templates">Connect Meta template sync</button>
-      <button class="primary-button" data-action="open-template-modal">Create template</button>
+      <button class="primary-button" data-action="open-template-builder">Create template</button>
     `;
   }
   if (current === "journeys") {
@@ -1791,7 +1828,7 @@ function renderSegmentTable(segments) {
       </td>
       <td><strong>${segment.size}</strong></td>
       <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
+      <td><button class="ghost-button" data-action="open-broadcast-builder" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
     </tr>
   `).join("");
   return table(["Segment Name", "Segment Size", "Updated At", ""], rows);
@@ -2115,6 +2152,7 @@ function renderBroadcasts() {
   loadMetaTemplates();
   loadSavedBroadcasts();
   loadSavedSegments();
+  if (state.broadcastBuilderOpen) return renderBroadcastBuilderPage();
   const templates = approvedTemplates();
   const scheduled = savedBroadcasts.filter((campaign) => campaign.status === "scheduled").length;
   const sentMessages = savedBroadcasts.reduce((sum, campaign) => sum + Number(campaign.analytics?.sent || 0), 0);
@@ -2128,7 +2166,7 @@ function renderBroadcasts() {
             <h2>Send approved WhatsApp templates to real customers.</h2>
             <p>Broadcasts use templates approved by Meta. Template approval happens in Templates; broadcast sends go through your connected WhatsApp Cloud API number.</p>
           </div>
-          <button class="primary-button" data-action="open-broadcast-modal">Create campaign draft</button>
+          <button class="primary-button" data-action="open-broadcast-builder">Create campaign draft</button>
         </div>
       </section>
 
@@ -2146,7 +2184,7 @@ function renderBroadcasts() {
         </div>
         <div class="builder-actions">
           <button class="secondary-button" data-action="sync-templates">Sync templates</button>
-          <button class="primary-button" data-action="open-broadcast-modal">Create broadcast</button>
+          <button class="primary-button" data-action="open-broadcast-builder">Create broadcast</button>
         </div>
       </section>
 
@@ -2163,7 +2201,7 @@ function renderBroadcastCampaigns() {
     return emptyPanel("Loading campaigns", "Pulling saved drafts and scheduled broadcasts.");
   }
   if (!savedBroadcasts.length) {
-    return emptyPanel("No campaign drafts yet", "Create a broadcast to save the audience, template, schedule and UTM plan.", "Create broadcast", "open-broadcast-modal");
+    return emptyPanel("No campaign drafts yet", "Create a broadcast to save the audience, template, schedule and UTM plan.", "Create broadcast", "open-broadcast-builder");
   }
   const rows = savedBroadcasts.map((draft) => `
     <tr>
@@ -2180,7 +2218,7 @@ function renderBroadcastCampaigns() {
       <td>${draft.analytics?.order_rate || 0}%</td>
       <td>
         <button class="ghost-button" data-action="open-broadcast-report" data-campaign-id="${escapeHtml(draft.id)}">Report</button>
-        <button class="ghost-button" data-action="open-broadcast-modal">Duplicate</button>
+        <button class="ghost-button" data-action="open-broadcast-builder">Duplicate</button>
       </td>
     </tr>
   `).join("");
@@ -2219,7 +2257,7 @@ function openBroadcastReportModal(campaignId) {
         </section>
       </div>
     `,
-    `<button class="ghost-button" data-action="close-modal">Close</button><button class="primary-button" data-action="open-broadcast-modal">Duplicate campaign</button>`
+    `<button class="ghost-button" data-action="close-modal">Close</button><button class="primary-button" data-action="open-broadcast-builder">Duplicate campaign</button>`
   );
 }
 
@@ -2259,12 +2297,12 @@ function renderBroadcastTable() {
       <td>${escapeHtml(template.category || "-")}</td>
       <td>${escapeHtml(template.language || "-")}</td>
       <td>${liveCustomers().length}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal">Use template</button></td>
+      <td><button class="ghost-button" data-action="open-broadcast-builder">Use template</button></td>
     </tr>
   `).join("");
 
   if (!approvedTemplates().length) {
-    return emptyPanel("No approved templates available", "Sync templates from Meta or submit a new template for approval before sending broadcasts.", "Create template", "open-template-modal");
+    return emptyPanel("No approved templates available", "Sync templates from Meta or submit a new template for approval before sending broadcasts.", "Create template", "open-template-builder");
   }
 
   return table(["Template", "Status", "Category", "Language", "Current Audience", ""], rows);
@@ -2272,6 +2310,7 @@ function renderBroadcastTable() {
 
 function renderTemplates() {
   loadMetaTemplates();
+  if (state.templateBuilderOpen) return renderTemplateBuilderPage();
   const filtered = filterBySearch(metaTemplates, ["name", "category", "status", "language"]);
 
   return `
@@ -2280,12 +2319,12 @@ function renderTemplates() {
         <div class="toolbar-right">
           <span class="badge ${metaTemplatesLastError ? "red" : metaTemplates.length ? "green" : "orange"}">${metaTemplatesLastError ? "Sync issue" : metaTemplates.length ? "Meta synced" : "Waiting"}</span>
           <button class="secondary-button" data-action="sync-templates">Sync Templates</button>
-          <button class="primary-button" data-action="open-template-modal">Create New Template</button>
+          <button class="primary-button" data-action="open-template-builder">Create New Template</button>
         </div>
         <input class="search" data-search placeholder="Search by template name" value="${escapeHtml(state.search)}" />
       </div>
       ${metaTemplatesLastError ? `<section class="panel pad"><span class="badge red">Meta sync failed</span><p class="setting-copy">${escapeHtml(metaTemplatesLastError)}</p></section>` : ""}
-      ${filtered.length ? renderTemplateTable(filtered) : emptyPanel("No templates synced yet", "Click Sync Templates to pull live WhatsApp templates from Meta, or create a template here and send it to Meta for approval.", "Create template", "open-template-modal")}
+      ${filtered.length ? renderTemplateTable(filtered) : emptyPanel("No templates synced yet", "Click Sync Templates to pull live WhatsApp templates from Meta, or create a template here and send it to Meta for approval.", "Create template", "open-template-builder")}
     </div>
   `;
 }
@@ -2300,7 +2339,7 @@ function renderTemplateTable(rowsData) {
       <td>${escapeHtml(template.language || "-")}</td>
       <td>${escapeHtml(template.created ? formatContextDate(template.created) : "-")}</td>
       <td>${escapeHtml(template.disabled || "-")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-modal" ${template.status !== "APPROVED" ? "disabled" : ""}>Use</button></td>
+      <td><button class="ghost-button" data-action="open-broadcast-builder" ${template.status !== "APPROVED" ? "disabled" : ""}>Use</button></td>
     </tr>
   `).join("");
   return table(["Template Name", "Approval Status", "Category", "Usage", "Language", "Created At", "Disabled At", ""], rows);
@@ -3587,8 +3626,10 @@ async function submitMetaTemplate() {
     }
 
     closeModal();
+    state.templateBuilderOpen = false;
     metaTemplatesLoadedAt = 0;
     await loadMetaTemplates({ force: true });
+    render();
     showToast("Template sent to Meta for approval.");
   } catch (error) {
     setModalNotice(error.message || "Could not submit template.", "error");
@@ -3634,10 +3675,12 @@ async function sendBroadcastLive() {
   }
 
   closeModal();
+  state.broadcastBuilderOpen = false;
   inboxLoadedAt = 0;
   savedBroadcastsLoadedAt = 0;
   await loadInboxData({ force: true });
   await loadSavedBroadcasts({ force: true });
+  render();
   showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
 }
 
@@ -3696,6 +3739,8 @@ async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("dr
   await loadSavedBroadcasts({ force: true });
   if (!silent) {
     closeModal();
+    state.broadcastBuilderOpen = false;
+    render();
     showToast(payload.status === "scheduled" ? "Broadcast scheduled." : "Broadcast draft saved.");
   }
   return result.campaign;
@@ -4049,6 +4094,162 @@ function broadcastEligibleCustomers(customers) {
     .filter((customer) => customer.phone.replace(/\D/g, ""));
 }
 
+function broadcastBuilderData() {
+  const templates = approvedTemplates();
+  const customers = liveCustomers();
+  const segments = localSegments().filter((segment) => segment.size > 0);
+  const seededSegmentId = state.broadcastSegmentSeed;
+  const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
+  const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
+  const templateOptions = templates.length
+    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
+    : `<option value="">No approved templates synced</option>`;
+  const segmentOptions = [
+    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All current WhatsApp customers (${customers.length})</option>`,
+    ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
+  ].join("");
+  return {
+    templates,
+    customers,
+    segments,
+    defaultRecipients,
+    templateOptions,
+    segmentOptions,
+  };
+}
+
+function renderBroadcastBuilderPage() {
+  const { templates, customers, segments, defaultRecipients, templateOptions, segmentOptions } = broadcastBuilderData();
+  const customerRows = broadcastRecipientRows(defaultRecipients);
+  const templatesReady = templates.length;
+  const audienceReady = defaultRecipients.length;
+  return `
+    <div id="broadcast-builder" class="campaign-builder-page">
+      <div class="segment-builder-header campaign-builder-header">
+        <button class="segment-back-button" data-action="close-broadcast-builder" aria-label="Back">‹</button>
+        <div class="segment-builder-title">
+          <span class="eyebrow">WhatsApp campaign</span>
+          <h2>Create broadcast</h2>
+          <p>Choose an approved Meta template, attach a Shopify-ready UTM plan, and send only to an opted-in audience.</p>
+          <div class="segment-builder-pills">
+            <span>${templatesReady} approved templates</span>
+            <span>${customers.length} WhatsApp customers</span>
+            <span>${segments.length} live segments</span>
+          </div>
+        </div>
+        <div class="builder-header-actions">
+          <button class="secondary-button" data-action="save-broadcast">Save Draft</button>
+          <button class="primary-button" data-action="send-broadcast-live">Send broadcast</button>
+        </div>
+      </div>
+
+      <div class="builder-page-shell">
+        <section class="builder-page-main">
+          <section class="builder-section">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Campaign setup</span>
+                <h3>Name, template and timing</h3>
+              </div>
+              <span class="builder-status-pill">${templatesReady ? "Meta templates available" : "Template sync needed"}</span>
+            </div>
+            <div class="form-grid">
+              <div class="wide">
+                <label class="label">Campaign name</label>
+                <input id="broadcast-name" class="field" placeholder="Example: TJS clearance sale" />
+              </div>
+              <div>
+                <label class="label">Approved Meta template</label>
+                <select id="broadcast-template-name" class="select">${templateOptions}</select>
+              </div>
+              <div>
+                <label class="label">Language</label>
+                <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
+              </div>
+              <div>
+                <label class="label">Audience</label>
+                <select id="broadcast-audience-segment" class="select">${segmentOptions}</select>
+              </div>
+              <div>
+                <label class="label">Send time</label>
+                <select id="broadcast-send-mode" class="select"><option value="now">Send now</option><option value="later">Schedule later</option></select>
+              </div>
+              <div>
+                <label class="label">Schedule date</label>
+                <input id="broadcast-scheduled-date" class="field" type="date" />
+              </div>
+              <div>
+                <label class="label">Schedule time</label>
+                <input id="broadcast-scheduled-time" class="field" type="time" />
+              </div>
+            </div>
+          </section>
+
+          <section class="builder-section">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Attribution</span>
+                <h3>Track Shopify revenue back to WhatsApp</h3>
+              </div>
+              <span class="builder-status-pill green">UTM ready</span>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="label">UTM source</label>
+                <input id="broadcast-utm-source" class="field" value="onewhatsapp" />
+              </div>
+              <div>
+                <label class="label">UTM medium</label>
+                <input id="broadcast-utm-medium" class="field" value="whatsapp" />
+              </div>
+              <div class="wide">
+                <label class="label">UTM campaign</label>
+                <input id="broadcast-utm-campaign" class="field" placeholder="clearance_june" />
+              </div>
+              <div class="wide">
+                <label class="label">Template variables</label>
+                <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
+              </div>
+            </div>
+          </section>
+
+          <section class="builder-section compact">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Safety</span>
+                <h3>WhatsApp policy checks</h3>
+              </div>
+            </div>
+            <div class="builder-check-grid">
+              <label><input id="broadcast-optin-check" type="checkbox" /> These contacts have WhatsApp opt-in.</label>
+              <label><input id="broadcast-template-check" type="checkbox" /> This is an approved Meta template and follows WhatsApp policy.</label>
+            </div>
+          </section>
+        </section>
+
+        <aside class="builder-page-side">
+          <section class="segment-score-card">
+            <div><strong id="broadcast-recipient-count">${audienceReady}</strong><span>selected recipients</span></div>
+            <div><strong>${templatesReady}</strong><span>approved templates</span></div>
+            <div><strong>${segments.length || "-"}</strong><span>usable segments</span></div>
+          </section>
+          <section class="segment-insight-card">
+            <span class="eyebrow">Recipient preview</span>
+            <h3>Audience sample</h3>
+            <div class="recipient-list">${customerRows}</div>
+          </section>
+          <section class="segment-use-card">
+            <span class="eyebrow">Before sending</span>
+            <div><strong>Template</strong><span>Must be approved by Meta</span></div>
+            <div><strong>Opt-in</strong><span>Only message opted-in customers</span></div>
+            <div><strong>Revenue</strong><span>Use UTM campaign for attribution</span></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  `;
+}
+
 function openBroadcastModal() {
   const templates = approvedTemplates();
   const customers = liveCustomers();
@@ -4166,6 +4367,162 @@ function attachTemplateSubmitFallback() {
     if (button.disabled) return;
     submitMetaTemplate();
   });
+}
+
+function renderTemplateBuilderPage() {
+  const approvedCount = approvedTemplates().length;
+  const pendingCount = metaTemplates.filter((template) => template.status && template.status !== "APPROVED").length;
+  return `
+    <div id="template-builder-page" class="template-builder-page">
+      <div class="segment-builder-header template-builder-header">
+        <button class="segment-back-button" data-action="close-template-builder" aria-label="Back">‹</button>
+        <div class="segment-builder-title">
+          <span class="eyebrow">Meta template</span>
+          <h2>Create WhatsApp template</h2>
+          <p>Build reusable approved messages for broadcasts and automations, with preview and Meta submission from the dashboard.</p>
+          <div class="segment-builder-pills">
+            <span>${approvedCount} approved</span>
+            <span>${pendingCount} pending/review</span>
+            <span>${systemStatus.runtime?.phone_number_id ? "Sender connected" : "Sender not connected"}</span>
+          </div>
+        </div>
+        <div class="builder-header-actions">
+          <button class="secondary-button" data-action="close-template-builder">Cancel</button>
+          <button type="button" id="submit-template-button" class="primary-button" data-action="submit-template">Submit for approval</button>
+        </div>
+      </div>
+
+      <div class="builder-page-shell template-page-shell">
+        <section class="builder-page-main">
+          <section class="builder-section">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Template type</span>
+                <h3>Choose the message format</h3>
+              </div>
+              <span class="builder-status-pill">Basic active</span>
+            </div>
+            <div class="template-type-row">
+              <button class="template-type active" type="button">Basic</button>
+              <button class="template-type" type="button">Carousel</button>
+              <button class="template-type" type="button">Limited time offer</button>
+            </div>
+          </section>
+
+          <section class="builder-section">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">General settings</span>
+                <h3>Name, category and sender</h3>
+              </div>
+              <span class="builder-status-pill green">Meta format</span>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="label">Template name</label>
+                <input id="template-create-name" class="field" placeholder="order_delivered_followup" />
+              </div>
+              <div>
+                <label class="label">Category</label>
+                <select id="template-create-category" class="select"><option>MARKETING</option><option>UTILITY</option><option>AUTHENTICATION</option></select>
+              </div>
+              <div>
+                <label class="label">Language</label>
+                <select id="template-create-language" class="select"><option value="en_US">English</option><option value="hi">Hindi</option></select>
+              </div>
+              <div>
+                <label class="label">Usage in platform</label>
+                <select id="template-create-usage" class="select"><option>Automation</option><option>Broadcast</option><option>Both</option></select>
+              </div>
+              <div class="wide">
+                <label class="label">Sender number</label>
+                <input class="field" value="${escapeHtml(systemStatus.runtime?.phone_number_id ? "Connected WhatsApp number" : "Connect Meta number first")}" disabled />
+              </div>
+            </div>
+          </section>
+
+          <section class="builder-section">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Content</span>
+                <h3>Header, body and examples</h3>
+              </div>
+              <span class="builder-status-pill">Live preview</span>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="label">Header</label>
+                <select id="template-create-header-type" class="select"><option value="none">No header</option><option value="text">Text header</option><option value="image">Image header</option><option value="video">Video header</option><option value="document">Document header</option></select>
+              </div>
+              <div>
+                <label class="label">Header text or media handle</label>
+                <input id="template-create-header-value" class="field" placeholder="Optional" />
+              </div>
+              <div class="wide">
+                <label class="label">Message body</label>
+                <textarea id="template-create-body" class="textarea template-body-input" placeholder="Hi {{1}}, your order {{2}} has been delivered. Reply if you need help."></textarea>
+                <div class="field-help">Use {{1}}, {{2}} for variables. Add examples below so Meta can review the template.</div>
+              </div>
+              <div class="wide">
+                <label class="label">Example variables</label>
+                <input id="template-create-examples" class="field" placeholder="Piyush, #301887" />
+              </div>
+              <div class="wide">
+                <label class="label">Footer</label>
+                <input id="template-create-footer" class="field" value="Reply STOP to unsubscribe." />
+              </div>
+            </div>
+          </section>
+
+          <section class="builder-section compact">
+            <div class="builder-section-head">
+              <div>
+                <span class="eyebrow">Actions</span>
+                <h3>Button shown under the template</h3>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="label">Button type</label>
+                <select id="template-create-button-type" class="select"><option value="none">No button</option><option value="url">URL CTA</option><option value="quick_reply">Quick reply</option><option value="phone">Phone CTA</option></select>
+              </div>
+              <div>
+                <label class="label">Button text</label>
+                <input id="template-create-button-text" class="field" placeholder="Shop Now" />
+              </div>
+              <div class="wide">
+                <label class="label">Button URL or phone</label>
+                <input id="template-create-button-value" class="field" placeholder="https://thejuneshop.com" />
+              </div>
+            </div>
+          </section>
+
+          <div id="modal-notice" class="modal-notice info" aria-live="polite"></div>
+        </section>
+
+        <aside class="builder-page-side">
+          <section class="template-preview-card">
+            <span class="eyebrow">Customer preview</span>
+            <div class="phone-preview">
+              <div class="phone-bar"><span>TJS</span><strong>The June Shop</strong></div>
+              <div class="phone-bubble">
+                <strong id="template-preview-header">Template preview</strong>
+                <p id="template-preview-body">Your template body will preview here while you write.</p>
+                <small id="template-preview-footer">Reply STOP to unsubscribe.</small>
+              </div>
+              <button class="phone-cta" type="button" id="template-preview-button">CTA preview</button>
+            </div>
+          </section>
+          <section class="segment-use-card">
+            <span class="eyebrow">Meta approval checklist</span>
+            <div><strong>Clear purpose</strong><span>Marketing, utility or authentication</span></div>
+            <div><strong>Real examples</strong><span>Variables need sample values</span></div>
+            <div><strong>Reusable copy</strong><span>Avoid one-off wording when possible</span></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  `;
 }
 
 function openTemplateModal() {
@@ -4439,10 +4796,40 @@ document.addEventListener("click", (event) => {
   const handlers = {
     "open-broadcast-modal": () => {
       state.broadcastSegmentSeed = actionTarget.dataset.segmentId || "";
-      openBroadcastModal();
+      state.broadcastBuilderOpen = true;
+      state.screen = "broadcasts";
+      closeModal();
+      render();
+    },
+    "open-broadcast-builder": () => {
+      state.broadcastSegmentSeed = actionTarget.dataset.segmentId || "";
+      state.broadcastBuilderOpen = true;
+      state.screen = "broadcasts";
+      closeModal();
+      render();
+    },
+    "close-broadcast-builder": () => {
+      state.broadcastBuilderOpen = false;
+      state.broadcastSegmentSeed = "";
+      render();
     },
     "open-broadcast-report": () => openBroadcastReportModal(actionTarget.dataset.campaignId),
-    "open-template-modal": openTemplateModal,
+    "open-template-modal": () => {
+      state.templateBuilderOpen = true;
+      state.screen = "templates";
+      closeModal();
+      render();
+    },
+    "open-template-builder": () => {
+      state.templateBuilderOpen = true;
+      state.screen = "templates";
+      closeModal();
+      render();
+    },
+    "close-template-builder": () => {
+      state.templateBuilderOpen = false;
+      render();
+    },
     "open-segment-modal": openSegmentModal,
     "open-segment-builder": () => {
       state.segmentBuilderOpen = true;
