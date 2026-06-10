@@ -25,6 +25,11 @@ let metaTemplates = [];
 let metaTemplatesLoading = false;
 let metaTemplatesLoadedAt = 0;
 let metaTemplatesLastError = "";
+let shopifySegments = [];
+let shopifySegmentsLoading = false;
+let shopifySegmentsLoadedAt = 0;
+let shopifySegmentsLastError = "";
+const customSegments = [];
 let systemStatus = {
   outboundMode: "local_only",
   outboundEnabled: false,
@@ -310,7 +315,163 @@ function liveCustomers() {
     lastMessage: conversation.preview,
     lastSeen: conversation.time,
     intent: conversation.intent || "general_support",
+    shopify: conversation.shopify || null,
+    messages: conversation.messages || [],
   }));
+}
+
+function customerShopifyStats(customer) {
+  const shopify = customer.shopify || {};
+  const shopifyCustomer = shopify.customer || {};
+  const orders = shopify.orders || [];
+  const totalSpent = Number(shopifyCustomer.total_spent || 0);
+  const orderCount = Number(shopifyCustomer.orders_count || orders.length || 0);
+  const averageOrder = orderCount ? totalSpent / orderCount : 0;
+  const latestOrder = orders[0] || null;
+  return {
+    matched: Boolean(shopify.matched),
+    totalSpent,
+    orderCount,
+    averageOrder,
+    tags: shopifyCustomer.tags || "",
+    latestOrder,
+  };
+}
+
+function customerTextBlob(customer) {
+  return [
+    customer.lastMessage,
+    ...(customer.messages || []).map((message) => message.text || message.body || ""),
+  ].join(" ");
+}
+
+const localSegmentRules = [
+  {
+    id: "needs_reply",
+    name: "Needs reply",
+    source: "WhatsApp",
+    description: "Unread WhatsApp customers waiting for a response.",
+    ruleText: "Unread messages greater than 0",
+    matches: (customer) => Number(customer.unread || 0) > 0,
+  },
+  {
+    id: "return_refund",
+    name: "Return / refund intent",
+    source: "WhatsApp + Shopify",
+    description: "Chats mentioning return, refund, exchange, damaged, wrong item, or cancellation.",
+    ruleText: "Message intent contains after-sales keywords",
+    matches: (customer) => /(return|refund|exchange|damaged|wrong|cancel)/i.test(customerTextBlob(customer)),
+  },
+  {
+    id: "delivery_watch",
+    name: "Delivery watchlist",
+    source: "WhatsApp + Shopify",
+    description: "Customers asking about delivery or sounding upset.",
+    ruleText: "Delivery concern, delay, issue, or upset language",
+    matches: (customer) => /(where|delivery|delay|late|not received|upset|angry|issue|problem)/i.test(customerTextBlob(customer)),
+  },
+  {
+    id: "multiple_orders",
+    name: "Multiple Orders (3+)",
+    source: "Shopify",
+    description: "Customers with 3 or more Shopify orders.",
+    ruleText: "Shopify order count greater than or equal to 3",
+    matches: (customer) => customerShopifyStats(customer).orderCount >= 3,
+  },
+  {
+    id: "high_value",
+    name: "High Value Customers",
+    source: "Shopify",
+    description: "Customers with strong lifetime spend.",
+    ruleText: "Lifetime spend greater than or equal to Rs. 5,000",
+    matches: (customer) => customerShopifyStats(customer).totalSpent >= 5000,
+  },
+  {
+    id: "high_aov_repeat",
+    name: "High AOV + Repeat",
+    source: "Shopify",
+    description: "Repeat buyers with high average order value.",
+    ruleText: "Order count greater than 1 and AOV greater than Rs. 2,000",
+    matches: (customer) => {
+      const stats = customerShopifyStats(customer);
+      return stats.orderCount > 1 && stats.averageOrder >= 2000;
+    },
+  },
+  {
+    id: "whatsapp_only",
+    name: "WhatsApp only",
+    source: "WhatsApp",
+    description: "WhatsApp contacts with no matched Shopify customer yet.",
+    ruleText: "No Shopify customer match",
+    matches: (customer) => !customerShopifyStats(customer).matched,
+  },
+];
+
+function localSegments() {
+  const customers = liveCustomers();
+  const computed = localSegmentRules.map((definition) => {
+    const members = customers.filter(definition.matches);
+    return {
+      ...definition,
+      size: members.length,
+      members,
+      updated_at: new Date().toISOString(),
+    };
+  });
+  const custom = customSegments.map((segment) => {
+    const members = customers.filter((customer) => {
+      const stats = customerShopifyStats(customer);
+      const text = customerTextBlob(customer);
+      const rules = [];
+      if (segment.source === "Shopify" || segment.source === "Combined") rules.push(stats.matched);
+      if (segment.minOrders) rules.push(stats.orderCount >= Number(segment.minOrders));
+      if (segment.minSpend) rules.push(stats.totalSpent >= Number(segment.minSpend));
+      if (segment.intentKeyword) rules.push(new RegExp(segment.intentKeyword, "i").test(text));
+      if (segment.tag) rules.push(stats.tags.toLowerCase().includes(segment.tag.toLowerCase()));
+      if (!rules.length) return true;
+      return segment.matchMode === "any" ? rules.some(Boolean) : rules.every(Boolean);
+    });
+    return {
+      id: segment.id,
+      name: segment.name,
+      source: segment.source,
+      description: segment.description,
+      ruleText: segment.ruleText,
+      size: members.length,
+      members,
+      updated_at: segment.updated_at,
+      custom: true,
+    };
+  });
+  return [...computed, ...custom];
+}
+
+function recipientsForSegment(segmentId) {
+  if (!segmentId || segmentId === "all_customers") return liveCustomers();
+  const segment = localSegments().find((item) => item.id === segmentId);
+  return segment?.members || [];
+}
+
+async function loadShopifySegments({ force = false } = {}) {
+  if (shopifySegmentsLoading) return;
+  if (!force && Date.now() - shopifySegmentsLoadedAt < 60000) return;
+  shopifySegmentsLoading = true;
+  shopifySegmentsLastError = "";
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/shopify/segments`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Shopify segments returned ${response.status}`);
+    }
+    shopifySegments = payload.items || [];
+    shopifySegmentsLoadedAt = Date.now();
+  } catch (error) {
+    shopifySegmentsLastError = error.message || "Shopify segment sync unavailable";
+    shopifySegmentsLoadedAt = Date.now();
+  } finally {
+    shopifySegmentsLoading = false;
+    if (state.screen === "audience") render();
+  }
 }
 
 function normalizeMetaTemplate(item) {
@@ -989,18 +1150,99 @@ function legend(label, value, color) {
 
 function renderAudience() {
   const customers = filterBySearch(liveCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
+  const segments = filterBySearch(localSegments(), ["name", "source", "description", "ruleText"]);
+  if (state.audienceTab === "shopify_segments") loadShopifySegments();
   return `
     <div class="page-stack">
       <div class="toolbar">
-        <input class="search" data-search placeholder="Search live customers by name, phone, or message" value="${escapeHtml(state.search)}" />
+        <div class="toolbar-left">
+          <div class="tabs">
+            ${tab("profiles", "Customers", state.audienceTab, "audienceTab")}
+            ${tab("segments", "Live Segments", state.audienceTab, "audienceTab")}
+            ${tab("lists", "Static Lists", state.audienceTab, "audienceTab")}
+            ${tab("shopify_segments", "Shopify Segments", state.audienceTab, "audienceTab")}
+          </div>
+        </div>
         <div class="toolbar-right">
-          <span class="badge blue">${customers.length} live customer${customers.length === 1 ? "" : "s"}</span>
-          <span class="badge gray">Source: WhatsApp</span>
+          <button class="secondary-button" data-action="sync-shopify-segments">Sync Shopify</button>
+          <button class="primary-button" data-action="open-segment-modal">Create Segment</button>
         </div>
       </div>
-      ${customers.length ? renderCustomersTable(customers) : emptyPanel("No live customers yet", "Customers will appear here after they message The June Shop on WhatsApp.")}
+      <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
+      ${renderAudienceTab(customers, segments)}
     </div>
   `;
+}
+
+function renderAudienceTab(customers, segments) {
+  if (state.audienceTab === "segments") {
+    return segments.length
+      ? renderSegmentTable(segments)
+      : emptyPanel("No live segments yet", "Create a segment from WhatsApp behaviour and Shopify customer data.", "Create Segment", "open-segment-modal");
+  }
+  if (state.audienceTab === "lists") {
+    const staticRows = [
+      { name: "WhatsApp suppression list", size: 0, source: "Compliance", updated: "Not synced", detail: "Exclude unsubscribed or manually blocked numbers." },
+      { name: "VIP manual list", size: customers.filter((customer) => customerShopifyStats(customer).totalSpent >= 10000).length, source: "Manual", updated: "Live estimate", detail: "For curated high-touch campaigns." },
+    ].map((item) => `
+      <tr>
+        <td><span class="row-title">${escapeHtml(item.name)}</span><div class="row-subtle">${escapeHtml(item.detail)}</div></td>
+        <td>${item.size}</td>
+        <td><span class="badge gray">${escapeHtml(item.source)}</span></td>
+        <td>${escapeHtml(item.updated)}</td>
+        <td><button class="ghost-button" data-action="open-segment-modal">Edit rules</button></td>
+      </tr>
+    `).join("");
+    return table(["List", "Size", "Source", "Updated At", ""], staticRows);
+  }
+  if (state.audienceTab === "shopify_segments") {
+    return renderShopifySegmentsTable();
+  }
+  return customers.length
+    ? renderCustomersTable(customers)
+    : emptyPanel("No live customers yet", "Customers will appear here after they message The June Shop on WhatsApp.");
+}
+
+function renderSegmentTable(segments) {
+  const rows = segments.map((segment) => `
+    <tr>
+      <td>
+        <span class="row-title">${escapeHtml(segment.name)}</span>
+        <div class="row-subtle">${escapeHtml(segment.description || "Dynamic audience segment")}</div>
+      </td>
+      <td><strong>${segment.size}</strong></td>
+      <td><span class="badge ${segment.source === "Shopify" ? "blue" : segment.source.includes("Shopify") ? "green" : "gray"}">${escapeHtml(segment.source)}</span></td>
+      <td>${escapeHtml(segment.ruleText || "-")}</td>
+      <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}</td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
+    </tr>
+  `).join("");
+  return table(["Segment Name", "Segment Size", "Source", "Rule", "Updated At", ""], rows);
+}
+
+function renderShopifySegmentsTable() {
+  if (shopifySegmentsLoading && !shopifySegments.length) {
+    return emptyPanel("Syncing Shopify segments", "Pulling customer segments from Shopify.");
+  }
+  if (shopifySegmentsLastError) {
+    return emptyPanel("Shopify segments need permission", shopifySegmentsLastError, "Retry Sync", "sync-shopify-segments");
+  }
+  if (!shopifySegments.length) {
+    return emptyPanel("No Shopify segments synced yet", "Sync Shopify to pull customer segments created in your store.", "Sync Shopify", "sync-shopify-segments");
+  }
+  const rows = shopifySegments.map((segment) => `
+    <tr>
+      <td>
+        <span class="row-title">${escapeHtml(segment.name)}</span>
+        <div class="row-subtle">${escapeHtml(segment.query || "Shopify customer segment")}</div>
+      </td>
+      <td>${segment.size === null || segment.size === undefined ? "-" : segment.size}</td>
+      <td><span class="badge blue">Shopify</span></td>
+      <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "-")}</td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal">Use in broadcast</button></td>
+    </tr>
+  `).join("");
+  return table(["Shopify Segment", "Segment Size", "Source", "Updated At", ""], rows);
 }
 
 function renderCustomersTable(customers) {
@@ -1049,8 +1291,8 @@ function renderBroadcasts() {
       <div class="metric-grid four">
         ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
         ${metric("Reachable customers", customers.length, "Current WhatsApp customer list")}
+        ${metric("Live segments", localSegments().filter((segment) => segment.size > 0).length, "WhatsApp and Shopify aware audiences")}
         ${metric("Outbound messages", revenue.outboundMessages, `${revenue.delivered}/${revenue.sent} delivered or read`)}
-        ${metric("UTM tracking", "Ready", "Stored on campaign draft before send")}
       </div>
 
       <section class="panel pad broadcast-builder-card">
@@ -1997,6 +2239,10 @@ function splitVariables(value) {
     .filter(Boolean);
 }
 
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function sendConversationPayload(payload, { successMessage, pendingDraftClear = true } = {}) {
   const selected = selectedLiveConversation();
   if (!isLiveConversation(selected)) {
@@ -2133,6 +2379,43 @@ async function sendBroadcastLive() {
   showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
 }
 
+function saveCustomSegment() {
+  const name = document.getElementById("segment-name")?.value?.trim();
+  const source = document.getElementById("segment-source")?.value || "Combined";
+  const matchMode = document.getElementById("segment-match-mode")?.value || "all";
+  const minOrders = document.getElementById("segment-min-orders")?.value?.trim();
+  const minSpend = document.getElementById("segment-min-spend")?.value?.trim();
+  const intentKeyword = document.getElementById("segment-keyword")?.value?.trim();
+  const tag = document.getElementById("segment-tag")?.value?.trim();
+  const description = document.getElementById("segment-description")?.value?.trim();
+  if (!name) {
+    showToast("Segment name is required.");
+    return;
+  }
+  customSegments.push({
+    id: `custom_${Date.now()}`,
+    name,
+    source,
+    matchMode,
+    minOrders,
+    minSpend,
+    intentKeyword: intentKeyword ? escapeRegExp(intentKeyword) : "",
+    tag,
+    description: description || "Custom live segment",
+    ruleText: [
+      minOrders ? `orders >= ${minOrders}` : "",
+      minSpend ? `spend >= Rs. ${minSpend}` : "",
+      intentKeyword ? `message contains "${intentKeyword}"` : "",
+      tag ? `Shopify tag contains "${tag}"` : "",
+    ].filter(Boolean).join(matchMode === "any" ? " OR " : " AND ") || "All current customers",
+    updated_at: new Date().toISOString(),
+  });
+  state.audienceTab = "segments";
+  closeModal();
+  showToast("Segment created.");
+  render();
+}
+
 function closeModal() {
   modalRoot.innerHTML = "";
 }
@@ -2152,116 +2435,192 @@ function openModal(title, body, footer) {
   `;
 }
 
-function openBroadcastModal() {
-  const templates = approvedTemplates();
-  const customers = liveCustomers();
-  const templateOptions = templates.length
-    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
-    : `<option value="">No approved templates synced</option>`;
-  const customerRows = customers.length
+function broadcastRecipientRows(customers) {
+  return customers.length
     ? customers.map((customer) => `
         <label class="recipient-row">
           <input type="checkbox" class="broadcast-recipient" value="${escapeHtml(customer.phone.replace(/\D/g, ""))}" checked />
           <span>
             <strong>${escapeHtml(customer.name)}</strong>
-            <small>${escapeHtml(customer.phone)}</small>
+            <small>${escapeHtml(customer.phone)} · ${escapeHtml(customer.segment || "Customer")}</small>
           </span>
         </label>
       `).join("")
-    : `<div class="empty-inline"><strong>No customers yet</strong><span>WhatsApp customers will appear here after they message you.</span></div>`;
+    : `<div class="empty-inline"><strong>No customers in this audience</strong><span>Choose another segment or wait for matching customers.</span></div>`;
+}
+
+function openBroadcastModal() {
+  const templates = approvedTemplates();
+  const customers = liveCustomers();
+  const segments = localSegments().filter((segment) => segment.size > 0);
+  const selectedSegmentId = "all_customers";
+  const defaultRecipients = recipientsForSegment(selectedSegmentId);
+  const templateOptions = templates.length
+    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
+    : `<option value="">No approved templates synced</option>`;
+  const segmentOptions = [
+    `<option value="all_customers">All current WhatsApp customers (${customers.length})</option>`,
+    ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}">${escapeHtml(segment.name)} (${segment.size})</option>`),
+  ].join("");
+  const customerRows = broadcastRecipientRows(defaultRecipients);
   openModal(
     "Create WhatsApp broadcast",
     `
-      <div class="campaign-modal">
-        <div class="wide">
-          <label class="label">Campaign name</label>
-          <input id="broadcast-name" class="field" placeholder="Example: TJS clearance sale" />
-        </div>
-        <div class="form-grid wide">
-          <div>
-            <label class="label">Approved Meta template</label>
-            <select id="broadcast-template-name" class="select">${templateOptions}</select>
+      <div class="campaign-modal broadcast-setup">
+        <section class="campaign-modal-main">
+          <div class="wide">
+            <label class="label">Campaign name</label>
+            <input id="broadcast-name" class="field" placeholder="Example: TJS clearance sale" />
           </div>
-          <div>
-            <label class="label">Language</label>
-            <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
+          <div class="form-grid wide">
+            <div>
+              <label class="label">Approved Meta template</label>
+              <select id="broadcast-template-name" class="select">${templateOptions}</select>
+            </div>
+            <div>
+              <label class="label">Language</label>
+              <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
+            </div>
+            <div>
+              <label class="label">Audience</label>
+              <select id="broadcast-audience-segment" class="select">${segmentOptions}</select>
+            </div>
+            <div>
+              <label class="label">Send time</label>
+              <select id="broadcast-send-mode" class="select"><option>Send now</option><option>Schedule later</option></select>
+            </div>
+            <div>
+              <label class="label">UTM source</label>
+              <input id="broadcast-utm-source" class="field" value="onewhatsapp" />
+            </div>
+            <div>
+              <label class="label">UTM medium</label>
+              <input id="broadcast-utm-medium" class="field" value="whatsapp" />
+            </div>
+            <div class="wide">
+              <label class="label">UTM campaign</label>
+              <input id="broadcast-utm-campaign" class="field" placeholder="clearance_june" />
+            </div>
           </div>
-          <div>
-            <label class="label">UTM source</label>
-            <input id="broadcast-utm-source" class="field" value="onewhatsapp" />
+          <div class="wide">
+            <label class="label">Template variables</label>
+            <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
           </div>
-          <div>
-            <label class="label">UTM campaign</label>
-            <input id="broadcast-utm-campaign" class="field" placeholder="clearance_june" />
+          <div class="checklist wide">
+            <label><input id="broadcast-optin-check" type="checkbox" /> These contacts have WhatsApp opt-in.</label>
+            <label><input id="broadcast-template-check" type="checkbox" /> This is an approved Meta template and follows WhatsApp policy.</label>
           </div>
-        </div>
-        <div class="wide">
-          <label class="label">Template variables</label>
-          <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
-        </div>
-        <div class="wide">
+        </section>
+        <aside class="campaign-modal-side">
+          <div class="campaign-side-card">
+            <span class="eyebrow">Recipients</span>
+            <strong id="broadcast-recipient-count">${defaultRecipients.length}</strong>
+            <span>from selected audience</span>
+          </div>
+          <div class="campaign-side-card">
+            <span class="eyebrow">Safety checks</span>
+            <span>Opt-in required</span>
+            <span>Approved template required</span>
+            <span>Variables must match template</span>
+          </div>
           <label class="label">Recipients</label>
           <div class="recipient-list">${customerRows}</div>
-        </div>
-        <div class="checklist wide">
-          <label><input id="broadcast-optin-check" type="checkbox" /> I confirm these contacts have WhatsApp opt-in.</label>
-          <label><input id="broadcast-template-check" type="checkbox" /> I confirm this is an approved Meta template.</label>
-        </div>
+        </aside>
       </div>
     `,
     `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="secondary-button" data-action="save-broadcast">Save Draft</button><button class="primary-button" data-action="send-broadcast-live">Send broadcast</button>`
   );
 }
 
+function updateTemplatePreview() {
+  const header = document.getElementById("template-create-header-value")?.value?.trim() || "The June Shop";
+  const body = document.getElementById("template-create-body")?.value?.trim() || "Your template body will preview here while you write.";
+  const footer = document.getElementById("template-create-footer")?.value?.trim() || "";
+  const buttonText = document.getElementById("template-create-button-text")?.value?.trim() || "CTA preview";
+  const headerTarget = document.getElementById("template-preview-header");
+  const bodyTarget = document.getElementById("template-preview-body");
+  const footerTarget = document.getElementById("template-preview-footer");
+  const buttonTarget = document.getElementById("template-preview-button");
+  if (headerTarget) headerTarget.textContent = header;
+  if (bodyTarget) bodyTarget.textContent = body;
+  if (footerTarget) footerTarget.textContent = footer;
+  if (buttonTarget) buttonTarget.textContent = buttonText;
+}
+
 function openTemplateModal() {
   openModal(
     "Create WhatsApp template",
     `
-      <div class="form-grid">
-        <div>
-          <label class="label">Template name</label>
-          <input id="template-create-name" class="field" placeholder="order_delivered_followup" />
-        </div>
-        <div>
-          <label class="label">Category</label>
-          <select id="template-create-category" class="select"><option>MARKETING</option><option>UTILITY</option><option>AUTHENTICATION</option></select>
-        </div>
-        <div>
-          <label class="label">Language</label>
-          <select id="template-create-language" class="select"><option value="en_US">English</option><option value="hi">Hindi</option></select>
-        </div>
-        <div>
-          <label class="label">Header</label>
-          <select id="template-create-header-type" class="select"><option value="none">No header</option><option value="text">Text header</option><option value="image">Image header</option><option value="video">Video header</option><option value="document">Document header</option></select>
-        </div>
-        <div class="wide">
-          <label class="label">Header text or uploaded media handle</label>
-          <input id="template-create-header-value" class="field" placeholder="Optional. Media headers need a Meta media handle." />
-        </div>
-        <div class="wide">
-          <label class="label">Message body</label>
-          <textarea id="template-create-body" class="textarea" placeholder="Hi {{1}}, your order {{2}} has been delivered. Reply if you need help."></textarea>
-        </div>
-        <div class="wide">
-          <label class="label">Example variables</label>
-          <input id="template-create-examples" class="field" placeholder="Piyush, #301887" />
-        </div>
-        <div>
-          <label class="label">Button type</label>
-          <select id="template-create-button-type" class="select"><option value="none">No button</option><option value="url">URL CTA</option><option value="quick_reply">Quick reply</option><option value="phone">Phone CTA</option></select>
-        </div>
-        <div>
-          <label class="label">Button text</label>
-          <input id="template-create-button-text" class="field" placeholder="Shop Now" />
-        </div>
-        <div class="wide">
-          <label class="label">Button URL or phone</label>
-          <input id="template-create-button-value" class="field" placeholder="https://thejuneshop.com" />
-        </div>
-        <div class="wide">
-          <label class="label">Footer</label>
-          <input id="template-create-footer" class="field" value="Reply STOP to unsubscribe." />
-        </div>
+      <div class="template-builder">
+        <section class="template-form">
+          <div class="form-grid">
+            <div class="wide template-type-row">
+              <button class="template-type active" type="button">Basic</button>
+              <button class="template-type" type="button">Carousel</button>
+              <button class="template-type" type="button">Limited time offer</button>
+            </div>
+            <div>
+              <label class="label">Template name</label>
+              <input id="template-create-name" class="field" placeholder="order_delivered_followup" />
+            </div>
+            <div>
+              <label class="label">Category</label>
+              <select id="template-create-category" class="select"><option>MARKETING</option><option>UTILITY</option><option>AUTHENTICATION</option></select>
+            </div>
+            <div>
+              <label class="label">Language</label>
+              <select id="template-create-language" class="select"><option value="en_US">English</option><option value="hi">Hindi</option></select>
+            </div>
+            <div>
+              <label class="label">Sender number</label>
+              <input class="field" value="${escapeHtml(systemStatus.runtime?.phone_number_id ? "Connected WhatsApp number" : "Connect Meta number first")}" disabled />
+            </div>
+            <div>
+              <label class="label">Header</label>
+              <select id="template-create-header-type" class="select"><option value="none">No header</option><option value="text">Text header</option><option value="image">Image header</option><option value="video">Video header</option><option value="document">Document header</option></select>
+            </div>
+            <div>
+              <label class="label">Header text or media handle</label>
+              <input id="template-create-header-value" class="field" placeholder="Optional" />
+            </div>
+            <div class="wide">
+              <label class="label">Message body</label>
+              <textarea id="template-create-body" class="textarea template-body-input" placeholder="Hi {{1}}, your order {{2}} has been delivered. Reply if you need help."></textarea>
+              <div class="field-help">Use {{1}}, {{2}} for variables. Add examples below so Meta can review the template.</div>
+            </div>
+            <div class="wide">
+              <label class="label">Example variables</label>
+              <input id="template-create-examples" class="field" placeholder="Piyush, #301887" />
+            </div>
+            <div>
+              <label class="label">Button type</label>
+              <select id="template-create-button-type" class="select"><option value="none">No button</option><option value="url">URL CTA</option><option value="quick_reply">Quick reply</option><option value="phone">Phone CTA</option></select>
+            </div>
+            <div>
+              <label class="label">Button text</label>
+              <input id="template-create-button-text" class="field" placeholder="Shop Now" />
+            </div>
+            <div class="wide">
+              <label class="label">Button URL or phone</label>
+              <input id="template-create-button-value" class="field" placeholder="https://thejuneshop.com" />
+            </div>
+            <div class="wide">
+              <label class="label">Footer</label>
+              <input id="template-create-footer" class="field" value="Reply STOP to unsubscribe." />
+            </div>
+          </div>
+        </section>
+        <aside class="template-preview">
+          <div class="phone-preview">
+            <div class="phone-bar"><span>TJS</span><strong>The June Shop</strong></div>
+            <div class="phone-bubble">
+              <strong id="template-preview-header">Template preview</strong>
+              <p id="template-preview-body">Your template body will preview here while you write.</p>
+              <small id="template-preview-footer">Reply STOP to unsubscribe.</small>
+            </div>
+            <button class="phone-cta" type="button" id="template-preview-button">CTA preview</button>
+          </div>
+        </aside>
       </div>
     `,
     `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="submit-template">Submit for approval</button>`
@@ -2275,19 +2634,39 @@ function openSegmentModal() {
       <div class="form-grid">
         <div class="wide">
           <label class="label">Segment name</label>
-          <input class="field" placeholder="High AOV no purchase 30 days" />
+          <input id="segment-name" class="field" placeholder="High AOV no purchase 30 days" />
         </div>
         <div>
-          <label class="label">Condition</label>
-          <select class="select"><option>Order count</option><option>Last purchase</option><option>Total spent</option></select>
+          <label class="label">Data source</label>
+          <select id="segment-source" class="select"><option>Combined</option><option>WhatsApp</option><option>Shopify</option></select>
         </div>
         <div>
-          <label class="label">Rule</label>
-          <input class="field" placeholder="greater than 2" />
+          <label class="label">Match mode</label>
+          <select id="segment-match-mode" class="select"><option value="all">Match all rules</option><option value="any">Match any rule</option></select>
+        </div>
+        <div>
+          <label class="label">Minimum Shopify orders</label>
+          <input id="segment-min-orders" class="field" type="number" min="0" placeholder="3" />
+        </div>
+        <div>
+          <label class="label">Minimum lifetime spend</label>
+          <input id="segment-min-spend" class="field" type="number" min="0" placeholder="5000" />
+        </div>
+        <div>
+          <label class="label">Message keyword / intent</label>
+          <input id="segment-keyword" class="field" placeholder="refund, delivery, upset" />
+        </div>
+        <div>
+          <label class="label">Shopify tag contains</label>
+          <input id="segment-tag" class="field" placeholder="vip, wholesale, repeat" />
         </div>
         <div class="wide">
           <label class="label">Description</label>
-          <textarea class="textarea" placeholder="Who should enter this segment?"></textarea>
+          <textarea id="segment-description" class="textarea" placeholder="Who should enter this segment?"></textarea>
+        </div>
+        <div class="wide segment-note">
+          <strong>Live preview logic</strong>
+          <span>Segments recalculate from WhatsApp conversations and Shopify customer context already loaded into the dashboard.</span>
         </div>
       </div>
     `,
@@ -2354,14 +2733,18 @@ document.addEventListener("click", (event) => {
     "submit-template": () => {
       submitMetaTemplate().catch((error) => showToast(error.message || "Could not submit template."));
     },
-    "save-segment": () => {
-      closeModal();
-      showToast("Live segment created.");
-    },
+    "save-segment": saveCustomSegment,
     "sync-templates": () => {
       metaTemplatesLoadedAt = 0;
       loadMetaTemplates({ force: true });
       showToast("Syncing templates from Meta.");
+    },
+    "sync-shopify-segments": () => {
+      shopifySegmentsLoadedAt = 0;
+      state.audienceTab = "shopify_segments";
+      loadShopifySegments({ force: true });
+      showToast("Syncing Shopify segments.");
+      render();
     },
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
@@ -2506,6 +2889,9 @@ document.addEventListener("input", (event) => {
   if (target.id === "copilot-prompt" && state.selectedConversationId) {
     state.copilotPrompts[state.selectedConversationId] = target.value;
   }
+  if (target.id?.startsWith("template-create-")) {
+    updateTemplatePreview();
+  }
 });
 
 document.addEventListener("change", (event) => {
@@ -2514,6 +2900,16 @@ document.addEventListener("change", (event) => {
     const language = target.selectedOptions[0]?.dataset.language || "en_US";
     const input = document.getElementById("broadcast-template-language");
     if (input) input.value = language;
+  }
+  if (target.id === "broadcast-audience-segment") {
+    const recipients = recipientsForSegment(target.value);
+    const list = document.querySelector(".recipient-list");
+    const count = document.getElementById("broadcast-recipient-count");
+    if (list) list.innerHTML = broadcastRecipientRows(recipients);
+    if (count) count.textContent = String(recipients.length);
+  }
+  if (target.id?.startsWith("template-create-")) {
+    updateTemplatePreview();
   }
 });
 

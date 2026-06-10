@@ -726,6 +726,33 @@ async function shopifyGet(pathname, query = {}) {
   };
 }
 
+async function shopifyGraphql(query, variables = {}) {
+  const config = shopifyConfig();
+  if (!config.enabled) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: "shopify_not_configured" },
+    };
+  }
+
+  const url = `https://${config.domain}/admin/api/${config.api_version}/graphql.json`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  return {
+    ok: response.ok && !payload.errors,
+    status: response.status,
+    payload,
+  };
+}
+
 function normalizeShopifyOrder(order) {
   const amount = order.current_total_price || order.total_price || "";
   const currency = order.currency || order.presentment_currency || "";
@@ -773,6 +800,51 @@ function normalizeShopifyCustomer(customer, orders) {
       created_at: customer.created_at || "",
     },
     orders: orders.map(normalizeShopifyOrder),
+  };
+}
+
+function normalizeShopifySegment(node) {
+  const count =
+    node.customerCount ??
+    node.customersCount ??
+    node.membersCount ??
+    node.statistics?.customerCount ??
+    null;
+  return {
+    id: node.id || node.legacyResourceId || node.name || "",
+    name: node.name || "Shopify segment",
+    query: node.query || node.searchQuery || "",
+    size: Number.isFinite(Number(count)) ? Number(count) : null,
+    updated_at: node.updatedAt || node.lastEditDate || node.creationDate || node.createdAt || "",
+    source: "Shopify",
+  };
+}
+
+async function listShopifySegments() {
+  const result = await shopifyGraphql(`
+    query OneWhatsappSegments($first: Int!) {
+      segments(first: $first) {
+        edges {
+          node {
+            id
+            name
+            query
+            creationDate
+            lastEditDate
+          }
+        }
+      }
+    }
+  `, { first: 50 });
+
+  if (!result.ok) return result;
+  const nodes = result.payload?.data?.segments?.edges?.map((edge) => edge.node).filter(Boolean) || [];
+  return {
+    ok: true,
+    status: result.status,
+    payload: {
+      segments: nodes.map(normalizeShopifySegment),
+    },
   };
 }
 
@@ -1947,6 +2019,15 @@ async function handleApi(req, res, parsed) {
         error: error?.message || "broadcast_send_failed",
       });
     }
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/shopify/segments") {
+    const result = await listShopifySegments();
+    return sendJson(res, result.ok ? 200 : result.status || 500, {
+      ok: result.ok,
+      items: result.payload?.segments || [],
+      error: result.ok ? null : result.payload?.errors || result.payload?.error || result.payload,
+    });
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/inbox/conversations") {
