@@ -2141,6 +2141,13 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2300);
 }
 
+function setModalNotice(message, tone = "info") {
+  const notice = document.getElementById("modal-notice");
+  if (!notice) return;
+  notice.textContent = message || "";
+  notice.className = `modal-notice ${tone}`;
+}
+
 function selectedLiveConversation() {
   const conversations = liveConversations();
   if (!conversations.length) return null;
@@ -2291,6 +2298,7 @@ async function sendConversationPayload(payload, { successMessage, pendingDraftCl
 }
 
 async function submitMetaTemplate() {
+  const submitButton = document.getElementById("submit-template-button");
   const name = document.getElementById("template-create-name")?.value?.trim();
   const category = document.getElementById("template-create-category")?.value || "MARKETING";
   const language = document.getElementById("template-create-language")?.value || "en_US";
@@ -2304,8 +2312,15 @@ async function submitMetaTemplate() {
   const footer = document.getElementById("template-create-footer")?.value?.trim();
 
   if (!name || !body) {
+    setModalNotice("Template name and body are required.", "error");
     showToast("Template name and body are required.");
     return;
+  }
+
+  setModalNotice("Submitting template to Meta for approval...", "info");
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = "Submitting...";
   }
 
   const payload = {
@@ -2324,20 +2339,29 @@ async function submitMetaTemplate() {
     footer,
   };
 
-  const response = await fetch(`${INBOX_API_BASE}/api/meta/templates`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok || result.ok === false) {
-    throw new Error(result?.error?.message || result?.error || "Meta rejected the template.");
-  }
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/meta/templates`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || result.ok === false) {
+      throw new Error(result?.error?.message || result?.error || "Meta rejected the template.");
+    }
 
-  closeModal();
-  metaTemplatesLoadedAt = 0;
-  await loadMetaTemplates({ force: true });
-  showToast("Template sent to Meta for approval.");
+    closeModal();
+    metaTemplatesLoadedAt = 0;
+    await loadMetaTemplates({ force: true });
+    showToast("Template sent to Meta for approval.");
+  } catch (error) {
+    setModalNotice(error.message || "Could not submit template.", "error");
+    showToast(error.message || "Could not submit template.");
+    if (submitButton && document.body.contains(submitButton)) {
+      submitButton.disabled = false;
+      submitButton.textContent = "Submit for approval";
+    }
+  }
 }
 
 async function sendBroadcastLive() {
@@ -2547,6 +2571,17 @@ function updateTemplatePreview() {
   if (buttonTarget) buttonTarget.textContent = buttonText;
 }
 
+function attachTemplateSubmitFallback() {
+  const button = document.getElementById("submit-template-button");
+  if (!button) return;
+  button.addEventListener("pointerup", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    submitMetaTemplate();
+  });
+}
+
 function openTemplateModal() {
   openModal(
     "Create WhatsApp template",
@@ -2622,9 +2657,11 @@ function openTemplateModal() {
           </div>
         </aside>
       </div>
+      <div id="modal-notice" class="modal-notice info" aria-live="polite"></div>
     `,
-    `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="submit-template">Submit for approval</button>`
+    `<button type="button" class="ghost-button" data-action="close-modal">Cancel</button><button type="button" id="submit-template-button" class="primary-button" data-action="submit-template">Submit for approval</button>`
   );
+  attachTemplateSubmitFallback();
 }
 
 function openSegmentModal() {

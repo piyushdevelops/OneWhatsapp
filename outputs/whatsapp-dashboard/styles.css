@@ -2729,6 +2729,32 @@ tr:last-child td {
   padding: 18px;
 }
 
+.modal-notice {
+  min-height: 20px;
+  margin-top: 14px;
+  border-radius: 7px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 750;
+  display: none;
+}
+
+.modal-notice:not(:empty) {
+  display: block;
+}
+
+.modal-notice.info {
+  border: 1px solid #c9d2ff;
+  background: #f3f6ff;
+  color: var(--blue);
+}
+
+.modal-notice.error {
+  border: 1px solid #ffd0d0;
+  background: #fff4f4;
+  color: var(--red);
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
