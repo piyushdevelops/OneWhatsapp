@@ -11,6 +11,7 @@ const state = {
   replyDrafts: {},
   copilotPrompts: {},
   broadcastSegmentSeed: "",
+  segmentBuilderOpen: false,
 };
 
 const BRAND_NAME = "The June Shop";
@@ -396,15 +397,26 @@ function textContains(value, query) {
   return String(value || "").toLowerCase().includes(String(query).toLowerCase());
 }
 
+function dateValue(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
 function segmentHasShopifyRules(rules = {}) {
   return Boolean(
-    Number(rules.min_orders || 0)
+    (Array.isArray(rules.builder_rules) && rules.builder_rules.length)
+    || Number(rules.min_orders || 0)
     || Number(rules.max_orders || 0)
     || Number(rules.min_spend || 0)
     || Number(rules.max_spend || 0)
     || Number(rules.min_aov || 0)
     || Number(rules.last_order_within_days || 0)
     || Number(rules.last_order_older_than_days || 0)
+    || rules.last_order_before
+    || rules.last_order_after
+    || rules.event_name
     || rules.tag
     || rules.product_keyword
     || rules.city
@@ -415,10 +427,114 @@ function segmentHasShopifyRules(rules = {}) {
   );
 }
 
+function compareStringRule(actual, operator, expected) {
+  const hasValue = textContains(actual, expected);
+  if (operator === "is") return String(actual || "").toLowerCase() === String(expected || "").toLowerCase();
+  if (operator === "is_not" || operator === "not_in") return !hasValue;
+  return hasValue;
+}
+
+function compareNumberRule(actual, operator, expected) {
+  const current = Number(actual || 0);
+  const target = Number(expected || 0);
+  if (operator === "lte") return current <= target;
+  if (operator === "eq") return current === target;
+  return current >= target;
+}
+
+function compareDateRule(actualValue, operator, expected) {
+  const actual = dateValue(actualValue);
+  if (!actual) return false;
+  if (operator === "within_last") return daysSince(actualValue) !== null && daysSince(actualValue) <= Number(expected || 0);
+  if (operator === "not_within_last") return daysSince(actualValue) !== null && daysSince(actualValue) > Number(expected || 0);
+  const target = dateValue(expected);
+  if (!target) return false;
+  if (operator === "after") return actual > target;
+  return actual < target;
+}
+
+function segmentBuilderRuleMatches(customer, rule = {}) {
+  const stats = customerShopifyStats(customer);
+  const latestOrderDate = stats.latestOrder?.processed_at || stats.latestOrder?.created_at;
+  if (rule.type === "event") {
+    let matched = false;
+    let supported = true;
+    if (["order_placed", "offline_order_placed"].includes(rule.event)) matched = stats.orderCount > 0;
+    else if (rule.event === "fulfillment_created") matched = Boolean(stats.fulfillmentStatus);
+    else if (rule.event === "order_cancelled") matched = /cancel/i.test(stats.fulfillmentStatus);
+    else if (rule.event === "order_refunded") matched = /refund/i.test(stats.financialStatus);
+    else if (rule.event === "whatsapp_message_received") matched = Boolean(customer.messages?.some((message) => message.direction === "inbound" || message.from));
+    else supported = false;
+    if (!supported) return false;
+    if (rule.occurrence === "zero_times") matched = !matched;
+    return matched;
+  }
+  if (rule.type === "list") {
+    const inList = rule.list === "all_whatsapp"
+      ? Boolean(customer.phone)
+      : localSegmentRules.some((segment) => segment.id === rule.list && segment.matches(customer))
+        || textContains(stats.tags, rule.list);
+    return rule.operator === "not_in" ? !inList : inList;
+  }
+  const value = rule.value;
+  switch (rule.field) {
+    case "whatsapp_subscriber": {
+      const matched = Boolean(customer.phone) === (value !== "false");
+      return rule.operator === "is_not" ? !matched : matched;
+    }
+    case "has_unread": {
+      const matched = (Number(customer.unread || 0) > 0) === (value !== "false");
+      return rule.operator === "is_not" ? !matched : matched;
+    }
+    case "message_keyword":
+      return compareStringRule(customerTextBlob(customer), rule.operator, value);
+    case "customer_tag":
+      return compareStringRule(stats.tags, rule.operator, value);
+    case "product_keyword":
+      return compareStringRule(stats.productText, rule.operator, value);
+    case "city":
+      return compareStringRule(stats.city, rule.operator, value);
+    case "province":
+      return compareStringRule(stats.province, rule.operator, value);
+    case "email":
+      return compareStringRule(customer.email, rule.operator, value);
+    case "phone_number":
+      return compareStringRule(customer.phone, rule.operator, value);
+    case "payment_status":
+      return compareStringRule(stats.financialStatus, rule.operator, value);
+    case "fulfillment_status":
+      return compareStringRule(stats.fulfillmentStatus, rule.operator, value);
+    case "shopify_segment":
+      return compareStringRule(stats.tags, rule.operator, value);
+    case "number_of_orders":
+      return compareNumberRule(stats.orderCount, rule.operator, value);
+    case "total_spent":
+      return compareNumberRule(stats.totalSpent, rule.operator, value);
+    case "average_order_value":
+      return compareNumberRule(stats.averageOrder, rule.operator, value);
+    case "last_order_date":
+      return compareDateRule(latestOrderDate, rule.operator, value);
+    default:
+      return true;
+  }
+}
+
+function segmentBuilderRulesMatch(customer, rules = []) {
+  if (!rules.length) return true;
+  return rules.reduce((result, rule, index) => {
+    const matched = segmentBuilderRuleMatches(customer, rule);
+    if (index === 0) return matched;
+    return rule.logic === "or" ? result || matched : result && matched;
+  }, true);
+}
+
 function customSegmentMatches(customer, segment) {
   const stats = customerShopifyStats(customer);
   const text = customerTextBlob(customer);
   const rules = segment.rules || {};
+  if (Array.isArray(rules.builder_rules) && rules.builder_rules.length) {
+    return segmentBuilderRulesMatch(customer, rules.builder_rules);
+  }
   const checks = [];
   const source = segment.source || "Combined";
   if (source === "Shopify" || segmentHasShopifyRules(rules)) checks.push(stats.matched);
@@ -433,6 +549,16 @@ function customSegmentMatches(customer, segment) {
   if (Number(rules.last_order_older_than_days || 0)) {
     checks.push(stats.latestOrderDays !== null && stats.latestOrderDays >= Number(rules.last_order_older_than_days));
   }
+  if (rules.last_order_before) {
+    const latestDate = dateValue(stats.latestOrder?.processed_at || stats.latestOrder?.created_at);
+    const limitDate = dateValue(rules.last_order_before);
+    checks.push(Boolean(latestDate && limitDate && latestDate < limitDate));
+  }
+  if (rules.last_order_after) {
+    const latestDate = dateValue(stats.latestOrder?.processed_at || stats.latestOrder?.created_at);
+    const limitDate = dateValue(rules.last_order_after);
+    checks.push(Boolean(latestDate && limitDate && latestDate > limitDate));
+  }
   if (rules.keyword) checks.push(textContains(text, rules.keyword));
   if (rules.tag) checks.push(textContains(stats.tags, rules.tag));
   if (rules.product_keyword) checks.push(textContains(stats.productText, rules.product_keyword));
@@ -442,6 +568,16 @@ function customSegmentMatches(customer, segment) {
   if (rules.fulfillment_status) checks.push(textContains(stats.fulfillmentStatus, rules.fulfillment_status));
   if (rules.has_unread === true || rules.has_unread === "true") checks.push(Number(customer.unread || 0) > 0);
   if (rules.has_unread === false || rules.has_unread === "false") checks.push(Number(customer.unread || 0) === 0);
+  if (rules.whatsapp_subscriber === true || rules.whatsapp_subscriber === "true") checks.push(Boolean(customer.phone));
+  if (rules.event_name) {
+    const eventMode = rules.event_count_mode || "at_least_once";
+    let eventMatched = false;
+    if (rules.event_name === "order_placed" || rules.event_name === "offline_order_placed") eventMatched = stats.orderCount > 0;
+    if (rules.event_name === "order_cancelled") eventMatched = /cancel/i.test(stats.fulfillmentStatus);
+    if (rules.event_name === "order_refunded") eventMatched = /refund/i.test(stats.financialStatus);
+    if (eventMode === "zero_times") eventMatched = !eventMatched;
+    checks.push(eventMatched);
+  }
   if (!checks.length) return true;
   return (segment.match_mode || segment.matchMode || "all") === "any" ? checks.some(Boolean) : checks.every(Boolean);
 }
@@ -538,6 +674,26 @@ function localSegments() {
 
 function segmentRuleText(segment) {
   const rules = segment.rules || {};
+  if (Array.isArray(rules.builder_rules) && rules.builder_rules.length) {
+    return rules.builder_rules.map((rule, index) => {
+      const prefix = index === 0 ? "" : `${(rule.logic || "and").toUpperCase()} `;
+      if (rule.type === "event") {
+        const eventLabel = labelForSegmentOption(segmentEventOptions, rule.event);
+        const occurrence = String(rule.occurrence || "at_least_once").replace(/_/g, " ");
+        const windowText = rule.window === "within_last" && rule.window_value ? ` within ${rule.window_value} days` : " over all time";
+        return `${prefix}${eventLabel} ${occurrence}${windowText}`;
+      }
+      if (rule.type === "list") {
+        return `${prefix}${rule.operator === "not_in" ? "not in" : "in"} ${rule.list || "selected list"}`;
+      }
+      const fieldLabel = labelForSegmentOption(segmentPropertyOptions, rule.field);
+      const operator = String(rule.operator || "contains").replace(/_/g, " ");
+      const suffix = rule.field === "last_order_date" && ["within_last", "not_within_last"].includes(rule.operator)
+        ? `${rule.value} days`
+        : rule.value;
+      return `${prefix}${fieldLabel} ${operator} ${suffix || ""}`.trim();
+    }).join(" ");
+  }
   const parts = [
     rules.min_orders ? `orders >= ${rules.min_orders}` : "",
     rules.max_orders ? `orders <= ${rules.max_orders}` : "",
@@ -546,6 +702,9 @@ function segmentRuleText(segment) {
     rules.min_aov ? `AOV >= Rs. ${rules.min_aov}` : "",
     rules.last_order_within_days ? `ordered within ${rules.last_order_within_days} days` : "",
     rules.last_order_older_than_days ? `last order older than ${rules.last_order_older_than_days} days` : "",
+    rules.last_order_before ? `last order before ${rules.last_order_before}` : "",
+    rules.last_order_after ? `last order after ${rules.last_order_after}` : "",
+    rules.event_name ? `${String(rules.event_name).replace(/_/g, " ")} ${String(rules.event_count_mode || "at least once").replace(/_/g, " ")}${rules.event_window_days ? ` within ${rules.event_window_days} days` : ""}` : "",
     rules.keyword ? `message contains "${rules.keyword}"` : "",
     rules.tag ? `Shopify tag contains "${rules.tag}"` : "",
     rules.product_keyword ? `product contains "${rules.product_keyword}"` : "",
@@ -555,9 +714,14 @@ function segmentRuleText(segment) {
     rules.fulfillment_status ? `fulfillment is "${rules.fulfillment_status}"` : "",
     rules.has_unread === true || rules.has_unread === "true" ? "has unread WhatsApp" : "",
     rules.has_unread === false || rules.has_unread === "false" ? "no unread WhatsApp" : "",
+    rules.whatsapp_subscriber === true || rules.whatsapp_subscriber === "true" ? "is WhatsApp subscriber" : "",
     rules.shopify_segment ? `Shopify segment: ${rules.shopify_segment}` : "",
   ].filter(Boolean);
   return parts.join((segment.match_mode || "all") === "any" ? " OR " : " AND ") || "All current customers";
+}
+
+function labelForSegmentOption(options, value) {
+  return options.find((option) => option.value === value)?.label || String(value || "Rule").replace(/_/g, " ");
 }
 
 function recipientsForSegment(segmentId) {
@@ -1139,6 +1303,7 @@ function escapeHtml(value) {
 function setScreen(next) {
   state.screen = next;
   state.search = "";
+  if (next !== "audience") state.segmentBuilderOpen = false;
   document.querySelectorAll(".nav-item").forEach((item) => {
     item.classList.toggle("active", item.dataset.screen === next);
   });
@@ -1214,7 +1379,11 @@ function restoreInboxUiState(snapshot) {
 
 function render() {
   const inboxSnapshot = captureInboxUiState();
-  const [title, subtitle] = screenMeta[state.screen];
+  const [metaTitle, metaSubtitle] = screenMeta[state.screen];
+  const title = state.screen === "audience" && state.segmentBuilderOpen ? "Segment" : metaTitle;
+  const subtitle = state.screen === "audience" && state.segmentBuilderOpen
+    ? "Create precise audiences from WhatsApp and Shopify signals."
+    : metaSubtitle;
   pageTitle.textContent = title;
   pageSubtitle.textContent = subtitle;
   actions.innerHTML = renderActions(state.screen);
@@ -1554,6 +1723,7 @@ function legend(label, value, color) {
 
 function renderAudience() {
   loadSavedSegments();
+  if (state.segmentBuilderOpen) return renderSegmentBuilder();
   const customers = filterBySearch(liveCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
   const segments = filterBySearch(localSegments(), ["name", "source", "description", "ruleText"]);
   if (state.audienceTab === "shopify_segments") loadShopifySegments();
@@ -1570,7 +1740,7 @@ function renderAudience() {
         </div>
         <div class="toolbar-right">
           <button class="secondary-button" data-action="sync-shopify-segments">Sync Shopify</button>
-          <button class="primary-button" data-action="open-segment-modal">Create Segment</button>
+          <button class="primary-button" data-action="open-segment-builder">Create Segment</button>
         </div>
       </div>
       <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
@@ -1584,7 +1754,7 @@ function renderAudienceTab(customers, segments) {
   if (state.audienceTab === "segments") {
     return segments.length
       ? renderSegmentTable(segments)
-      : emptyPanel("No live segments yet", "Create a segment from WhatsApp behaviour and Shopify customer data.", "Create Segment", "open-segment-modal");
+      : emptyPanel("No live segments yet", "Create a segment from WhatsApp behaviour and Shopify customer data.", "Create Segment", "open-segment-builder");
   }
   if (state.audienceTab === "lists") {
     const staticRows = [
@@ -1596,7 +1766,7 @@ function renderAudienceTab(customers, segments) {
         <td>${item.size}</td>
         <td><span class="badge gray">${escapeHtml(item.source)}</span></td>
         <td>${escapeHtml(item.updated)}</td>
-        <td><button class="ghost-button" data-action="open-segment-modal">Edit rules</button></td>
+        <td><button class="ghost-button" data-action="open-segment-builder">Edit rules</button></td>
       </tr>
     `).join("");
     return table(["List", "Size", "Source", "Updated At", ""], staticRows);
@@ -1614,16 +1784,239 @@ function renderSegmentTable(segments) {
     <tr>
       <td>
         <span class="row-title">${escapeHtml(segment.name)}</span>
-        <div class="row-subtle">${escapeHtml(segment.description || "Dynamic audience segment")}</div>
+        <div class="row-subtle">${escapeHtml(segment.ruleText || segment.description || "Dynamic audience segment")}</div>
       </td>
       <td><strong>${segment.size}</strong></td>
-      <td><span class="badge ${segment.source === "Shopify" ? "blue" : segment.source.includes("Shopify") ? "green" : "gray"}">${escapeHtml(segment.source)}</span></td>
-      <td>${escapeHtml(segment.ruleText || "-")}</td>
       <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}</td>
       <td><button class="ghost-button" data-action="open-broadcast-modal" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
     </tr>
   `).join("");
-  return table(["Segment Name", "Segment Size", "Source", "Rule", "Updated At", ""], rows);
+  return table(["Segment Name", "Segment Size", "Updated At", ""], rows);
+}
+
+const segmentConditionTypes = [
+  { value: "property", label: "Properties about someone" },
+  { value: "event", label: "What someone has done (or not done)" },
+  { value: "list", label: "If someone is in or not in a list" },
+];
+
+const segmentPropertyOptions = [
+  { value: "", label: "Choose property...", group: "" },
+  { value: "whatsapp_subscriber", label: "Is WhatsApp Subscriber", group: "WhatsApp" },
+  { value: "has_unread", label: "Has unread WhatsApp", group: "WhatsApp" },
+  { value: "message_keyword", label: "Message contains", group: "WhatsApp" },
+  { value: "shopify_segment", label: "Shopify Segment", group: "Shopify" },
+  { value: "customer_tag", label: "Customer Tag", group: "Shopify" },
+  { value: "product_keyword", label: "Product Purchased", group: "Shopify" },
+  { value: "number_of_orders", label: "Number of Orders", group: "Shopify" },
+  { value: "total_spent", label: "Total Spent", group: "Shopify" },
+  { value: "average_order_value", label: "Average Order Value", group: "Shopify" },
+  { value: "last_order_date", label: "Last Order Date", group: "Shopify" },
+  { value: "payment_status", label: "Payment Status", group: "Shopify" },
+  { value: "fulfillment_status", label: "Fulfillment Status", group: "Shopify" },
+  { value: "city", label: "City", group: "Customer" },
+  { value: "province", label: "State", group: "Customer" },
+  { value: "email", label: "Email", group: "Customer" },
+  { value: "phone_number", label: "Phone Number", group: "Customer" },
+];
+
+const segmentEventOptions = [
+  { value: "", label: "Choose event..." },
+  { value: "order_placed", label: "Order Placed" },
+  { value: "offline_order_placed", label: "Offline Order Placed" },
+  { value: "checkout_started", label: "Checkout Started" },
+  { value: "fulfillment_created", label: "Fulfillment Created" },
+  { value: "order_cancelled", label: "Order Cancelled" },
+  { value: "order_refunded", label: "Order Refunded" },
+  { value: "whatsapp_message_received", label: "WhatsApp Message Received" },
+];
+
+function selectOptions(options, selected = "") {
+  let group = "";
+  return options.map((option) => {
+    const label = escapeHtml(option.label);
+    const value = escapeHtml(option.value);
+    const selectedAttr = option.value === selected ? "selected" : "";
+    const groupLabel = option.group && option.group !== group
+      ? `<option value="" disabled>${escapeHtml(option.group)}</option>`
+      : "";
+    if (option.group) group = option.group;
+    return `${groupLabel}<option value="${value}" ${selectedAttr}>${label}</option>`;
+  }).join("");
+}
+
+function renderSegmentBuilder() {
+  const segmentCount = localSegments().length;
+  return `
+    <div id="segment-builder" class="segment-builder-page">
+      <div class="segment-builder-header">
+        <button class="ghost-button icon-only" data-action="close-segment-builder" aria-label="Back">‹</button>
+        <div>
+          <h2>Segment</h2>
+          <p>Build an audience from WhatsApp behaviour and Shopify customer data.</p>
+        </div>
+        <button id="segment-save-button" class="primary-button" data-action="save-segment" disabled>Save Segment</button>
+      </div>
+      <div class="segment-builder-shell">
+        <section class="segment-builder-main">
+          <label class="label">Segment Name</label>
+          <input id="segment-name" class="field segment-name-field" placeholder="Abandoned Users Last 30 Days" />
+
+          <label class="label segment-criteria-label">Segment Criteria</label>
+          <div class="segment-criteria-card">
+            <div id="segment-rules">
+              ${renderSegmentRuleRow(0, true)}
+            </div>
+            <div class="segment-rule-actions">
+              <button class="secondary-button" data-action="add-segment-rule" type="button">+ Add Filter Rule</button>
+              <button class="ghost-button" data-action="segment-group-coming" type="button">+ Add Filter Group</button>
+            </div>
+          </div>
+        </section>
+        <aside class="segment-builder-side">
+          <section class="panel pad">
+            <span class="eyebrow">Audience builder</span>
+            <h3>Built for campaign precision</h3>
+            <p class="setting-copy">Use Shopify order history, customer profile fields, and WhatsApp activity to create audiences for broadcasts and automations.</p>
+          </section>
+          <section class="panel pad segment-builder-hints">
+            <div><strong>${segmentCount}</strong><span>saved/live segments</span></div>
+            <div><strong>${liveCustomers().length}</strong><span>current WhatsApp customers</span></div>
+            <div><strong>${shopifySegments.length || "-"}</strong><span>Shopify segments synced</span></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  `;
+}
+
+function renderSegmentRuleRow(index, isFirst = false) {
+  return `
+    <div class="segment-rule-row" data-segment-rule>
+      <div class="segment-rule-prefix">
+        ${isFirst
+          ? `<span class="segment-prefix-label">WHERE</span>`
+          : `<select class="select segment-logic"><option value="and">AND</option><option value="or">OR</option></select>`}
+      </div>
+      <div class="segment-rule-main">
+        <select class="select segment-condition-type">
+          ${selectOptions(segmentConditionTypes, "property")}
+        </select>
+        <div class="segment-rule-detail">
+          ${renderSegmentPropertyControls()}
+        </div>
+      </div>
+      <button class="ghost-button icon-only segment-delete" data-action="delete-segment-rule" type="button" ${isFirst ? "disabled" : ""} aria-label="Delete rule">x</button>
+    </div>
+  `;
+}
+
+function renderSegmentPropertyControls(field = "", operator = "", value = "") {
+  return `
+    <select class="select segment-rule-field">
+      ${selectOptions(segmentPropertyOptions, field)}
+    </select>
+    <span class="segment-value-slot">${renderSegmentPropertyValueControls(field, operator, value)}</span>
+  `;
+}
+
+function renderSegmentPropertyValueControls(field, operator = "", value = "") {
+  if (!field) return "";
+  const escapedValue = escapeHtml(value);
+  if (["whatsapp_subscriber", "has_unread"].includes(field)) {
+    return `
+      <select class="select segment-rule-operator"><option value="is">is</option><option value="is_not" ${operator === "is_not" ? "selected" : ""}>is not</option></select>
+      <select class="select segment-rule-value"><option value="true" ${value !== "false" ? "selected" : ""}>Yes</option><option value="false" ${value === "false" ? "selected" : ""}>No</option></select>
+    `;
+  }
+  if (["number_of_orders", "total_spent", "average_order_value"].includes(field)) {
+    return `
+      <select class="select segment-rule-operator">
+        <option value="gte" ${operator === "gte" ? "selected" : ""}>at least</option>
+        <option value="lte" ${operator === "lte" ? "selected" : ""}>at most</option>
+        <option value="eq" ${operator === "eq" ? "selected" : ""}>exactly</option>
+      </select>
+      <input class="field segment-rule-value short" type="number" min="0" placeholder="0" value="${escapedValue}" />
+    `;
+  }
+  if (field === "last_order_date") {
+    const op = operator || "within_last";
+    return `
+      <select class="select segment-rule-operator">
+        <option value="within_last" ${op === "within_last" ? "selected" : ""}>within last</option>
+        <option value="not_within_last" ${op === "not_within_last" ? "selected" : ""}>not within last</option>
+        <option value="before" ${op === "before" ? "selected" : ""}>before</option>
+        <option value="after" ${op === "after" ? "selected" : ""}>after</option>
+      </select>
+      ${["before", "after"].includes(op)
+        ? `<input class="field segment-rule-value short" type="date" value="${escapedValue}" />`
+        : `<input class="field segment-rule-value mini" type="number" min="1" placeholder="30" value="${escapedValue}" /><select class="select segment-rule-unit"><option value="days">days</option></select>`}
+    `;
+  }
+  if (field === "payment_status") {
+    return `
+      <select class="select segment-rule-operator"><option value="is">is</option><option value="is_not" ${operator === "is_not" ? "selected" : ""}>is not</option></select>
+      <select class="select segment-rule-value">
+        ${selectOptions([{ value: "", label: "Select payment..." }, { value: "paid", label: "Paid" }, { value: "pending", label: "Pending" }, { value: "refunded", label: "Refunded" }, { value: "partially_refunded", label: "Partially refunded" }], value)}
+      </select>
+    `;
+  }
+  if (field === "fulfillment_status") {
+    return `
+      <select class="select segment-rule-operator"><option value="is">is</option><option value="is_not" ${operator === "is_not" ? "selected" : ""}>is not</option></select>
+      <select class="select segment-rule-value">
+        ${selectOptions([{ value: "", label: "Select fulfillment..." }, { value: "fulfilled", label: "Fulfilled" }, { value: "unfulfilled", label: "Unfulfilled" }, { value: "partial", label: "Partial" }, { value: "delivered", label: "Delivered" }], value)}
+      </select>
+    `;
+  }
+  if (field === "shopify_segment") {
+    const options = [{ value: "", label: "Select Shopify segment..." }, ...shopifySegments.map((segment) => ({ value: segment.name, label: segment.name }))];
+    return `
+      <select class="select segment-rule-operator"><option value="in">is in</option><option value="not_in" ${operator === "not_in" ? "selected" : ""}>is not in</option></select>
+      <select class="select segment-rule-value">${selectOptions(options, value)}</select>
+    `;
+  }
+  return `
+    <select class="select segment-rule-operator">
+      <option value="contains" ${operator === "contains" ? "selected" : ""}>contains</option>
+      <option value="is" ${operator === "is" ? "selected" : ""}>is</option>
+      <option value="is_not" ${operator === "is_not" ? "selected" : ""}>is not</option>
+    </select>
+    <input class="field segment-rule-value" placeholder="Enter value" value="${escapedValue}" />
+  `;
+}
+
+function renderSegmentEventControls(eventName = "", occurrence = "", windowMode = "over_all_time", windowValue = "") {
+  return `
+    <span class="segment-inline-label">Has</span>
+    <select class="select segment-event-name">${selectOptions(segmentEventOptions, eventName)}</select>
+    <select class="select segment-event-count">
+      <option value="at_least_once" ${occurrence !== "zero_times" ? "selected" : ""}>at least once</option>
+      <option value="zero_times" ${occurrence === "zero_times" ? "selected" : ""}>zero times</option>
+    </select>
+    <select class="select segment-event-window">
+      <option value="over_all_time" ${windowMode !== "within_last" ? "selected" : ""}>over all time</option>
+      <option value="within_last" ${windowMode === "within_last" ? "selected" : ""}>within last</option>
+    </select>
+    ${windowMode === "within_last" ? `<input class="field segment-event-window-value mini" type="number" min="1" placeholder="30" value="${escapeHtml(windowValue)}" /><select class="select segment-event-window-unit"><option value="days">days</option></select>` : ""}
+  `;
+}
+
+function renderSegmentListControls(listValue = "", operator = "in") {
+  const options = [
+    { value: "", label: "Choose list..." },
+    { value: "all_whatsapp", label: "All WhatsApp customers" },
+    { value: "needs_reply", label: "Needs reply" },
+    { value: "return_refund", label: "Return / refund intent" },
+    ...shopifySegments.map((segment) => ({ value: segment.name, label: `Shopify: ${segment.name}` })),
+  ];
+  return `
+    <select class="select segment-list-operator">
+      <option value="in" ${operator !== "not_in" ? "selected" : ""}>is in</option>
+      <option value="not_in" ${operator === "not_in" ? "selected" : ""}>is not in</option>
+    </select>
+    <select class="select segment-list-value">${selectOptions(options, listValue)}</select>
+  `;
 }
 
 function renderShopifySegmentsTable() {
@@ -1645,7 +2038,7 @@ function renderShopifySegmentsTable() {
       <td>${segment.size === null || segment.size === undefined ? "-" : segment.size}</td>
       <td><span class="badge blue">Shopify</span></td>
       <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "-")}</td>
-      <td><button class="ghost-button" data-action="open-segment-modal">Build local rules</button></td>
+      <td><button class="ghost-button" data-action="open-segment-builder">Build local rules</button></td>
     </tr>
   `).join("");
   return table(["Shopify Segment", "Segment Size", "Source", "Updated At", ""], rows);
@@ -3349,7 +3742,138 @@ async function saveSelectedAutomationConfig() {
   showToast("Automation setup saved.");
 }
 
+function collectSegmentBuilderRules() {
+  return Array.from(document.querySelectorAll("[data-segment-rule]")).map((row, index) => {
+    const type = row.querySelector(".segment-condition-type")?.value || "property";
+    const logic = index === 0 ? "and" : row.querySelector(".segment-logic")?.value || "and";
+    if (type === "event") {
+      return {
+        type,
+        logic,
+        event: row.querySelector(".segment-event-name")?.value || "",
+        occurrence: row.querySelector(".segment-event-count")?.value || "at_least_once",
+        window: row.querySelector(".segment-event-window")?.value || "over_all_time",
+        window_value: row.querySelector(".segment-event-window-value")?.value || "",
+      };
+    }
+    if (type === "list") {
+      return {
+        type,
+        logic,
+        operator: row.querySelector(".segment-list-operator")?.value || "in",
+        list: row.querySelector(".segment-list-value")?.value || "",
+      };
+    }
+    return {
+      type: "property",
+      logic,
+      field: row.querySelector(".segment-rule-field")?.value || "",
+      operator: row.querySelector(".segment-rule-operator")?.value || "",
+      value: row.querySelector(".segment-rule-value")?.value || "",
+      unit: row.querySelector(".segment-rule-unit")?.value || "",
+    };
+  });
+}
+
+function segmentRuleIsValid(rule) {
+  if (rule.type === "event") {
+    return Boolean(rule.event) && (rule.window !== "within_last" || Number(rule.window_value || 0) > 0);
+  }
+  if (rule.type === "list") return Boolean(rule.list);
+  if (!rule.field) return false;
+  if (["whatsapp_subscriber", "has_unread"].includes(rule.field)) return Boolean(rule.value);
+  return Boolean(String(rule.value || "").trim());
+}
+
+function collectSegmentBuilderPayload() {
+  const name = document.getElementById("segment-name")?.value?.trim();
+  const rules = collectSegmentBuilderRules().filter(segmentRuleIsValid);
+  if (!name) {
+    showToast("Segment name is required.");
+    return null;
+  }
+  if (!rules.length) {
+    showToast("Add at least one complete segment rule.");
+    return null;
+  }
+  const payload = {
+    name,
+    source: rules.some((rule) => ["event", "list"].includes(rule.type) || /order|spent|shopify|payment|fulfillment|city|province|tag|product/i.test(rule.field || ""))
+      ? "WhatsApp + Shopify"
+      : "WhatsApp",
+    match_mode: rules.some((rule) => rule.logic === "or") ? "any" : "all",
+    rules: {
+      builder_rules: rules,
+    },
+    description: "Custom audience built from live customer rules",
+  };
+  payload.ruleText = segmentRuleText(payload);
+  return payload;
+}
+
+function updateSegmentBuilderSaveState() {
+  const button = document.getElementById("segment-save-button");
+  if (!button) return;
+  const name = document.getElementById("segment-name")?.value?.trim();
+  const validRules = collectSegmentBuilderRules().filter(segmentRuleIsValid);
+  button.disabled = !name || !validRules.length;
+}
+
+function refreshSegmentRuleControls(row) {
+  if (!row) return;
+  const type = row.querySelector(".segment-condition-type")?.value || "property";
+  const detail = row.querySelector(".segment-rule-detail");
+  if (!detail) return;
+  if (type === "event") detail.innerHTML = renderSegmentEventControls();
+  if (type === "list") detail.innerHTML = renderSegmentListControls();
+  if (type === "property") detail.innerHTML = renderSegmentPropertyControls();
+  updateSegmentBuilderSaveState();
+}
+
+function refreshSegmentPropertyControls(row) {
+  if (!row) return;
+  const field = row.querySelector(".segment-rule-field")?.value || "";
+  const slot = row.querySelector(".segment-value-slot");
+  if (slot) slot.innerHTML = renderSegmentPropertyValueControls(field);
+  updateSegmentBuilderSaveState();
+}
+
+function refreshSegmentDateControls(row) {
+  if (!row) return;
+  const field = row.querySelector(".segment-rule-field")?.value || "";
+  if (field !== "last_order_date") {
+    updateSegmentBuilderSaveState();
+    return;
+  }
+  const operator = row.querySelector(".segment-rule-operator")?.value || "within_last";
+  const value = row.querySelector(".segment-rule-value")?.value || "";
+  const slot = row.querySelector(".segment-value-slot");
+  if (slot) slot.innerHTML = renderSegmentPropertyValueControls(field, operator, value);
+  updateSegmentBuilderSaveState();
+}
+
+function refreshSegmentEventWindow(row) {
+  if (!row) return;
+  const windowMode = row.querySelector(".segment-event-window")?.value || "over_all_time";
+  const eventName = row.querySelector(".segment-event-name")?.value || "";
+  const occurrence = row.querySelector(".segment-event-count")?.value || "";
+  const value = row.querySelector(".segment-event-window-value")?.value || "";
+  const detail = row.querySelector(".segment-rule-detail");
+  if (detail) detail.innerHTML = renderSegmentEventControls(eventName, occurrence, windowMode, value);
+  updateSegmentBuilderSaveState();
+}
+
 async function saveCustomSegment() {
+  if (document.getElementById("segment-builder")) {
+    const payload = collectSegmentBuilderPayload();
+    if (!payload) return;
+    await persistAudienceSegment(payload);
+    state.segmentBuilderOpen = false;
+    state.audienceTab = "segments";
+    showToast("Segment saved.");
+    render();
+    return;
+  }
   const name = document.getElementById("segment-name")?.value?.trim();
   const source = document.getElementById("segment-source")?.value || "Combined";
   const matchMode = document.getElementById("segment-match-mode")?.value || "all";
@@ -3416,6 +3940,16 @@ async function saveCustomSegment() {
       shopifySegment ? `Shopify segment: ${shopifySegment}` : "",
     ].filter(Boolean).join(matchMode === "any" ? " OR " : " AND ") || "All current customers",
   };
+  await persistAudienceSegment(payload);
+  savedSegmentsLoadedAt = 0;
+  await loadSavedSegments({ force: true });
+  state.audienceTab = "segments";
+  closeModal();
+  showToast("Segment saved.");
+  render();
+}
+
+async function persistAudienceSegment(payload) {
   const response = await fetch(`${INBOX_API_BASE}/api/audience/segments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3427,10 +3961,6 @@ async function saveCustomSegment() {
   }
   savedSegmentsLoadedAt = 0;
   await loadSavedSegments({ force: true });
-  state.audienceTab = "segments";
-  closeModal();
-  showToast("Segment saved.");
-  render();
 }
 
 function closeModal() {
@@ -3872,6 +4402,28 @@ document.addEventListener("click", (event) => {
     "open-broadcast-report": () => openBroadcastReportModal(actionTarget.dataset.campaignId),
     "open-template-modal": openTemplateModal,
     "open-segment-modal": openSegmentModal,
+    "open-segment-builder": () => {
+      state.segmentBuilderOpen = true;
+      state.audienceTab = "segments";
+      render();
+      setTimeout(updateSegmentBuilderSaveState, 0);
+    },
+    "close-segment-builder": () => {
+      state.segmentBuilderOpen = false;
+      render();
+    },
+    "add-segment-rule": () => {
+      const rules = document.getElementById("segment-rules");
+      if (!rules) return;
+      rules.insertAdjacentHTML("beforeend", renderSegmentRuleRow(rules.querySelectorAll("[data-segment-rule]").length, false));
+      updateSegmentBuilderSaveState();
+    },
+    "delete-segment-rule": () => {
+      const row = actionTarget.closest("[data-segment-rule]");
+      if (row && !actionTarget.disabled) row.remove();
+      updateSegmentBuilderSaveState();
+    },
+    "segment-group-coming": () => showToast("Filter groups are mapped for the next audience pass. Use AND/OR rules for now."),
     "close-modal": closeModal,
     "save-broadcast": () => {
       saveBroadcastCampaignRecord().catch((error) => showToast(error.message || "Could not save campaign."));
@@ -4057,6 +4609,9 @@ document.addEventListener("input", (event) => {
   if (target.id?.startsWith("template-create-")) {
     updateTemplatePreview();
   }
+  if (target.closest?.("#segment-builder")) {
+    updateSegmentBuilderSaveState();
+  }
 });
 
 document.addEventListener("change", (event) => {
@@ -4075,6 +4630,14 @@ document.addEventListener("change", (event) => {
   }
   if (target.id?.startsWith("template-create-")) {
     updateTemplatePreview();
+  }
+  if (target.closest?.("#segment-builder")) {
+    const row = target.closest("[data-segment-rule]");
+    if (target.classList.contains("segment-condition-type")) refreshSegmentRuleControls(row);
+    if (target.classList.contains("segment-rule-field")) refreshSegmentPropertyControls(row);
+    if (target.classList.contains("segment-rule-operator")) refreshSegmentDateControls(row);
+    if (target.classList.contains("segment-event-window")) refreshSegmentEventWindow(row);
+    updateSegmentBuilderSaveState();
   }
 });
 
