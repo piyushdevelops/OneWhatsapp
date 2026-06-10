@@ -227,6 +227,58 @@ const AUTOMATION_BLUEPRINTS = {
   },
 };
 
+const AUTOMATION_CONFIG_DEFAULTS = {
+  checkout_abandonment: {
+    wait_minutes: 30,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "" },
+    stop_conditions: { order_placed: true, customer_replied: true, refund_open: false },
+    suppression_rules: { opted_out: true, open_support_issue: true, recent_purchase_days: 1 },
+    fallback_action: "create_task",
+  },
+  cod_confirmation: {
+    wait_minutes: 5,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "Cash on Delivery", customer_tags: "" },
+    stop_conditions: { order_cancelled: true, customer_replied: true, prepaid_converted: false },
+    suppression_rules: { opted_out: true, open_support_issue: false, recent_purchase_days: 0 },
+    fallback_action: "create_task",
+  },
+  cod_to_prepaid: {
+    wait_minutes: 10,
+    filters: { min_order_value: 499, max_order_value: 0, payment_method: "Cash on Delivery", customer_tags: "" },
+    stop_conditions: { prepaid_converted: true, order_cancelled: true, customer_replied: true },
+    suppression_rules: { opted_out: true, open_support_issue: true, recent_purchase_days: 0 },
+    fallback_action: "create_task",
+  },
+  delivery_failure: {
+    wait_minutes: 0,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "ndr,rto" },
+    stop_conditions: { delivery_resolved: true, customer_replied: true, refund_open: true },
+    suppression_rules: { opted_out: false, open_support_issue: false, recent_purchase_days: 0 },
+    fallback_action: "create_task",
+  },
+  post_purchase_review: {
+    wait_minutes: 4320,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "" },
+    stop_conditions: { refund_open: true, return_open: true, customer_replied: false },
+    suppression_rules: { opted_out: true, open_support_issue: true, recent_purchase_days: 0 },
+    fallback_action: "skip",
+  },
+  winback: {
+    wait_minutes: 0,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "winback" },
+    stop_conditions: { order_placed: true, customer_replied: true, open_support_issue: true },
+    suppression_rules: { opted_out: true, open_support_issue: true, recent_purchase_days: 30 },
+    fallback_action: "skip",
+  },
+  return_refund: {
+    wait_minutes: 0,
+    filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "return,refund" },
+    stop_conditions: { refund_processed: true, customer_replied: true },
+    suppression_rules: { opted_out: false, open_support_issue: false, recent_purchase_days: 0 },
+    fallback_action: "create_task",
+  },
+};
+
 function readJsonl(file) {
   if (!fs.existsSync(file)) return [];
   return fs
@@ -267,9 +319,10 @@ function readAutomationEventStore() {
     return {
       events: Array.isArray(parsed.events) ? parsed.events : [],
       runs: Array.isArray(parsed.runs) ? parsed.runs : [],
+      configs: parsed.configs && typeof parsed.configs === "object" ? parsed.configs : {},
     };
   } catch {
-    return { events: [], runs: [] };
+    return { events: [], runs: [], configs: {} };
   }
 }
 
@@ -281,11 +334,78 @@ function writeAutomationEventStore(store) {
       {
         events: Array.isArray(store.events) ? store.events : [],
         runs: Array.isArray(store.runs) ? store.runs : [],
+        configs: store.configs && typeof store.configs === "object" ? store.configs : {},
       },
       null,
       2
     )
   );
+}
+
+function defaultAutomationConfig(automationId) {
+  const defaults = AUTOMATION_CONFIG_DEFAULTS[automationId] || {};
+  return {
+    automation_id: automationId,
+    is_enabled: false,
+    template_name: "",
+    template_language: "en_US",
+    wait_minutes: Number(defaults.wait_minutes || 0),
+    filters: {
+      min_order_value: 0,
+      max_order_value: 0,
+      payment_method: "",
+      customer_tags: "",
+      ...(defaults.filters || {}),
+    },
+    stop_conditions: {
+      customer_replied: true,
+      order_placed: false,
+      order_cancelled: false,
+      refund_open: false,
+      return_open: false,
+      delivery_resolved: false,
+      prepaid_converted: false,
+      refund_processed: false,
+      ...(defaults.stop_conditions || {}),
+    },
+    suppression_rules: {
+      opted_out: true,
+      open_support_issue: true,
+      recent_purchase_days: 0,
+      ...(defaults.suppression_rules || {}),
+    },
+    fallback_action: defaults.fallback_action || "create_task",
+    notes: "",
+    updated_at: "",
+  };
+}
+
+function normalizeAutomationConfig(automationId, input = {}) {
+  const base = defaultAutomationConfig(automationId);
+  return {
+    ...base,
+    is_enabled: Boolean(input.is_enabled ?? base.is_enabled),
+    template_name: String(input.template_name || "").trim(),
+    template_language: String(input.template_language || base.template_language || "en_US").trim() || "en_US",
+    wait_minutes: Math.max(0, Math.min(Number(input.wait_minutes ?? base.wait_minutes) || 0, 43200)),
+    filters: {
+      ...base.filters,
+      ...(input.filters && typeof input.filters === "object" ? input.filters : {}),
+    },
+    stop_conditions: {
+      ...base.stop_conditions,
+      ...(input.stop_conditions && typeof input.stop_conditions === "object" ? input.stop_conditions : {}),
+    },
+    suppression_rules: {
+      ...base.suppression_rules,
+      ...(input.suppression_rules && typeof input.suppression_rules === "object" ? input.suppression_rules : {}),
+    },
+    fallback_action: ["create_task", "skip", "notify_owner"].includes(input.fallback_action)
+      ? input.fallback_action
+      : base.fallback_action,
+    notes: String(input.notes || "").slice(0, 2000),
+    updated_at: input.updated_at || "",
+  };
 }
 
 function sha1(value) {
@@ -1452,6 +1572,31 @@ function createJsonStorage() {
     };
   }
 
+  async function listAutomationConfigs() {
+    const store = readAutomationEventStore();
+    const saved = store.configs && typeof store.configs === "object" ? store.configs : {};
+    return Object.keys(AUTOMATION_BLUEPRINTS).map((automationId) =>
+      normalizeAutomationConfig(automationId, saved[automationId] || {})
+    );
+  }
+
+  async function saveAutomationConfig(automationId, input) {
+    if (!AUTOMATION_BLUEPRINTS[automationId]) throw new Error("automation_not_found");
+    const store = readAutomationEventStore();
+    const saved = store.configs && typeof store.configs === "object" ? store.configs : {};
+    const config = normalizeAutomationConfig(automationId, {
+      ...(saved[automationId] || {}),
+      ...(input || {}),
+      updated_at: new Date().toISOString(),
+    });
+    store.configs = {
+      ...saved,
+      [automationId]: config,
+    };
+    writeAutomationEventStore(store);
+    return config;
+  }
+
   return {
     mode: "json",
     diagnostics: {
@@ -1511,6 +1656,8 @@ function createJsonStorage() {
     recordAutomationEvent,
     listAutomationRuns,
     automationOverview,
+    listAutomationConfigs,
+    saveAutomationConfig,
   };
 }
 
@@ -2282,6 +2429,91 @@ function createPostgresStorage() {
     };
   }
 
+  function mapAutomationConfig(row) {
+    return normalizeAutomationConfig(row.automation_id, {
+      is_enabled: row.is_enabled,
+      template_name: row.template_name || "",
+      template_language: row.template_language || "en_US",
+      wait_minutes: row.wait_minutes,
+      filters: safeJsonParse(row.filters, {}),
+      stop_conditions: safeJsonParse(row.stop_conditions, {}),
+      suppression_rules: safeJsonParse(row.suppression_rules, {}),
+      fallback_action: row.fallback_action || "create_task",
+      notes: row.notes || "",
+      updated_at: row.updated_at || "",
+    });
+  }
+
+  async function listAutomationConfigs() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select *
+      from automation_configs
+      where organization_id = $1
+      `,
+      [organizationId]
+    );
+    const saved = Object.fromEntries(result.rows.map((row) => [row.automation_id, mapAutomationConfig(row)]));
+    return Object.keys(AUTOMATION_BLUEPRINTS).map((automationId) =>
+      normalizeAutomationConfig(automationId, saved[automationId] || {})
+    );
+  }
+
+  async function saveAutomationConfig(automationId, input) {
+    if (!AUTOMATION_BLUEPRINTS[automationId]) throw new Error("automation_not_found");
+    const organizationId = await ensureOrganization();
+    const config = normalizeAutomationConfig(automationId, input || {});
+    const result = await query(
+      `
+      insert into automation_configs (
+        id,
+        organization_id,
+        automation_id,
+        is_enabled,
+        template_name,
+        template_language,
+        wait_minutes,
+        filters,
+        stop_conditions,
+        suppression_rules,
+        fallback_action,
+        notes,
+        updated_at,
+        created_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12, now(), now())
+      on conflict (organization_id, automation_id) do update
+      set is_enabled = excluded.is_enabled,
+          template_name = excluded.template_name,
+          template_language = excluded.template_language,
+          wait_minutes = excluded.wait_minutes,
+          filters = excluded.filters,
+          stop_conditions = excluded.stop_conditions,
+          suppression_rules = excluded.suppression_rules,
+          fallback_action = excluded.fallback_action,
+          notes = excluded.notes,
+          updated_at = now()
+      returning *
+      `,
+      [
+        uuid(),
+        organizationId,
+        automationId,
+        config.is_enabled,
+        config.template_name || null,
+        config.template_language,
+        config.wait_minutes,
+        JSON.stringify(config.filters || {}),
+        JSON.stringify(config.stop_conditions || {}),
+        JSON.stringify(config.suppression_rules || {}),
+        config.fallback_action,
+        config.notes || null,
+      ]
+    );
+    return mapAutomationConfig(result.rows[0]);
+  }
+
   return {
     mode: "postgres",
     diagnostics: {
@@ -2316,6 +2548,8 @@ function createPostgresStorage() {
     recordAutomationEvent,
     listAutomationRuns,
     automationOverview,
+    listAutomationConfigs,
+    saveAutomationConfig,
   };
 }
 
@@ -2385,6 +2619,14 @@ function createStorage() {
     async automationOverview(...args) {
       await storage.ready();
       return storage._impl.automationOverview(...args);
+    },
+    async listAutomationConfigs(...args) {
+      await storage.ready();
+      return storage._impl.listAutomationConfigs(...args);
+    },
+    async saveAutomationConfig(...args) {
+      await storage.ready();
+      return storage._impl.saveAutomationConfig(...args);
     },
   };
 
@@ -2564,6 +2806,31 @@ async function handleApi(req, res, parsed) {
       ok: true,
       items: await storage.listAutomationRuns(limit),
     });
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/automations/configs") {
+    return sendJson(res, 200, {
+      ok: true,
+      items: await storage.listAutomationConfigs(),
+    });
+  }
+
+  const automationConfigMatch = parsed.pathname.match(/^\/api\/automations\/configs\/([^/]+)$/);
+  if (req.method === "PUT" && automationConfigMatch) {
+    try {
+      const automationId = decodeURIComponent(automationConfigMatch[1]);
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      return sendJson(res, 200, {
+        ok: true,
+        config: await storage.saveAutomationConfig(automationId, body),
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "automation_config_save_failed",
+      });
+    }
   }
 
   if (req.method === "POST" && parsed.pathname === "/api/automations/test-event") {

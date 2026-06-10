@@ -38,6 +38,7 @@ let automationOverview = {
   by_automation: [],
 };
 let automationRuns = [];
+let automationConfigs = {};
 let automationsLoading = false;
 let automationsLoadedAt = 0;
 let automationsLastError = "";
@@ -497,14 +498,17 @@ async function loadAutomationData({ force = false } = {}) {
   automationsLastError = "";
 
   try {
-    const [overviewResponse, runsResponse] = await Promise.all([
+    const [overviewResponse, runsResponse, configsResponse] = await Promise.all([
       fetch(`${INBOX_API_BASE}/api/automations/overview`),
       fetch(`${INBOX_API_BASE}/api/automations/runs?limit=50`),
+      fetch(`${INBOX_API_BASE}/api/automations/configs`),
     ]);
     if (!overviewResponse.ok) throw new Error(`Automation overview returned ${overviewResponse.status}`);
     if (!runsResponse.ok) throw new Error(`Automation runs returned ${runsResponse.status}`);
+    if (!configsResponse.ok) throw new Error(`Automation configs returned ${configsResponse.status}`);
     const overviewPayload = await overviewResponse.json();
     const runsPayload = await runsResponse.json();
+    const configsPayload = await configsResponse.json();
     automationOverview = {
       mode: overviewPayload.mode || "observe",
       sends_enabled: Boolean(overviewPayload.sends_enabled),
@@ -513,11 +517,13 @@ async function loadAutomationData({ force = false } = {}) {
       webhook: overviewPayload.webhook || "/webhooks/shopify",
     };
     automationRuns = Array.isArray(runsPayload.items) ? runsPayload.items : [];
+    automationConfigs = Object.fromEntries((configsPayload.items || []).map((item) => [item.automation_id, item]));
     automationsLoadedAt = Date.now();
   } catch (error) {
     automationsLastError = error.message || "Automation data unavailable";
     automationOverview = { mode: "observe", sends_enabled: false, total_runs: 0, by_automation: [] };
     automationRuns = [];
+    automationConfigs = {};
     automationsLoadedAt = Date.now();
   } finally {
     automationsLoading = false;
@@ -534,6 +540,60 @@ function automationStats(id) {
     last_event_type: overview.last_event_type || runs[0]?.trigger_event_type || "",
     last_run: runs[0] || null,
   };
+}
+
+const automationConfigDefaults = {
+  checkout_abandonment: { wait_minutes: 30, fallback_action: "create_task", filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "" } },
+  cod_confirmation: { wait_minutes: 5, fallback_action: "create_task", filters: { min_order_value: 0, max_order_value: 0, payment_method: "Cash on Delivery", customer_tags: "" } },
+  cod_to_prepaid: { wait_minutes: 10, fallback_action: "create_task", filters: { min_order_value: 499, max_order_value: 0, payment_method: "Cash on Delivery", customer_tags: "" } },
+  delivery_failure: { wait_minutes: 0, fallback_action: "create_task", filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "ndr,rto" } },
+  post_purchase_review: { wait_minutes: 4320, fallback_action: "skip", filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "" } },
+  winback: { wait_minutes: 0, fallback_action: "skip", filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "winback" } },
+  return_refund: { wait_minutes: 0, fallback_action: "create_task", filters: { min_order_value: 0, max_order_value: 0, payment_method: "", customer_tags: "return,refund" } },
+};
+
+function automationConfig(id) {
+  const defaults = automationConfigDefaults[id] || {};
+  const saved = automationConfigs[id] || {};
+  return {
+    automation_id: id,
+    is_enabled: Boolean(saved.is_enabled),
+    template_name: saved.template_name || "",
+    template_language: saved.template_language || "en_US",
+    wait_minutes: Number(saved.wait_minutes ?? defaults.wait_minutes ?? 0),
+    filters: {
+      min_order_value: 0,
+      max_order_value: 0,
+      payment_method: "",
+      customer_tags: "",
+      ...(defaults.filters || {}),
+      ...(saved.filters || {}),
+    },
+    stop_conditions: {
+      customer_replied: true,
+      order_placed: false,
+      order_cancelled: false,
+      refund_open: false,
+      return_open: false,
+      delivery_resolved: false,
+      prepaid_converted: false,
+      refund_processed: false,
+      ...(saved.stop_conditions || {}),
+    },
+    suppression_rules: {
+      opted_out: true,
+      open_support_issue: true,
+      recent_purchase_days: 0,
+      ...(saved.suppression_rules || {}),
+    },
+    fallback_action: saved.fallback_action || defaults.fallback_action || "create_task",
+    notes: saved.notes || "",
+    updated_at: saved.updated_at || "",
+  };
+}
+
+function selectedAutomationConfig() {
+  return automationConfig(state.selectedAutomationId);
 }
 
 function automationModeLabel() {
@@ -584,7 +644,7 @@ async function loadMetaTemplates({ force = false } = {}) {
     metaTemplatesLoadedAt = Date.now();
   } finally {
     metaTemplatesLoading = false;
-    if (["templates", "broadcasts"].includes(state.screen)) render();
+    if (["templates", "broadcasts", "journeys", "bot"].includes(state.screen)) render();
   }
 }
 
@@ -1642,23 +1702,28 @@ function renderJourneys() {
 }
 
 function renderAutomationTable(items) {
-  const rows = items.map((item) => `
-    <tr>
-      <td>
-        <span class="row-title">${escapeHtml(item.name)}</span>
-        <div class="row-subtle">${escapeHtml(item.revenueGoal)}</div>
-      </td>
-      <td><span class="badge ${automationStats(item.id).observed ? "green" : "blue"}">${automationStats(item.id).observed ? "Observed" : "Ready"}</span></td>
-      <td>${escapeHtml(item.trigger)}</td>
-      <td>${escapeHtml(item.audience)}</td>
-      <td>${escapeHtml(item.templateUsage)}</td>
-      <td>${escapeHtml(automationStats(item.id).observed)}</td>
-      <td>${escapeHtml(automationStats(item.id).last_event_type || "Waiting")}</td>
-      <td>${escapeHtml(item.nextSetup)}</td>
-      <td><button class="ghost-button" data-automation-id="${escapeHtml(item.id)}" data-screen-shortcut="bot">Open</button></td>
-    </tr>
-  `).join("");
-  return table(["Automation", "State", "Trigger", "Audience", "Template", "Observed", "Latest signal", "Next setup", ""], rows);
+  const rows = items.map((item) => {
+    const stats = automationStats(item.id);
+    const config = automationConfig(item.id);
+    const configured = Boolean(config.template_name);
+    return `
+      <tr>
+        <td>
+          <span class="row-title">${escapeHtml(item.name)}</span>
+          <div class="row-subtle">${escapeHtml(item.revenueGoal)}</div>
+        </td>
+        <td><span class="badge ${configured ? "green" : stats.observed ? "blue" : "gray"}">${configured ? "Template mapped" : stats.observed ? "Observed" : "Setup"}</span></td>
+        <td>${escapeHtml(item.trigger)}</td>
+        <td>${escapeHtml(item.audience)}</td>
+        <td>${escapeHtml(config.template_name || "Not mapped")}</td>
+        <td>${escapeHtml(stats.observed)}</td>
+        <td>${escapeHtml(stats.last_event_type || "Waiting")}</td>
+        <td>${escapeHtml(configured ? `${config.wait_minutes} min wait · ${config.fallback_action.replace("_", " ")}` : item.nextSetup)}</td>
+        <td><button class="ghost-button" data-automation-id="${escapeHtml(item.id)}" data-screen-shortcut="bot">Open</button></td>
+      </tr>
+    `;
+  }).join("");
+  return table(["Automation", "State", "Trigger", "Audience", "Template", "Observed", "Latest signal", "Setup", ""], rows);
 }
 
 function renderAutomationRunFeed() {
@@ -1734,25 +1799,131 @@ function automationConnector(from, to) {
   return `<path d="M${startX} ${startY} C ${startX + mid} ${startY}, ${endX - mid} ${endY}, ${endX} ${endY}" />`;
 }
 
+function automationTemplateOptions(config) {
+  const options = approvedTemplates();
+  const current = config.template_name || "";
+  const currentExists = options.some((template) => template.name === current);
+  return [
+    `<option value="">Select approved template</option>`,
+    current && !currentExists ? `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} · saved</option>` : "",
+    ...options.map((template) => `
+      <option value="${escapeHtml(template.name)}" ${template.name === current ? "selected" : ""}>
+        ${escapeHtml(template.name)} · ${escapeHtml(template.category || "TEMPLATE")}
+      </option>
+    `),
+  ].join("");
+}
+
+function configCheckbox(key, label, checked) {
+  return `
+    <label class="rule-check">
+      <input type="checkbox" data-config-group="${escapeHtml(key.group)}" data-config-key="${escapeHtml(key.name)}" ${checked ? "checked" : ""} />
+      <span>${escapeHtml(label)}</span>
+    </label>
+  `;
+}
+
 function renderAutomationInspector() {
   const automation = selectedAutomation();
   const node = selectedAutomationNode();
   const stats = automationStats(automation.id);
+  const config = automationConfig(automation.id);
   return `
-    <aside class="automation-inspector">
-      <span class="badge ${node.tone}">${escapeHtml(node.status)}</span>
-      <h2>${escapeHtml(node.title)}</h2>
+    <aside class="automation-inspector setup-inspector">
+      <div class="inspector-headline">
+        <span class="badge ${config.is_enabled ? "green" : "blue"}">${config.is_enabled ? "Ready to enable later" : "Draft setup"}</span>
+        <span class="badge gray">${escapeHtml(automationModeLabel())}</span>
+      </div>
+      <h2>${escapeHtml(automation.name)}</h2>
       <p>${escapeHtml(node.detail)}</p>
+
+      <div class="setup-card">
+        <label class="switch-row">
+          <span>
+            <strong>Automation enabled</strong>
+            <small>Still observe-only until live execution is switched on.</small>
+          </span>
+          <input id="automation-enabled" type="checkbox" ${config.is_enabled ? "checked" : ""} />
+        </label>
+      </div>
+
+      <div class="setup-card">
+        <div class="setup-card-title">Template mapping</div>
+        <label class="label">Approved Meta template</label>
+        <select id="automation-template-name" class="select">${automationTemplateOptions(config)}</select>
+        <label class="label">Language</label>
+        <input id="automation-template-language" class="field" value="${escapeHtml(config.template_language || "en_US")}" />
+        <button class="secondary-button" data-screen-shortcut="templates">Manage templates</button>
+      </div>
+
+      <div class="setup-card">
+        <div class="setup-card-title">Rules</div>
+        <div class="form-grid compact">
+          <div>
+            <label class="label">Wait before action</label>
+            <input id="automation-wait-minutes" class="field" type="number" min="0" value="${escapeHtml(config.wait_minutes)}" />
+          </div>
+          <div>
+            <label class="label">Fallback</label>
+            <select id="automation-fallback-action" class="select">
+              <option value="create_task" ${config.fallback_action === "create_task" ? "selected" : ""}>Create task</option>
+              <option value="notify_owner" ${config.fallback_action === "notify_owner" ? "selected" : ""}>Notify owner</option>
+              <option value="skip" ${config.fallback_action === "skip" ? "selected" : ""}>Skip</option>
+            </select>
+          </div>
+          <div>
+            <label class="label">Minimum order value</label>
+            <input id="automation-min-order" class="field" type="number" min="0" value="${escapeHtml(config.filters.min_order_value || 0)}" />
+          </div>
+          <div>
+            <label class="label">Maximum order value</label>
+            <input id="automation-max-order" class="field" type="number" min="0" value="${escapeHtml(config.filters.max_order_value || 0)}" />
+          </div>
+          <div class="wide">
+            <label class="label">Payment method contains</label>
+            <input id="automation-payment-method" class="field" value="${escapeHtml(config.filters.payment_method || "")}" placeholder="Cash on Delivery" />
+          </div>
+          <div class="wide">
+            <label class="label">Customer / order tags contain</label>
+            <input id="automation-customer-tags" class="field" value="${escapeHtml(config.filters.customer_tags || "")}" placeholder="vip, ndr, refund" />
+          </div>
+        </div>
+      </div>
+
+      <div class="setup-card">
+        <div class="setup-card-title">Stop conditions</div>
+        <div class="rule-grid">
+          ${configCheckbox({ group: "stop", name: "customer_replied" }, "Customer replied", config.stop_conditions.customer_replied)}
+          ${configCheckbox({ group: "stop", name: "order_placed" }, "Order placed", config.stop_conditions.order_placed)}
+          ${configCheckbox({ group: "stop", name: "order_cancelled" }, "Order cancelled", config.stop_conditions.order_cancelled)}
+          ${configCheckbox({ group: "stop", name: "prepaid_converted" }, "Prepaid converted", config.stop_conditions.prepaid_converted)}
+          ${configCheckbox({ group: "stop", name: "refund_open" }, "Refund open", config.stop_conditions.refund_open)}
+          ${configCheckbox({ group: "stop", name: "return_open" }, "Return open", config.stop_conditions.return_open)}
+          ${configCheckbox({ group: "stop", name: "delivery_resolved" }, "Delivery resolved", config.stop_conditions.delivery_resolved)}
+          ${configCheckbox({ group: "stop", name: "refund_processed" }, "Refund processed", config.stop_conditions.refund_processed)}
+        </div>
+      </div>
+
+      <div class="setup-card">
+        <div class="setup-card-title">Suppressions</div>
+        <div class="rule-grid">
+          ${configCheckbox({ group: "suppression", name: "opted_out" }, "Skip opted-out customers", config.suppression_rules.opted_out)}
+          ${configCheckbox({ group: "suppression", name: "open_support_issue" }, "Skip open support issues", config.suppression_rules.open_support_issue)}
+        </div>
+        <label class="label">Recent purchase exclusion days</label>
+        <input id="automation-recent-days" class="field" type="number" min="0" value="${escapeHtml(config.suppression_rules.recent_purchase_days || 0)}" />
+      </div>
+
+      <div class="setup-card">
+        <div class="setup-card-title">Notes</div>
+        <textarea id="automation-notes" class="textarea" placeholder="Internal launch notes, edge cases, exclusions...">${escapeHtml(config.notes || "")}</textarea>
+      </div>
+
       <div class="inspector-list">
-        ${profileRow("Automation", automation.name)}
-        ${profileRow("Node type", node.type)}
         ${profileRow("Observed triggers", stats.observed || "0")}
         ${profileRow("Last signal", stats.last_event_type || "Waiting")}
-        ${profileRow("Template slot", automation.templateUsage)}
-        ${profileRow("Current mode", automationModeLabel())}
-        ${profileRow("Next setup", automation.nextSetup)}
+        ${profileRow("Selected node", node.title)}
       </div>
-      <button class="secondary-button" data-screen-shortcut="templates">Manage templates</button>
     </aside>
   `;
 }
@@ -2217,8 +2388,10 @@ function customerContextPanel(selected, messages, brief) {
 
 function renderBot() {
   loadAutomationData();
+  loadMetaTemplates();
   const automation = selectedAutomation();
   const stats = automationStats(automation.id);
+  const config = automationConfig(automation.id);
   return `
     <div class="flow-shell">
       <aside class="flow-sidebar">
@@ -2239,7 +2412,7 @@ function renderBot() {
         <div class="flow-health-board">
           <div><span>Trigger</span><strong>${escapeHtml(automation.trigger)}</strong></div>
           <div><span>Observed</span><strong>${escapeHtml(stats.observed)} safe matches</strong></div>
-          <div><span>Mode</span><strong>${escapeHtml(automationModeLabel())}</strong></div>
+          <div><span>Template</span><strong>${escapeHtml(config.template_name || "Not mapped")}</strong></div>
         </div>
         ${renderAutomationCanvas(true)}
       </section>
@@ -2776,6 +2949,57 @@ async function simulateAutomationEvent() {
   showToast(`Observed ${result.matches?.length || 0} matching automation signals.`);
 }
 
+function checkboxConfig(group, name) {
+  return Boolean(document.querySelector(`[data-config-group="${group}"][data-config-key="${name}"]`)?.checked);
+}
+
+async function saveSelectedAutomationConfig() {
+  const automation = selectedAutomation();
+  const payload = {
+    is_enabled: Boolean(document.getElementById("automation-enabled")?.checked),
+    template_name: document.getElementById("automation-template-name")?.value || "",
+    template_language: document.getElementById("automation-template-language")?.value?.trim() || "en_US",
+    wait_minutes: Number(document.getElementById("automation-wait-minutes")?.value || 0),
+    filters: {
+      min_order_value: Number(document.getElementById("automation-min-order")?.value || 0),
+      max_order_value: Number(document.getElementById("automation-max-order")?.value || 0),
+      payment_method: document.getElementById("automation-payment-method")?.value?.trim() || "",
+      customer_tags: document.getElementById("automation-customer-tags")?.value?.trim() || "",
+    },
+    stop_conditions: {
+      customer_replied: checkboxConfig("stop", "customer_replied"),
+      order_placed: checkboxConfig("stop", "order_placed"),
+      order_cancelled: checkboxConfig("stop", "order_cancelled"),
+      prepaid_converted: checkboxConfig("stop", "prepaid_converted"),
+      refund_open: checkboxConfig("stop", "refund_open"),
+      return_open: checkboxConfig("stop", "return_open"),
+      delivery_resolved: checkboxConfig("stop", "delivery_resolved"),
+      refund_processed: checkboxConfig("stop", "refund_processed"),
+    },
+    suppression_rules: {
+      opted_out: checkboxConfig("suppression", "opted_out"),
+      open_support_issue: checkboxConfig("suppression", "open_support_issue"),
+      recent_purchase_days: Number(document.getElementById("automation-recent-days")?.value || 0),
+    },
+    fallback_action: document.getElementById("automation-fallback-action")?.value || "create_task",
+    notes: document.getElementById("automation-notes")?.value || "",
+  };
+
+  const response = await fetch(`${INBOX_API_BASE}/api/automations/configs/${encodeURIComponent(automation.id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.error || "Could not save automation setup.");
+  }
+  automationConfigs[automation.id] = result.config;
+  automationsLoadedAt = 0;
+  await loadAutomationData({ force: true });
+  showToast("Automation setup saved.");
+}
+
 function saveCustomSegment() {
   const name = document.getElementById("segment-name")?.value?.trim();
   const source = document.getElementById("segment-source")?.value || "Combined";
@@ -3195,7 +3419,9 @@ document.addEventListener("click", (event) => {
     },
     "topup": () => showToast("Wallet top-up flow will connect to billing."),
     "save-settings": () => showToast("Settings updated."),
-    "save-flow": () => showToast("Flow changes saved."),
+    "save-flow": () => {
+      saveSelectedAutomationConfig().catch((error) => showToast(error.message || "Could not save automation setup."));
+    },
     "show-stats": () => showToast("Flow stats panel coming next."),
     "resolve-chat": () => showToast("Conversation resolved."),
     "use-suggested-reply": () => {

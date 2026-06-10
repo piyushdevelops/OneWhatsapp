@@ -166,6 +166,24 @@ create table if not exists automation_runs (
   unique (automation_id, trigger_event_id)
 );
 
+create table if not exists automation_configs (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  automation_id text not null,
+  is_enabled boolean not null default false,
+  template_name text,
+  template_language text not null default 'en_US',
+  wait_minutes integer not null default 0,
+  filters jsonb not null default '{}'::jsonb,
+  stop_conditions jsonb not null default '{}'::jsonb,
+  suppression_rules jsonb not null default '{}'::jsonb,
+  fallback_action text not null default 'create_task',
+  notes text,
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  unique (organization_id, automation_id)
+);
+
 create table if not exists conversation_notes (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
@@ -212,6 +230,7 @@ create index if not exists commerce_events_org_received_idx on commerce_events (
 create index if not exists commerce_events_phone_idx on commerce_events (organization_id, phone_e164, received_at desc);
 create index if not exists automation_runs_org_created_idx on automation_runs (organization_id, created_at desc);
 create index if not exists automation_runs_status_idx on automation_runs (organization_id, status, created_at desc);
+create index if not exists automation_configs_org_idx on automation_configs (organization_id, automation_id);
 
 -- Optional seed for local MVP development.
 insert into organizations (id, name, slug)

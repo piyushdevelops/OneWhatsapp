@@ -2517,6 +2517,19 @@ tr:last-child td {
   min-height: 280px;
 }
 
+.setup-inspector {
+  display: grid;
+  gap: 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 251, 248, 0.98));
+}
+
+.inspector-headline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .automation-inspector h2 {
   margin-top: 12px;
   font-size: 20px;
@@ -2541,6 +2554,73 @@ tr:last-child td {
 
 .automation-inspector .profile-label {
   color: var(--muted);
+}
+
+.setup-card {
+  border: 1px solid #dce4dc;
+  border-radius: 8px;
+  background: #fbfdf8;
+  padding: 13px;
+}
+
+.setup-card-title {
+  margin-bottom: 10px;
+  color: #23362e;
+  font-size: 13px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.switch-row span,
+.switch-row strong,
+.switch-row small {
+  display: block;
+}
+
+.switch-row small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.switch-row input[type="checkbox"] {
+  width: 42px;
+  height: 24px;
+  accent-color: #28745d;
+}
+
+.form-grid.compact {
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.rule-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.rule-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  color: #343a45;
+  font-size: 13px;
+  font-weight: 780;
+}
+
+.rule-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: #28745d;
 }
 
 .flow-shell {
