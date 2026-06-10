@@ -184,6 +184,40 @@ create table if not exists automation_configs (
   unique (organization_id, automation_id)
 );
 
+create table if not exists audience_segments (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  name text not null,
+  source text not null default 'Combined',
+  match_mode text not null default 'all',
+  rules jsonb not null default '{}'::jsonb,
+  description text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (organization_id, name)
+);
+
+create table if not exists broadcast_campaigns (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  name text not null,
+  template_name text not null,
+  template_language text not null default 'en_US',
+  audience_segment_id text,
+  audience_label text,
+  recipient_count integer not null default 0,
+  send_mode text not null default 'now',
+  scheduled_at timestamptz,
+  status text not null default 'draft',
+  utm_source text,
+  utm_medium text,
+  utm_campaign text,
+  variables jsonb not null default '[]'::jsonb,
+  safety_checks jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists conversation_notes (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
@@ -231,6 +265,10 @@ create index if not exists commerce_events_phone_idx on commerce_events (organiz
 create index if not exists automation_runs_org_created_idx on automation_runs (organization_id, created_at desc);
 create index if not exists automation_runs_status_idx on automation_runs (organization_id, status, created_at desc);
 create index if not exists automation_configs_org_idx on automation_configs (organization_id, automation_id);
+create index if not exists audience_segments_org_updated_idx on audience_segments (organization_id, updated_at desc);
+create index if not exists broadcast_campaigns_org_status_idx on broadcast_campaigns (organization_id, status, updated_at desc);
+create index if not exists broadcast_campaigns_scheduled_idx on broadcast_campaigns (organization_id, scheduled_at)
+  where scheduled_at is not null;
 
 -- Optional seed for local MVP development.
 insert into organizations (id, name, slug)

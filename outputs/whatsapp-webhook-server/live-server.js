@@ -37,6 +37,7 @@ const SHOPIFY_LOOKUP_TTL_MS = Number(process.env.SHOPIFY_LOOKUP_TTL_MS || 300000
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 const AUTOMATION_EVENTS_FILE =
   process.env.AUTOMATION_EVENTS_FILE || path.join(DATA_DIR, "automation-events.json");
+const PLATFORM_STATE_FILE = process.env.PLATFORM_STATE_FILE || path.join(DATA_DIR, "platform-state.json");
 const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
 
 const MIME_TYPES = {
@@ -80,6 +81,9 @@ function ensureDataDir() {
   if (!fs.existsSync(REPLIES_FILE)) fs.writeFileSync(REPLIES_FILE, "[]");
   if (!fs.existsSync(AUTOMATION_EVENTS_FILE)) {
     fs.writeFileSync(AUTOMATION_EVENTS_FILE, JSON.stringify({ events: [], runs: [] }, null, 2));
+  }
+  if (!fs.existsSync(PLATFORM_STATE_FILE)) {
+    fs.writeFileSync(PLATFORM_STATE_FILE, JSON.stringify({ segments: [], broadcasts: [] }, null, 2));
   }
 }
 
@@ -340,6 +344,82 @@ function writeAutomationEventStore(store) {
       2
     )
   );
+}
+
+function readPlatformState() {
+  ensureDataDir();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PLATFORM_STATE_FILE, "utf8"));
+    return {
+      segments: Array.isArray(parsed.segments) ? parsed.segments : [],
+      broadcasts: Array.isArray(parsed.broadcasts) ? parsed.broadcasts : [],
+    };
+  } catch {
+    return { segments: [], broadcasts: [] };
+  }
+}
+
+function writePlatformState(state) {
+  ensureDataDir();
+  fs.writeFileSync(
+    PLATFORM_STATE_FILE,
+    JSON.stringify(
+      {
+        segments: Array.isArray(state.segments) ? state.segments : [],
+        broadcasts: Array.isArray(state.broadcasts) ? state.broadcasts : [],
+      },
+      null,
+      2
+    )
+  );
+}
+
+function normalizeAudienceSegment(input = {}) {
+  const rules = input.rules && typeof input.rules === "object" ? input.rules : {};
+  const name = String(input.name || "").trim();
+  if (!name) throw new Error("segment_name_required");
+  return {
+    id: input.id || uuid(),
+    name,
+    source: String(input.source || "Combined"),
+    match_mode: String(input.match_mode || input.matchMode || "all"),
+    rules: {
+      min_orders: Number(rules.min_orders ?? input.min_orders ?? 0) || 0,
+      min_spend: Number(rules.min_spend ?? input.min_spend ?? 0) || 0,
+      keyword: String(rules.keyword ?? input.keyword ?? ""),
+      tag: String(rules.tag ?? input.tag ?? ""),
+    },
+    description: String(input.description || "Custom live segment"),
+    created_at: input.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function normalizeBroadcastCampaign(input = {}) {
+  const name = String(input.name || "").trim();
+  const templateName = validateTemplateName(input.template_name || input.templateName);
+  if (!name) throw new Error("campaign_name_required");
+  if (!templateName) throw new Error("template_name_required");
+  const status = String(input.status || "draft").toLowerCase();
+  return {
+    id: input.id || uuid(),
+    name,
+    template_name: templateName,
+    template_language: String(input.template_language || input.language || "en_US"),
+    audience_segment_id: String(input.audience_segment_id || ""),
+    audience_label: String(input.audience_label || ""),
+    recipient_count: Number(input.recipient_count || 0),
+    send_mode: String(input.send_mode || "now"),
+    scheduled_at: input.scheduled_at || null,
+    status,
+    utm_source: String(input.utm_source || ""),
+    utm_medium: String(input.utm_medium || ""),
+    utm_campaign: String(input.utm_campaign || ""),
+    variables: Array.isArray(input.variables) ? input.variables.map((item) => String(item)) : [],
+    safety_checks: input.safety_checks && typeof input.safety_checks === "object" ? input.safety_checks : {},
+    created_at: input.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
 }
 
 function defaultAutomationConfig(automationId) {
@@ -1597,6 +1677,45 @@ function createJsonStorage() {
     return config;
   }
 
+  async function listCustomSegments() {
+    const platform = readPlatformState();
+    return platform.segments.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+  }
+
+  async function saveCustomSegment(input) {
+    const platform = readPlatformState();
+    const segment = normalizeAudienceSegment(input);
+    const index = platform.segments.findIndex((item) => item.id === segment.id || item.name === segment.name);
+    if (index >= 0) {
+      segment.id = platform.segments[index].id;
+      segment.created_at = platform.segments[index].created_at || segment.created_at;
+      platform.segments[index] = segment;
+    } else {
+      platform.segments.unshift(segment);
+    }
+    writePlatformState(platform);
+    return segment;
+  }
+
+  async function listBroadcastCampaigns() {
+    const platform = readPlatformState();
+    return platform.broadcasts.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+  }
+
+  async function saveBroadcastCampaign(input) {
+    const platform = readPlatformState();
+    const campaign = normalizeBroadcastCampaign(input);
+    const index = platform.broadcasts.findIndex((item) => item.id === campaign.id);
+    if (index >= 0) {
+      campaign.created_at = platform.broadcasts[index].created_at || campaign.created_at;
+      platform.broadcasts[index] = campaign;
+    } else {
+      platform.broadcasts.unshift(campaign);
+    }
+    writePlatformState(platform);
+    return campaign;
+  }
+
   return {
     mode: "json",
     diagnostics: {
@@ -1658,6 +1777,10 @@ function createJsonStorage() {
     automationOverview,
     listAutomationConfigs,
     saveAutomationConfig,
+    listCustomSegments,
+    saveCustomSegment,
+    listBroadcastCampaigns,
+    saveBroadcastCampaign,
   };
 }
 
@@ -2514,6 +2637,174 @@ function createPostgresStorage() {
     return mapAutomationConfig(result.rows[0]);
   }
 
+  function mapAudienceSegment(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      source: row.source || "Combined",
+      match_mode: row.match_mode || "all",
+      rules: safeJsonParse(row.rules, {}),
+      description: row.description || "",
+      created_at: row.created_at || "",
+      updated_at: row.updated_at || "",
+    };
+  }
+
+  async function listCustomSegments() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select *
+      from audience_segments
+      where organization_id = $1
+      order by updated_at desc
+      `,
+      [organizationId]
+    );
+    return result.rows.map(mapAudienceSegment);
+  }
+
+  async function saveCustomSegment(input) {
+    const organizationId = await ensureOrganization();
+    const segment = normalizeAudienceSegment(input);
+    const result = await query(
+      `
+      insert into audience_segments (
+        id,
+        organization_id,
+        name,
+        source,
+        match_mode,
+        rules,
+        description,
+        created_at,
+        updated_at
+      )
+      values ($1, $2, $3, $4, $5, $6::jsonb, $7, now(), now())
+      on conflict (organization_id, name) do update
+      set source = excluded.source,
+          match_mode = excluded.match_mode,
+          rules = excluded.rules,
+          description = excluded.description,
+          updated_at = now()
+      returning *
+      `,
+      [
+        segment.id,
+        organizationId,
+        segment.name,
+        segment.source,
+        segment.match_mode,
+        JSON.stringify(segment.rules || {}),
+        segment.description || null,
+      ]
+    );
+    return mapAudienceSegment(result.rows[0]);
+  }
+
+  function mapBroadcastCampaign(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      template_name: row.template_name,
+      template_language: row.template_language || "en_US",
+      audience_segment_id: row.audience_segment_id || "",
+      audience_label: row.audience_label || "",
+      recipient_count: Number(row.recipient_count || 0),
+      send_mode: row.send_mode || "now",
+      scheduled_at: row.scheduled_at || null,
+      status: row.status || "draft",
+      utm_source: row.utm_source || "",
+      utm_medium: row.utm_medium || "",
+      utm_campaign: row.utm_campaign || "",
+      variables: safeJsonParse(row.variables, []),
+      safety_checks: safeJsonParse(row.safety_checks, {}),
+      created_at: row.created_at || "",
+      updated_at: row.updated_at || "",
+    };
+  }
+
+  async function listBroadcastCampaigns() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select *
+      from broadcast_campaigns
+      where organization_id = $1
+      order by updated_at desc
+      limit 200
+      `,
+      [organizationId]
+    );
+    return result.rows.map(mapBroadcastCampaign);
+  }
+
+  async function saveBroadcastCampaign(input) {
+    const organizationId = await ensureOrganization();
+    const campaign = normalizeBroadcastCampaign(input);
+    const result = await query(
+      `
+      insert into broadcast_campaigns (
+        id,
+        organization_id,
+        name,
+        template_name,
+        template_language,
+        audience_segment_id,
+        audience_label,
+        recipient_count,
+        send_mode,
+        scheduled_at,
+        status,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        variables,
+        safety_checks,
+        created_at,
+        updated_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, now(), now())
+      on conflict (id) do update
+      set name = excluded.name,
+          template_name = excluded.template_name,
+          template_language = excluded.template_language,
+          audience_segment_id = excluded.audience_segment_id,
+          audience_label = excluded.audience_label,
+          recipient_count = excluded.recipient_count,
+          send_mode = excluded.send_mode,
+          scheduled_at = excluded.scheduled_at,
+          status = excluded.status,
+          utm_source = excluded.utm_source,
+          utm_medium = excluded.utm_medium,
+          utm_campaign = excluded.utm_campaign,
+          variables = excluded.variables,
+          safety_checks = excluded.safety_checks,
+          updated_at = now()
+      returning *
+      `,
+      [
+        campaign.id,
+        organizationId,
+        campaign.name,
+        campaign.template_name,
+        campaign.template_language,
+        campaign.audience_segment_id || null,
+        campaign.audience_label || null,
+        campaign.recipient_count,
+        campaign.send_mode,
+        campaign.scheduled_at || null,
+        campaign.status,
+        campaign.utm_source || null,
+        campaign.utm_medium || null,
+        campaign.utm_campaign || null,
+        JSON.stringify(campaign.variables || []),
+        JSON.stringify(campaign.safety_checks || {}),
+      ]
+    );
+    return mapBroadcastCampaign(result.rows[0]);
+  }
+
   return {
     mode: "postgres",
     diagnostics: {
@@ -2550,6 +2841,10 @@ function createPostgresStorage() {
     automationOverview,
     listAutomationConfigs,
     saveAutomationConfig,
+    listCustomSegments,
+    saveCustomSegment,
+    listBroadcastCampaigns,
+    saveBroadcastCampaign,
   };
 }
 
@@ -2627,6 +2922,22 @@ function createStorage() {
     async saveAutomationConfig(...args) {
       await storage.ready();
       return storage._impl.saveAutomationConfig(...args);
+    },
+    async listCustomSegments(...args) {
+      await storage.ready();
+      return storage._impl.listCustomSegments(...args);
+    },
+    async saveCustomSegment(...args) {
+      await storage.ready();
+      return storage._impl.saveCustomSegment(...args);
+    },
+    async listBroadcastCampaigns(...args) {
+      await storage.ready();
+      return storage._impl.listBroadcastCampaigns(...args);
+    },
+    async saveBroadcastCampaign(...args) {
+      await storage.ready();
+      return storage._impl.saveBroadcastCampaign(...args);
     },
   };
 
@@ -2904,6 +3215,44 @@ async function handleApi(req, res, parsed) {
     }
   }
 
+  if (req.method === "GET" && parsed.pathname === "/api/audience/segments") {
+    const items = await storage.listCustomSegments();
+    return sendJson(res, 200, { ok: true, items });
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/audience/segments") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const segment = await storage.saveCustomSegment(body);
+      return sendJson(res, 200, { ok: true, segment });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "segment_save_failed",
+      });
+    }
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/broadcasts") {
+    const items = await storage.listBroadcastCampaigns();
+    return sendJson(res, 200, { ok: true, items });
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/broadcasts") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const campaign = await storage.saveBroadcastCampaign(body);
+      return sendJson(res, 200, { ok: true, campaign });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "broadcast_save_failed",
+      });
+    }
+  }
+
   if (req.method === "POST" && parsed.pathname === "/api/broadcasts/send") {
     try {
       const rawBody = await readBody(req, 1_000_000);
@@ -3118,6 +3467,7 @@ const server = http.createServer(async (req, res) => {
         enabled: shopifyConfig().enabled,
         shop_domain_configured: Boolean(shopifyConfig().domain),
         admin_token_configured: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+        webhook_secret_configured: Boolean(SHOPIFY_WEBHOOK_SECRET),
         api_version: SHOPIFY_API_VERSION,
       },
       automation: {

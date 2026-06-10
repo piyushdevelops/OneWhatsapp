@@ -31,6 +31,14 @@ let shopifySegments = [];
 let shopifySegmentsLoading = false;
 let shopifySegmentsLoadedAt = 0;
 let shopifySegmentsLastError = "";
+let savedSegments = [];
+let savedSegmentsLoading = false;
+let savedSegmentsLoadedAt = 0;
+let savedSegmentsLastError = "";
+let savedBroadcasts = [];
+let savedBroadcastsLoading = false;
+let savedBroadcastsLoadedAt = 0;
+let savedBroadcastsLastError = "";
 let automationOverview = {
   mode: "observe",
   sends_enabled: false,
@@ -434,32 +442,49 @@ function localSegments() {
       updated_at: new Date().toISOString(),
     };
   });
-  const custom = customSegments.map((segment) => {
+  const stored = [...savedSegments, ...customSegments].map((segment) => {
     const members = customers.filter((customer) => {
       const stats = customerShopifyStats(customer);
       const text = customerTextBlob(customer);
       const rules = [];
+      const segmentRules = segment.rules || {};
+      const matchMode = segment.match_mode || segment.matchMode || "all";
+      const minOrders = Number(segmentRules.min_orders ?? segment.minOrders ?? 0);
+      const minSpend = Number(segmentRules.min_spend ?? segment.minSpend ?? 0);
+      const keyword = segmentRules.keyword ?? segment.intentKeyword ?? "";
+      const tag = segmentRules.tag ?? segment.tag ?? "";
       if (segment.source === "Shopify" || segment.source === "Combined") rules.push(stats.matched);
-      if (segment.minOrders) rules.push(stats.orderCount >= Number(segment.minOrders));
-      if (segment.minSpend) rules.push(stats.totalSpent >= Number(segment.minSpend));
-      if (segment.intentKeyword) rules.push(new RegExp(segment.intentKeyword, "i").test(text));
-      if (segment.tag) rules.push(stats.tags.toLowerCase().includes(segment.tag.toLowerCase()));
+      if (minOrders) rules.push(stats.orderCount >= minOrders);
+      if (minSpend) rules.push(stats.totalSpent >= minSpend);
+      if (keyword) rules.push(new RegExp(escapeRegExp(keyword), "i").test(text));
+      if (tag) rules.push(stats.tags.toLowerCase().includes(String(tag).toLowerCase()));
       if (!rules.length) return true;
-      return segment.matchMode === "any" ? rules.some(Boolean) : rules.every(Boolean);
+      return matchMode === "any" ? rules.some(Boolean) : rules.every(Boolean);
     });
     return {
       id: segment.id,
       name: segment.name,
       source: segment.source,
       description: segment.description,
-      ruleText: segment.ruleText,
+      ruleText: segment.ruleText || segmentRuleText(segment),
       size: members.length,
       members,
       updated_at: segment.updated_at,
       custom: true,
     };
   });
-  return [...computed, ...custom];
+  return [...computed, ...stored];
+}
+
+function segmentRuleText(segment) {
+  const rules = segment.rules || {};
+  const parts = [
+    rules.min_orders ? `orders >= ${rules.min_orders}` : "",
+    rules.min_spend ? `spend >= Rs. ${rules.min_spend}` : "",
+    rules.keyword ? `message contains "${rules.keyword}"` : "",
+    rules.tag ? `Shopify tag contains "${rules.tag}"` : "",
+  ].filter(Boolean);
+  return parts.join((segment.match_mode || "all") === "any" ? " OR " : " AND ") || "All current customers";
 }
 
 function recipientsForSegment(segmentId) {
@@ -487,6 +512,50 @@ async function loadShopifySegments({ force = false } = {}) {
   } finally {
     shopifySegmentsLoading = false;
     if (state.screen === "audience") render();
+  }
+}
+
+async function loadSavedSegments({ force = false } = {}) {
+  if (savedSegmentsLoading) return;
+  if (!force && Date.now() - savedSegmentsLoadedAt < 60000) return;
+  savedSegmentsLoading = true;
+  savedSegmentsLastError = "";
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/audience/segments`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Segments returned ${response.status}`);
+    }
+    savedSegments = payload.items || [];
+    savedSegmentsLoadedAt = Date.now();
+  } catch (error) {
+    savedSegmentsLastError = error.message || "Saved segments unavailable";
+    savedSegmentsLoadedAt = Date.now();
+  } finally {
+    savedSegmentsLoading = false;
+    if (["audience", "broadcasts"].includes(state.screen)) render();
+  }
+}
+
+async function loadSavedBroadcasts({ force = false } = {}) {
+  if (savedBroadcastsLoading) return;
+  if (!force && Date.now() - savedBroadcastsLoadedAt < 60000) return;
+  savedBroadcastsLoading = true;
+  savedBroadcastsLastError = "";
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/broadcasts`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Campaigns returned ${response.status}`);
+    }
+    savedBroadcasts = payload.items || [];
+    savedBroadcastsLoadedAt = Date.now();
+  } catch (error) {
+    savedBroadcastsLastError = error.message || "Broadcast campaigns unavailable";
+    savedBroadcastsLoadedAt = Date.now();
+  } finally {
+    savedBroadcastsLoading = false;
+    if (["dashboard", "broadcasts"].includes(state.screen)) render();
   }
 }
 
@@ -727,8 +796,10 @@ function revenueStats() {
     delivered,
     sent,
     deliveryRate: sent ? Math.round((delivered / sent) * 100) : 0,
-    trackedCampaigns: 0,
-    utmCoverage: 0,
+    trackedCampaigns: savedBroadcasts.length,
+    utmCoverage: savedBroadcasts.length
+      ? Math.round((savedBroadcasts.filter((campaign) => campaign.utm_campaign).length / savedBroadcasts.length) * 100)
+      : 0,
   };
 }
 
@@ -1001,6 +1072,13 @@ function setScreen(next) {
   if (["dashboard", "audience", "inbox"].includes(next)) {
     loadInboxData({ force: true });
   }
+  if (next === "audience") {
+    loadSavedSegments({ force: true });
+  }
+  if (next === "broadcasts") {
+    loadSavedBroadcasts({ force: true });
+    loadSavedSegments({ force: true });
+  }
   if (["journeys", "bot"].includes(next)) {
     loadAutomationData({ force: true });
   }
@@ -1121,6 +1199,7 @@ function metric(label, value, delta, tone = "") {
 }
 
 function renderDashboard() {
+  loadSavedBroadcasts();
   const stats = liveInboxStats();
   const latest = stats.latest;
   const outboundTone = systemStatus.outboundEnabled ? "green" : "red";
@@ -1401,6 +1480,7 @@ function legend(label, value, color) {
 }
 
 function renderAudience() {
+  loadSavedSegments();
   const customers = filterBySearch(liveCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
   const segments = filterBySearch(localSegments(), ["name", "source", "description", "ruleText"]);
   if (state.audienceTab === "shopify_segments") loadShopifySegments();
@@ -1421,6 +1501,7 @@ function renderAudience() {
         </div>
       </div>
       <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
+      ${savedSegmentsLastError ? `<section class="panel pad"><span class="badge red">Segment storage issue</span><p class="setting-copy">${escapeHtml(savedSegmentsLastError)}</p></section>` : ""}
       ${renderAudienceTab(customers, segments)}
     </div>
   `;
@@ -1524,9 +1605,13 @@ function renderCustomersTable(customers) {
 
 function renderBroadcasts() {
   loadMetaTemplates();
+  loadSavedBroadcasts();
+  loadSavedSegments();
   const templates = approvedTemplates();
   const customers = liveCustomers();
   const revenue = revenueStats();
+  const scheduled = savedBroadcasts.filter((campaign) => campaign.status === "scheduled").length;
+  const drafts = savedBroadcasts.filter((campaign) => campaign.status === "draft").length;
   return `
     <div class="page-stack">
       <section class="panel pad">
@@ -1543,8 +1628,8 @@ function renderBroadcasts() {
       <div class="metric-grid four">
         ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
         ${metric("Reachable customers", customers.length, "Current WhatsApp customer list")}
-        ${metric("Live segments", localSegments().filter((segment) => segment.size > 0).length, "WhatsApp and Shopify aware audiences")}
-        ${metric("Outbound messages", revenue.outboundMessages, `${revenue.delivered}/${revenue.sent} delivered or read`)}
+        ${metric("Scheduled", scheduled, scheduled ? "Ready in campaign queue" : "No scheduled sends")}
+        ${metric("Drafts", drafts, drafts ? "Campaigns waiting to send" : "No saved drafts")}
       </div>
 
       <section class="panel pad broadcast-builder-card">
@@ -1558,21 +1643,55 @@ function renderBroadcasts() {
         </div>
       </section>
 
+      ${savedBroadcastsLastError ? `<section class="panel pad"><span class="badge red">Campaign ledger issue</span><p class="setting-copy">${escapeHtml(savedBroadcastsLastError)}</p></section>` : ""}
+      ${renderBroadcastCampaigns()}
+      <div class="section-title">Approved Templates</div>
       ${renderBroadcastTable()}
     </div>
   `;
 }
 
-function renderCampaignDrafts() {
-  const rows = campaignDrafts.map((draft) => `
+function renderBroadcastCampaigns() {
+  if (savedBroadcastsLoading && !savedBroadcasts.length) {
+    return emptyPanel("Loading campaigns", "Pulling saved drafts and scheduled broadcasts.");
+  }
+  if (!savedBroadcasts.length) {
+    return emptyPanel("No campaign drafts yet", "Create a broadcast to save the audience, template, schedule and UTM plan.", "Create broadcast", "open-broadcast-modal");
+  }
+  const rows = savedBroadcasts.map((draft) => `
     <tr>
-      <td><span class="row-title">${escapeHtml(draft.name)}</span></td>
-      <td>${escapeHtml(draft.mode)}</td>
-      <td>${escapeHtml(draft.audience)}</td>
-      <td><span class="badge gray">Draft</span></td>
+      <td>
+        <span class="row-title">${escapeHtml(draft.name)}</span>
+        <div class="row-subtle">${escapeHtml(draft.template_name)} - ${escapeHtml(draft.audience_label || "Audience saved")}</div>
+      </td>
+      <td><span class="badge ${broadcastStatusTone(draft.status)}">${escapeHtml(broadcastStatusLabel(draft.status))}</span></td>
+      <td>${escapeHtml(formatCampaignSchedule(draft))}</td>
+      <td>${draft.recipient_count || 0}</td>
+      <td>${escapeHtml(draft.utm_campaign || "-")}</td>
+      <td><button class="ghost-button" data-action="open-broadcast-modal">Duplicate</button></td>
     </tr>
   `).join("");
-  return table(["Campaign", "Mode", "Audience", "Status"], rows);
+  return table(["Campaign", "Status", "Send Time", "Recipients", "UTM Campaign", ""], rows);
+}
+
+function broadcastStatusLabel(status) {
+  const labels = { draft: "Draft", scheduled: "Scheduled", sent: "Sent", sending: "Sending" };
+  return labels[status] || status || "Draft";
+}
+
+function broadcastStatusTone(status) {
+  if (status === "sent") return "green";
+  if (status === "scheduled") return "blue";
+  if (status === "sending") return "orange";
+  return "gray";
+}
+
+function formatCampaignSchedule(campaign) {
+  if (campaign.send_mode === "later" || campaign.status === "scheduled") {
+    return campaign.scheduled_at ? formatContextDate(campaign.scheduled_at) : "Scheduled";
+  }
+  if (campaign.status === "sent") return `Sent ${formatClientRelative(campaign.updated_at)} ago`;
+  return "Draft";
 }
 
 function renderBroadcastTable() {
@@ -2283,6 +2402,24 @@ function shopifyStatusTone(shopify) {
   return "green";
 }
 
+function customerActionItems(selected, latestOrder) {
+  const text = `${selected.preview || ""} ${latestInboundText(selected)}`.toLowerCase();
+  const items = [];
+  if (Number(selected.unread || 0) > 0) {
+    items.push({ tone: "orange", title: "Reply needed", detail: `${selected.unread} unread message${selected.unread === 1 ? "" : "s"}` });
+  }
+  if (/(refund|return|exchange|damaged|wrong|cancel)/i.test(text)) {
+    items.push({ tone: "blue", title: "After-sales check", detail: "Review order before promising return/refund." });
+  }
+  if (/(where|delivery|late|delay|not received|angry|upset|issue)/i.test(text)) {
+    items.push({ tone: "orange", title: "Delivery monitor", detail: "Customer may need proactive shipment follow-up." });
+  }
+  if (latestOrder?.fulfillment_status && !/fulfilled|delivered/i.test(latestOrder.fulfillment_status)) {
+    items.push({ tone: "gray", title: "Open fulfillment", detail: latestOrder.fulfillment_status });
+  }
+  return items.slice(0, 4);
+}
+
 function customerContextPanel(selected, messages, brief) {
   const stateInfo = customerConversationState(selected);
   const rundown = conversationRundown(selected, messages);
@@ -2290,6 +2427,10 @@ function customerContextPanel(selected, messages, brief) {
   const shopifyCustomer = shopify?.customer || null;
   const orders = shopify?.orders || [];
   const latestOrder = orders[0] || null;
+  const totalSpent = parseMoney(shopifyCustomer?.total_spent);
+  const orderCount = Number(shopifyCustomer?.orders_count || orders.length || 0);
+  const averageOrder = orderCount ? totalSpent / orderCount : 0;
+  const actionItems = customerActionItems(selected, latestOrder);
   return `
     <aside class="profile-panel">
       <section class="context-card customer-summary-card">
@@ -2310,6 +2451,8 @@ function customerContextPanel(selected, messages, brief) {
           ${contextMetric("Email", shopifyCustomer?.email || selected.email || "-")}
           ${contextMetric("Total spent", shopifyCustomer?.display_total_spent || "-")}
           ${contextMetric("Orders", shopifyCustomer?.orders_count ? String(shopifyCustomer.orders_count) : "-")}
+          ${contextMetric("AOV", averageOrder ? formatMoney(averageOrder, latestOrder?.currency || "INR") : "-")}
+          ${contextMetric("Tags", shopifyCustomer?.tags || "-")}
           ${contextMetric("Last message", selected.time)}
         </div>
       </section>
@@ -2337,6 +2480,25 @@ function customerContextPanel(selected, messages, brief) {
                   : "Order history will appear here after Shopify is connected."
               }</div>`
         }
+      </section>
+
+      <section class="context-card">
+        <div class="context-card-head">
+          <strong>Work queue</strong>
+          <span>${actionItems.length ? `${actionItems.length} action${actionItems.length === 1 ? "" : "s"}` : "Clear"}</span>
+        </div>
+        <div class="action-mini-list">
+          ${
+            actionItems.length
+              ? actionItems.map((item) => `
+                  <button class="action-mini ${item.tone}" data-action="brief-action">
+                    <span>${escapeHtml(item.title)}</span>
+                    <strong>${escapeHtml(item.detail)}</strong>
+                  </button>
+                `).join("")
+              : `<div class="empty-context">No urgent Shopify or conversation task detected.</div>`
+          }
+        </div>
       </section>
 
       <section class="context-card">
@@ -2462,32 +2624,54 @@ function palette(label) {
 }
 
 function renderSettings() {
+  const shopify = systemStatus.shopify || {};
+  const webhook = systemStatus.webhookDiagnostics || {};
+  const outbound = systemStatus.outboundDiagnostics || {};
+  const readiness = [
+    { label: "Dashboard live", ok: systemStatus.healthLoaded, detail: systemStatus.healthLoaded ? "Railway app responding" : "App not reachable" },
+    { label: "WhatsApp webhook", ok: webhook.last_post_ok !== false && Boolean(webhook.last_post_at), detail: webhook.last_post_at ? `Last event ${formatClientRelative(webhook.last_post_at)} ago` : "Waiting for event" },
+    { label: "WhatsApp sends", ok: systemStatus.outboundEnabled && outbound.last_attempt_ok !== false, detail: systemStatus.outboundEnabled ? "Outbound configured" : "Needs Meta token" },
+    { label: "Postgres storage", ok: systemStatus.storageMode === "postgres" && !systemStatus.storageFallbackUsed, detail: systemStatus.storageMode || "Unknown" },
+    { label: "Shopify data", ok: Boolean(shopify.enabled), detail: shopify.enabled ? "Admin API connected" : "Add Shopify token/domain" },
+    { label: "Shopify webhook", ok: Boolean(shopify.webhook_secret_configured), detail: shopify.webhook_secret_configured ? "Secret configured" : "Add webhook secret" },
+  ];
   return `
-    <div class="settings-grid">
+    <div class="settings-grid production-settings">
       <section class="panel pad">
+        <div class="settings-hero">
+          <div>
+            <span class="eyebrow">Launch control</span>
+            <h2>Keep the platform live without showing technical clutter to operators.</h2>
+            <p>These are the only lights that matter day to day: customer messages, replies, Shopify data, campaign records and storage.</p>
+          </div>
+          <button class="secondary-button" data-action="refresh-diagnostics">Refresh status</button>
+        </div>
+        <div class="health-board readiness-board">
+          ${readiness.map((item) => healthLight(item.label, item.ok, item.detail)).join("")}
+        </div>
+
         <div class="setting-row">
           <div>
-            <div class="setting-title">General settings</div>
-            <p class="setting-copy">Workspace name, language and automatic ticket resolution.</p>
+            <div class="setting-title">Brand workspace</div>
+            <p class="setting-copy">Customer-facing identity used across inbox, templates and campaign previews.</p>
           </div>
           <div class="form-stack">
             <label class="label" for="account-name">Account name</label>
-            <input id="account-name" class="field" value="TheJuneShop" />
-            <label class="label" for="site-language">Site language</label>
-            <select id="site-language" class="select"><option>English (en)</option><option>Hindi (hi)</option></select>
-            <label class="label" for="resolve-days">Auto-resolve if inactive for days</label>
-            <input id="resolve-days" class="field" value="30" />
+            <input id="account-name" class="field" value="The June Shop" />
+            <label class="label" for="default-domain">Default store URL</label>
+            <input id="default-domain" class="field" value="https://thejuneshop.com" />
           </div>
         </div>
 
         <div class="setting-row">
           <div>
-            <div class="setting-title">Contact assignment</div>
-            <p class="setting-copy">Control whether agents can see all contacts or only contacts assigned to them.</p>
+            <div class="setting-title">Customer service window</div>
+            <p class="setting-copy">The dashboard should stay simple for one operator. No assignment routing is needed yet.</p>
           </div>
           <div class="form-stack">
-            <label><input type="checkbox" /> Enable agent-level contact segregation</label>
-            <p class="setting-copy">New contacts auto-assign to creator. Customer replies route to contact owner. Admins see all contacts.</p>
+            <label class="label" for="resolve-days">Auto-resolve inactive conversations after days</label>
+            <input id="resolve-days" class="field" value="30" />
+            <label><input type="checkbox" checked /> Keep all conversations visible to owner</label>
           </div>
         </div>
 
@@ -2507,17 +2691,6 @@ function renderSettings() {
                 <button class="ghost-button icon-only" data-action="add-hours" aria-label="Add hours">+</button>
               </div>
             `).join("")}
-          </div>
-        </div>
-
-        <div class="setting-row">
-          <div>
-            <div class="setting-title">Agent self-reports</div>
-            <p class="setting-copy">Allow agents to view their own performance reports.</p>
-          </div>
-          <div class="form-stack">
-            <label><input type="checkbox" /> Enable agent self-reports</label>
-            <p class="setting-copy">Agents can access report pages. Admins continue to see all agent data.</p>
           </div>
         </div>
       </section>
@@ -2879,9 +3052,10 @@ async function submitMetaTemplate() {
 }
 
 async function sendBroadcastLive() {
-  const template_name = document.getElementById("broadcast-template-name")?.value;
-  const language = document.getElementById("broadcast-template-language")?.value?.trim() || "en_US";
-  const variables = splitVariables(document.getElementById("broadcast-template-vars")?.value);
+  const campaignPayload = collectBroadcastPayload("sent");
+  const template_name = campaignPayload.template_name;
+  const language = campaignPayload.template_language;
+  const variables = campaignPayload.variables;
   const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
     .map((input) => input.value)
     .filter(Boolean);
@@ -2911,10 +3085,76 @@ async function sendBroadcastLive() {
     throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
   }
 
+  await saveBroadcastCampaignRecord({
+    ...campaignPayload,
+    recipient_count: result.accepted || recipients.length,
+    status: "sent",
+  }, { silent: true });
   closeModal();
   inboxLoadedAt = 0;
+  savedBroadcastsLoadedAt = 0;
   await loadInboxData({ force: true });
+  await loadSavedBroadcasts({ force: true });
   showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
+}
+
+function broadcastScheduledAt() {
+  const sendMode = document.getElementById("broadcast-send-mode")?.value || "now";
+  if (sendMode !== "later") return null;
+  const date = document.getElementById("broadcast-scheduled-date")?.value;
+  const time = document.getElementById("broadcast-scheduled-time")?.value;
+  if (!date || !time) return null;
+  const scheduled = new Date(`${date}T${time}`);
+  return Number.isNaN(scheduled.getTime()) ? null : scheduled.toISOString();
+}
+
+function collectBroadcastPayload(status = "draft") {
+  const segmentSelect = document.getElementById("broadcast-audience-segment");
+  const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
+    .map((input) => input.value)
+    .filter(Boolean);
+  const sendModeRaw = document.getElementById("broadcast-send-mode")?.value || "now";
+  const sendMode = sendModeRaw === "later" ? "later" : "now";
+  return {
+    name: document.getElementById("broadcast-name")?.value?.trim() || `WhatsApp campaign ${new Date().toLocaleDateString()}`,
+    template_name: document.getElementById("broadcast-template-name")?.value || "",
+    template_language: document.getElementById("broadcast-template-language")?.value?.trim() || "en_US",
+    audience_segment_id: segmentSelect?.value || "all_customers",
+    audience_label: segmentSelect?.selectedOptions?.[0]?.textContent || "All current WhatsApp customers",
+    recipient_count: recipients.length,
+    send_mode: sendMode,
+    scheduled_at: broadcastScheduledAt(),
+    status: status === "draft" && sendMode === "later" ? "scheduled" : status,
+    utm_source: document.getElementById("broadcast-utm-source")?.value?.trim() || "onewhatsapp",
+    utm_medium: document.getElementById("broadcast-utm-medium")?.value?.trim() || "whatsapp",
+    utm_campaign: document.getElementById("broadcast-utm-campaign")?.value?.trim() || "",
+    variables: splitVariables(document.getElementById("broadcast-template-vars")?.value),
+    safety_checks: {
+      opt_in_confirmed: Boolean(document.getElementById("broadcast-optin-check")?.checked),
+      template_policy_confirmed: Boolean(document.getElementById("broadcast-template-check")?.checked),
+    },
+  };
+}
+
+async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("draft"), { silent = false } = {}) {
+  if (!payload.template_name) throw new Error("Select an approved template first.");
+  if (payload.send_mode === "later" && !payload.scheduled_at) throw new Error("Add schedule date and time.");
+  const response = await fetch(`${INBOX_API_BASE}/api/broadcasts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.error || "Could not save campaign.");
+  }
+  savedBroadcastsLoadedAt = 0;
+  await loadSavedBroadcasts({ force: true });
+  if (!silent) {
+    closeModal();
+    showToast(payload.status === "scheduled" ? "Broadcast scheduled." : "Broadcast draft saved.");
+  }
+  return result.campaign;
 }
 
 async function simulateAutomationEvent() {
@@ -3000,7 +3240,7 @@ async function saveSelectedAutomationConfig() {
   showToast("Automation setup saved.");
 }
 
-function saveCustomSegment() {
+async function saveCustomSegment() {
   const name = document.getElementById("segment-name")?.value?.trim();
   const source = document.getElementById("segment-source")?.value || "Combined";
   const matchMode = document.getElementById("segment-match-mode")?.value || "all";
@@ -3013,15 +3253,16 @@ function saveCustomSegment() {
     showToast("Segment name is required.");
     return;
   }
-  customSegments.push({
-    id: `custom_${Date.now()}`,
+  const payload = {
     name,
     source,
-    matchMode,
-    minOrders,
-    minSpend,
-    intentKeyword: intentKeyword ? escapeRegExp(intentKeyword) : "",
-    tag,
+    match_mode: matchMode,
+    rules: {
+      min_orders: Number(minOrders || 0),
+      min_spend: Number(minSpend || 0),
+      keyword: intentKeyword || "",
+      tag: tag || "",
+    },
     description: description || "Custom live segment",
     ruleText: [
       minOrders ? `orders >= ${minOrders}` : "",
@@ -3029,11 +3270,21 @@ function saveCustomSegment() {
       intentKeyword ? `message contains "${intentKeyword}"` : "",
       tag ? `Shopify tag contains "${tag}"` : "",
     ].filter(Boolean).join(matchMode === "any" ? " OR " : " AND ") || "All current customers",
-    updated_at: new Date().toISOString(),
+  };
+  const response = await fetch(`${INBOX_API_BASE}/api/audience/segments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result?.error || "Could not save segment.");
+  }
+  savedSegmentsLoadedAt = 0;
+  await loadSavedSegments({ force: true });
   state.audienceTab = "segments";
   closeModal();
-  showToast("Segment created.");
+  showToast("Segment saved.");
   render();
 }
 
@@ -3108,7 +3359,15 @@ function openBroadcastModal() {
             </div>
             <div>
               <label class="label">Send time</label>
-              <select id="broadcast-send-mode" class="select"><option>Send now</option><option>Schedule later</option></select>
+              <select id="broadcast-send-mode" class="select"><option value="now">Send now</option><option value="later">Schedule later</option></select>
+            </div>
+            <div>
+              <label class="label">Schedule date</label>
+              <input id="broadcast-scheduled-date" class="field" type="date" />
+            </div>
+            <div>
+              <label class="label">Schedule time</label>
+              <input id="broadcast-scheduled-time" class="field" type="time" />
             </div>
             <div>
               <label class="label">UTM source</label>
@@ -3377,13 +3636,14 @@ document.addEventListener("click", (event) => {
     "open-segment-modal": openSegmentModal,
     "close-modal": closeModal,
     "save-broadcast": () => {
-      closeModal();
-      showToast("Broadcast draft saved for this session.");
+      saveBroadcastCampaignRecord().catch((error) => showToast(error.message || "Could not save campaign."));
     },
     "submit-template": () => {
       submitMetaTemplate().catch((error) => showToast(error.message || "Could not submit template."));
     },
-    "save-segment": saveCustomSegment,
+    "save-segment": () => {
+      saveCustomSegment().catch((error) => showToast(error.message || "Could not save segment."));
+    },
     "sync-templates": () => {
       metaTemplatesLoadedAt = 0;
       loadMetaTemplates({ force: true });
