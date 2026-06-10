@@ -33,7 +33,12 @@ WHATSAPP_BUSINESS_ACCOUNT_ID
 GRAPH_API_VERSION=v25.0
 ORGANIZATION_NAME=The June Shop
 ORGANIZATION_SLUG=the-june-shop
+SHOPIFY_SHOP_DOMAIN=your-store.myshopify.com
+SHOPIFY_ADMIN_ACCESS_TOKEN=<Shopify Admin API token>
+SHOPIFY_API_VERSION=2025-10
 ```
+
+Shopify token scopes: `read_customers`, `read_orders`, and optionally `read_all_orders` for older order history.
 
 Optional:
 
@@ -50,12 +55,14 @@ After deploy, check:
 - `/health`
 - `/api/diagnostics/webhook`
 - `/api/diagnostics/outbound`
+- `/api/diagnostics/shopify?phone=916291909628`
 
 Inside `/health`, check:
 
 - `storage.mode`
 - `storage.fallback_used`
 - `storage.last_init_error`
+- `shopify.enabled`
 
 ## 5. Confirm production behavior
 

@@ -29,6 +29,10 @@ const ORGANIZATION_SLUG = process.env.ORGANIZATION_SLUG || "the-june-shop";
 const DISPLAY_PHONE_NUMBER = process.env.WHATSAPP_DISPLAY_PHONE_NUMBER || "";
 const BUSINESS_DISPLAY_NAME = process.env.WHATSAPP_BUSINESS_DISPLAY_NAME || ORGANIZATION_NAME;
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_ACCESS_TOKEN =
+  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -505,6 +509,159 @@ async function metaGet(pathname) {
   };
 }
 
+function shopifyConfig() {
+  const domain = SHOPIFY_SHOP_DOMAIN
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "")
+    .trim();
+  return {
+    enabled: Boolean(domain && SHOPIFY_ADMIN_ACCESS_TOKEN),
+    domain,
+    api_version: SHOPIFY_API_VERSION,
+  };
+}
+
+function phoneCandidates(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return [];
+  const withoutCountry = digits.startsWith("91") && digits.length > 10 ? digits.slice(2) : digits;
+  return Array.from(new Set([
+    digits,
+    `+${digits}`,
+    withoutCountry,
+    `+91${withoutCountry}`,
+  ].filter(Boolean)));
+}
+
+async function shopifyGet(pathname, query = {}) {
+  const config = shopifyConfig();
+  if (!config.enabled) {
+    return {
+      ok: false,
+      status: 0,
+      payload: { error: "shopify_not_configured" },
+    };
+  }
+
+  const url = new URL(`https://${config.domain}/admin/api/${config.api_version}/${pathname}`);
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
+  }
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      "Content-Type": "application/json",
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload,
+  };
+}
+
+function normalizeShopifyOrder(order) {
+  const amount = order.current_total_price || order.total_price || "";
+  const currency = order.currency || order.presentment_currency || "";
+  const orderName = order.name || (order.order_number ? `#${order.order_number}` : "-");
+  return {
+    id: order.id ? String(order.id) : "",
+    name: String(orderName),
+    created_at: order.created_at || "",
+    processed_at: order.processed_at || "",
+    financial_status: order.financial_status || "",
+    fulfillment_status: order.fulfillment_status || "unfulfilled",
+    total_price: amount,
+    currency,
+    display_total: amount ? `${currency ? `${currency} ` : ""}${amount}` : "-",
+    line_items: (order.line_items || []).slice(0, 5).map((item) => ({
+      name: item.name || item.title || "",
+      quantity: item.quantity || 0,
+    })),
+    shipping_address: order.shipping_address
+      ? {
+          city: order.shipping_address.city || "",
+          province: order.shipping_address.province || "",
+          country: order.shipping_address.country || "",
+          zip: order.shipping_address.zip || "",
+        }
+      : null,
+  };
+}
+
+function normalizeShopifyCustomer(customer, orders) {
+  const totalSpent = customer.total_spent || "";
+  const currency = orders[0]?.currency || "";
+  return {
+    connected: true,
+    matched: true,
+    customer: {
+      id: customer.id ? String(customer.id) : "",
+      name: [customer.first_name, customer.last_name].filter(Boolean).join(" ") || customer.email || customer.phone || "",
+      email: customer.email || "",
+      phone: customer.phone || customer.default_address?.phone || "",
+      orders_count: Number(customer.orders_count || orders.length || 0),
+      total_spent: totalSpent,
+      display_total_spent: totalSpent ? `${currency ? `${currency} ` : ""}${totalSpent}` : "-",
+      tags: customer.tags || "",
+      created_at: customer.created_at || "",
+    },
+    orders: orders.map(normalizeShopifyOrder),
+  };
+}
+
+async function lookupShopifyCustomerByPhone(phone) {
+  const config = shopifyConfig();
+  if (!config.enabled) {
+    return {
+      connected: false,
+      matched: false,
+      reason: "shopify_not_configured",
+      customer: null,
+      orders: [],
+    };
+  }
+
+  for (const candidate of phoneCandidates(phone)) {
+    const result = await shopifyGet("customers/search.json", {
+      query: `phone:${candidate}`,
+      limit: "1",
+    });
+    if (!result.ok) {
+      return {
+        connected: true,
+        matched: false,
+        reason: result.payload?.errors || result.payload?.error || `shopify_http_${result.status}`,
+        customer: null,
+        orders: [],
+      };
+    }
+
+    const customer = result.payload?.customers?.[0];
+    if (!customer) continue;
+
+    const ordersResult = await shopifyGet("orders.json", {
+      customer_id: String(customer.id),
+      status: "any",
+      limit: "5",
+      order: "created_at desc",
+    });
+    const orders = ordersResult.ok ? (ordersResult.payload?.orders || []) : [];
+    return normalizeShopifyCustomer(customer, orders);
+  }
+
+  return {
+    connected: true,
+    matched: false,
+    reason: "no_customer_match",
+    customer: null,
+    orders: [],
+  };
+}
+
 function suggestedReply(conversation) {
   if (conversation.intent === "order_status") {
     return "I am checking your order status now and will update you here shortly.";
@@ -570,18 +727,20 @@ function normalizeConversation(conversation, storageMode = "json") {
   };
 }
 
-function conversationResponse(conversation, storageMode = "json") {
+async function conversationResponse(conversation, storageMode = "json") {
   const normalized = normalizeConversation(conversation, storageMode);
+  const shopify = await lookupShopifyCustomerByPhone(normalized.phone || normalized.wa_id);
   return {
     ...normalized,
     customer: {
       id: normalized.wa_id,
       name: normalized.name,
       phone: normalized.phone,
-      email: normalized.email,
+      email: shopify.customer?.email || normalized.email,
       segment: normalized.segment,
       opt_in_status: "unknown",
     },
+    shopify,
     service_window: normalized.service_window,
     outbound: outboundConfig(storageMode),
     suggested_reply: {
@@ -1565,7 +1724,7 @@ async function handleApi(req, res, parsed) {
   if (req.method === "GET" && detailMatch) {
     const conversation = await storage.getConversation(decodeURIComponent(detailMatch[1]));
     if (!conversation) return sendJson(res, 404, { error: "conversation_not_found" });
-    return sendJson(res, 200, conversationResponse(conversation, storage.mode));
+    return sendJson(res, 200, await conversationResponse(conversation, storage.mode));
   }
 
   const replyMatch = parsed.pathname.match(/^\/api\/inbox\/conversations\/([^/]+)\/reply$/);
@@ -1676,6 +1835,12 @@ const server = http.createServer(async (req, res) => {
       webhook: "/webhooks/whatsapp",
       api: "/api/inbox/conversations",
       outbound: outboundConfig(storage.mode),
+      shopify: {
+        enabled: shopifyConfig().enabled,
+        shop_domain_configured: Boolean(shopifyConfig().domain),
+        admin_token_configured: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+        api_version: SHOPIFY_API_VERSION,
+      },
       storage: {
         mode: storage.mode,
         attempted_mode: storage.initState?.attempted_mode || storage.mode,
@@ -1704,6 +1869,19 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/outbound") {
     return sendJson(res, 200, outboundDiagnostics);
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/shopify") {
+    const config = shopifyConfig();
+    const phone = parsed.query.phone || "";
+    const lookup = phone ? await lookupShopifyCustomerByPhone(phone) : null;
+    return sendJson(res, 200, {
+      enabled: config.enabled,
+      shop_domain_configured: Boolean(config.domain),
+      admin_token_configured: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+      api_version: config.api_version,
+      test_lookup: lookup,
+    });
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/meta-auth") {

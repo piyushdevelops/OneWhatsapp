@@ -1808,6 +1808,32 @@ tr:last-child td {
   line-height: 1.4;
 }
 
+.order-preview {
+  border: 1px solid #3c444f;
+  border-radius: 8px;
+  background: #22262d;
+  padding: 10px;
+  display: grid;
+  gap: 5px;
+}
+
+.order-preview strong {
+  color: #eef2f6;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.order-preview span {
+  color: #9ba4b1;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.order-history {
+  display: grid;
+  gap: 8px;
+}
+
 .history-stack {
   display: grid;
   gap: 8px;
@@ -2357,7 +2383,7 @@ tr:last-child td {
 
 .diagnostics-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
   gap: 12px;
 }
 

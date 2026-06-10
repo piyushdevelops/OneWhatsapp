@@ -32,6 +32,7 @@ let systemStatus = {
   runtime: {},
   webhookDiagnostics: null,
   outboundDiagnostics: null,
+  shopify: null,
   healthLoaded: false,
 };
 
@@ -62,6 +63,7 @@ async function loadSystemStatus() {
       runtime: payload.runtime || {},
       webhookDiagnostics: payload.webhook_diagnostics || null,
       outboundDiagnostics: payload.outbound_diagnostics || null,
+      shopify: payload.shopify || null,
       healthLoaded: true,
     };
   } catch {
@@ -76,6 +78,7 @@ async function loadSystemStatus() {
       runtime: {},
       webhookDiagnostics: null,
       outboundDiagnostics: null,
+      shopify: null,
       healthLoaded: false,
     };
   } finally {
@@ -124,6 +127,7 @@ function normalizeInboxConversation(item) {
     suggestedReply: item.suggested_reply?.body || "",
     allowedReplyModes: item.service_window?.allowed_reply_modes || ["freeform", "template"],
     storageMode: item.storage_mode || systemStatus.storageMode || "",
+    shopify: item.shopify || null,
     messages,
   };
 }
@@ -158,6 +162,9 @@ function mergeConversationSummary(item, detail) {
   if ((!detail.segment || detail.segment === "Webhook contact") && item.segment) {
     merged.segment = item.segment;
   }
+  if (!detail.shopify && item.shopify) {
+    merged.shopify = item.shopify;
+  }
 
   return merged;
 }
@@ -175,6 +182,9 @@ function isLiveConversation(item) {
 }
 
 function conversationSignature(item) {
+  const shopify = item.shopify || null;
+  const shopifyCustomer = shopify?.customer || null;
+  const shopifyOrders = shopify?.orders || [];
   return {
     id: item.id,
     preview: item.preview,
@@ -182,6 +192,15 @@ function conversationSignature(item) {
     time: item.time,
     status: item.status,
     serviceWindow: item.serviceWindow,
+    shopify: shopify
+      ? {
+          connected: shopify.connected,
+          matched: shopify.matched,
+          customerId: shopifyCustomer?.id || "",
+          orderCount: shopifyOrders.length,
+          latestOrderId: shopifyOrders[0]?.id || "",
+        }
+      : null,
     messages: (item.messages || []).map((message) => [
       message.provider_message_id || message.id || "",
       message.from,
@@ -1243,9 +1262,42 @@ function contextMetric(label, value) {
   `;
 }
 
+function formatContextDate(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function shopifyOrderLine(order) {
+  const items = order?.line_items || [];
+  if (!items.length) return "No items available";
+  return items
+    .slice(0, 2)
+    .map((item) => `${item.quantity || 1} x ${item.name}`)
+    .join(", ");
+}
+
+function shopifyStatusText(shopify) {
+  if (!shopify) return "Pending";
+  if (!shopify.connected) return "Not connected";
+  if (!shopify.matched) return "No match";
+  return "Matched";
+}
+
+function shopifyStatusTone(shopify) {
+  if (!shopify || !shopify.connected) return "gray";
+  if (!shopify.matched) return "orange";
+  return "green";
+}
+
 function customerContextPanel(selected, messages, brief) {
   const stateInfo = customerConversationState(selected);
   const rundown = conversationRundown(selected, messages);
+  const shopify = selected.shopify || null;
+  const shopifyCustomer = shopify?.customer || null;
+  const orders = shopify?.orders || [];
+  const latestOrder = orders[0] || null;
   return `
     <aside class="profile-panel">
       <section class="context-card customer-summary-card">
@@ -1263,7 +1315,9 @@ function customerContextPanel(selected, messages, brief) {
         <div class="context-grid two">
           ${contextMetric("Customer", selected.phone)}
           ${contextMetric("WhatsApp ID", selected.wa_id || selected.phone.replace(/\D/g, "") || "-")}
-          ${contextMetric("Segment", selected.segment === "Webhook contact" ? "Customer" : selected.segment)}
+          ${contextMetric("Email", shopifyCustomer?.email || selected.email || "-")}
+          ${contextMetric("Total spent", shopifyCustomer?.display_total_spent || "-")}
+          ${contextMetric("Orders", shopifyCustomer?.orders_count ? String(shopifyCustomer.orders_count) : "-")}
           ${contextMetric("Last message", selected.time)}
         </div>
       </section>
@@ -1271,15 +1325,45 @@ function customerContextPanel(selected, messages, brief) {
       <section class="context-card">
         <div class="context-card-head">
           <strong>Order details</strong>
-          <span class="badge gray">Shopify sync</span>
+          <span class="badge ${shopifyStatusTone(shopify)}">Shopify ${shopifyStatusText(shopify)}</span>
         </div>
         <div class="context-grid two">
-          ${contextMetric("Last order", selected.lastOrder || "-")}
-          ${contextMetric("Order value", "-")}
-          ${contextMetric("Orders", "-")}
-          ${contextMetric("Lifetime spend", "-")}
+          ${contextMetric("Last order", latestOrder?.name || selected.lastOrder || "-")}
+          ${contextMetric("Order value", latestOrder?.display_total || "-")}
+          ${contextMetric("Payment", latestOrder?.financial_status || "-")}
+          ${contextMetric("Fulfillment", latestOrder?.fulfillment_status || "-")}
         </div>
-        <div class="empty-context">Order history will appear here after Shopify is connected.</div>
+        ${
+          latestOrder
+            ? `<div class="order-preview">
+                <strong>${escapeHtml(shopifyOrderLine(latestOrder))}</strong>
+                <span>${escapeHtml(formatContextDate(latestOrder.processed_at || latestOrder.created_at))}</span>
+              </div>`
+            : `<div class="empty-context">${
+                shopify?.connected
+                  ? "No Shopify customer was found for this WhatsApp number yet."
+                  : "Order history will appear here after Shopify is connected."
+              }</div>`
+        }
+      </section>
+
+      <section class="context-card">
+        <div class="context-card-head">
+          <strong>Order history</strong>
+          <span>${orders.length ? `${orders.length} recent` : ""}</span>
+        </div>
+        <div class="order-history">
+          ${
+            orders.length
+              ? orders.map((order) => `
+                  <button class="history-button" data-action="brief-action">
+                    <span>${escapeHtml(order.name || "Order")}</span>
+                    <strong>${escapeHtml(`${order.display_total || "-"} - ${order.fulfillment_status || "status pending"}`)}</strong>
+                  </button>
+                `).join("")
+              : `<div class="empty-context">No Shopify orders linked to this phone number yet.</div>`
+          }
+        </div>
       </section>
 
       <section class="context-card">
@@ -1457,6 +1541,8 @@ function renderDiagnosticsPanel() {
   const outboundTone = systemStatus.outboundEnabled ? "green" : "orange";
   const webhookTone = diagnosticsStateTone(webhook.last_post_ok);
   const replyTone = diagnosticsStateTone(outbound.last_attempt_ok);
+  const shopify = systemStatus.shopify || {};
+  const shopifyTone = shopify.enabled ? "green" : "orange";
 
   return `
     <section class="panel pad diagnostics-panel">
@@ -1491,6 +1577,12 @@ function renderDiagnosticsPanel() {
           ${diagnosticRow("Last attempt", outbound.last_attempt_at ? formatClientRelative(outbound.last_attempt_at) : "none")}
           ${diagnosticRow("Reason", outbound.last_attempt_reason || "-")}
           ${diagnosticRow("Recipient", outbound.last_recipient_wa_id || "-")}
+        </article>
+        <article class="diagnostic-card">
+          <span class="badge ${shopifyTone}">Shopify ${shopify.enabled ? "Connected" : "Pending"}</span>
+          ${diagnosticRow("Shop domain", boolLabel(shopify.shop_domain_configured), shopify.shop_domain_configured ? "green" : "orange")}
+          ${diagnosticRow("Admin token", boolLabel(shopify.admin_token_configured), shopify.admin_token_configured ? "green" : "orange")}
+          ${diagnosticRow("API version", shopify.api_version || "-")}
         </article>
       </div>
     </section>

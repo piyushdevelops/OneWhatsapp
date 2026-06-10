@@ -44,9 +44,12 @@ DASHBOARD_DIR
 DATABASE_URL
 ORGANIZATION_NAME
 ORGANIZATION_SLUG
+SHOPIFY_SHOP_DOMAIN
+SHOPIFY_ADMIN_ACCESS_TOKEN
+SHOPIFY_API_VERSION
 ```
 
-Keep these in the hosting provider's environment settings. Do not put real Meta tokens in frontend files or documentation.
+Keep these in the hosting provider's environment settings. Do not put real Meta or Shopify tokens in frontend files or documentation.
 
 ## Meta Setup
 
@@ -89,6 +92,34 @@ This gives you:
 - cleaner path to multi-workspace rollout later
 
 If `DATABASE_URL` is not set, the server falls back to local JSON storage.
+
+## Shopify Customer Context
+
+If `SHOPIFY_SHOP_DOMAIN` and `SHOPIFY_ADMIN_ACCESS_TOKEN` are set, the selected inbox conversation is enriched with Shopify customer and recent order data by matching the WhatsApp phone number.
+
+Use:
+
+```txt
+SHOPIFY_SHOP_DOMAIN=your-store.myshopify.com
+SHOPIFY_ADMIN_ACCESS_TOKEN=shpat_...
+SHOPIFY_API_VERSION=2025-10
+```
+
+The Shopify Admin API token needs `read_customers` and `read_orders`. Add `read_all_orders` if you want history beyond Shopify's normal recent-order access window.
+
+The dashboard reads this into the customer context panel:
+
+- customer email
+- order count
+- total spent
+- latest order
+- recent order history
+
+Confirm Shopify setup with:
+
+```txt
+/api/diagnostics/shopify?phone=916291909628
+```
 
 ## Recommended Production Token
 
