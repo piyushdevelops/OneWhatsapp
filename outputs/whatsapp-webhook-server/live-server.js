@@ -2051,8 +2051,10 @@ function createJsonStorage() {
     async listConversations() {
       return buildInbox().map((item) => normalizeConversation(item, "json"));
     },
-    async listContacts() {
-      return buildInbox().map((item) => {
+    async listContacts(options = {}) {
+      const limit = Math.max(1, Math.min(Number(options.limit || 25), 5000));
+      const offset = Math.max(0, Number(options.offset || 0));
+      return buildInbox().slice(offset, offset + limit).map((item) => {
         const conversation = normalizeConversation(item, "json");
         return {
           id: conversation.id,
@@ -2082,7 +2084,7 @@ function createJsonStorage() {
     },
     async customerSyncStatus() {
       const platform = readPlatformState();
-      const contacts = await this.listContacts();
+      const contacts = buildInbox();
       return {
         total_contacts: contacts.length,
         shopify_synced: 0,
@@ -2090,6 +2092,7 @@ function createJsonStorage() {
         last_synced_at: platform.customerSync?.last_synced_at || "",
         last_checked_at: platform.customerSync?.last_checked_at || "",
         last_skipped: Number(platform.customerSync?.last_skipped || 0),
+        next_page_info: platform.customerSync?.next_page_info || "",
       };
     },
     async getConversation(id) {
@@ -2532,11 +2535,14 @@ function createPostgresStorage() {
       last_checked_at: platform.customerSync?.last_checked_at || "",
       last_skipped: Number(platform.customerSync?.last_skipped || 0),
       last_total_seen: Number(platform.customerSync?.last_total_seen || 0),
+      next_page_info: platform.customerSync?.next_page_info || "",
     };
   }
 
-  async function listContacts() {
+  async function listContacts(options = {}) {
     const organizationId = await ensureOrganization();
+    const limit = Math.max(1, Math.min(Number(options.limit || 25), 5000));
+    const offset = Math.max(0, Number(options.offset || 0));
     const result = await query(
       `
       select
@@ -2580,8 +2586,10 @@ function createPostgresStorage() {
       ) lm on true
       where ct.organization_id = $1
       order by coalesce(c.last_message_at, lm.created_at, ct.updated_at, ct.created_at) desc
+      limit $2
+      offset $3
       `,
-      [organizationId]
+      [organizationId, limit, offset]
     );
 
     return result.rows.map((row) => {
@@ -3679,9 +3687,9 @@ function createStorage() {
       await storage.ready();
       return storage._impl.listConversations();
     },
-    async listContacts() {
+    async listContacts(...args) {
       await storage.ready();
-      return storage._impl.listContacts();
+      return storage._impl.listContacts(...args);
     },
     async upsertShopifyCustomers(...args) {
       await storage.ready();
@@ -4229,6 +4237,7 @@ async function handleApi(req, res, parsed) {
           last_total_seen: result.customers.length,
           last_skipped: saved.skipped || 0,
           last_error: saved.errors?.[0]?.reason || "",
+          next_page_info: result.nextPageInfo || result.payload?.next_page_info || "",
         },
       });
       const status = await storage.customerSyncStatus();
@@ -4273,15 +4282,19 @@ async function handleApi(req, res, parsed) {
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/customers") {
-    const items = await storage.listContacts();
+    const limit = Math.max(1, Math.min(Number(parsed.query.limit || 25) || 25, 5000));
+    const offset = Math.max(0, Number(parsed.query.offset || 0) || 0);
+    const items = await storage.listContacts({ limit, offset });
     const status = await storage.customerSyncStatus();
     return sendJson(res, 200, {
       ok: true,
       items,
+      limit,
+      offset,
       counts: {
-        total: items.length,
-        shopify: items.filter((item) => item.shopify?.matched || item.channel === "Shopify").length,
-        whatsapp: items.filter((item) => item.conversation_id).length,
+        total: status.total_contacts ?? items.length,
+        shopify: status.shopify_synced ?? items.filter((item) => item.shopify?.matched || item.channel === "Shopify").length,
+        whatsapp: status.whatsapp_contacts ?? items.filter((item) => item.conversation_id).length,
       },
       sync_status: status,
     });

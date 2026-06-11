@@ -39,6 +39,7 @@ let syncedCustomers = [];
 let customersLoading = false;
 let customersLoadedAt = 0;
 let customersLastError = "";
+let customerPreviewLimit = 25;
 let customerSyncStatus = {
   loading: false,
   syncing: false,
@@ -52,6 +53,7 @@ let customerSyncStatus = {
   pages: 0,
   lastSyncedAt: "",
   lastError: "",
+  nextPageInfo: "",
 };
 let savedSegments = [];
 let savedSegmentsLoading = false;
@@ -404,6 +406,7 @@ function applyCustomerSyncStatus(status = {}) {
     skipped: Number(status.last_skipped ?? status.skipped ?? customerSyncStatus.skipped ?? 0),
     lastSyncedAt: status.last_synced_at || customerSyncStatus.lastSyncedAt || "",
     lastError: status.total_available_error || status.last_error || customerSyncStatus.lastError || "",
+    nextPageInfo: status.next_page_info ?? customerSyncStatus.nextPageInfo ?? "",
   };
 }
 
@@ -801,13 +804,15 @@ function recipientsForSegment(segmentId) {
   return segment?.members || [];
 }
 
-async function loadCustomers({ force = false } = {}) {
+async function loadCustomers({ force = false, limit = customerPreviewLimit } = {}) {
   if (customersLoading) return;
   if (!force && Date.now() - customersLoadedAt < 60000) return;
   customersLoading = true;
   customersLastError = "";
   try {
-    const response = await fetch(`${INBOX_API_BASE}/api/customers`);
+    const url = new URL(`${INBOX_API_BASE}/api/customers`);
+    url.searchParams.set("limit", String(Math.max(25, Number(limit) || 25)));
+    const response = await fetch(url.toString());
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) {
       throw new Error(payload?.error?.message || payload?.error || `Customers returned ${response.status}`);
@@ -860,12 +865,13 @@ async function syncShopifyCustomers() {
   };
   customersLastError = "";
   render();
-  let pageInfo = "";
+  let pageInfo = customerSyncStatus.nextPageInfo || "";
   let synced = 0;
   let skipped = 0;
   let totalSeen = 0;
+  let lastProgressRender = 0;
   try {
-    for (let page = 0; page < 100; page += 1) {
+    for (let page = 0; page < 5000; page += 1) {
       const url = new URL(`${INBOX_API_BASE}/api/shopify/sync-customers`);
       url.searchParams.set("pages", "1");
       if (pageInfo) url.searchParams.set("page_info", pageInfo);
@@ -887,13 +893,18 @@ async function syncShopifyCustomers() {
         checked: totalSeen,
         pages: page + 1,
         lastSyncedAt: payload.status?.last_synced_at || customerSyncStatus.lastSyncedAt,
+        nextPageInfo: payload.next_page_info || "",
       };
-      render();
+      const shouldRenderProgress = Date.now() - lastProgressRender > 1200 || page < 2 || !payload.next_page_info;
+      if (shouldRenderProgress) {
+        lastProgressRender = Date.now();
+        render();
+      }
       pageInfo = payload.next_page_info || "";
       if (!pageInfo) break;
     }
     customersLoadedAt = 0;
-    await loadCustomers({ force: true });
+    await loadCustomers({ force: true, limit: customerPreviewLimit });
     await loadCustomerSyncStatus({ force: true });
     showToast(`Synced ${synced} Shopify customers${skipped ? `, skipped ${skipped} without phone` : ""}.`);
   } catch (error) {
@@ -2340,6 +2351,8 @@ function renderShopifySegmentsTable() {
 }
 
 function renderCustomersTable(customers) {
+  const total = customerSyncStatus.totalContacts || customers.length;
+  const canLoadMore = customers.length < total;
   const rows = customers.map((customer) => `
     <tr>
       <td>
@@ -2363,7 +2376,13 @@ function renderCustomersTable(customers) {
     </tr>
   `).join("");
 
-  return table(["Name", "Email Address", "Contact No.", "Channel", "Segment", "Unread", "Last Seen", ""], rows);
+  return `
+    ${table(["Name", "Email Address", "Contact No.", "Channel", "Segment", "Unread", "Last Seen", ""], rows)}
+    <div class="table-footer-actions">
+      <span>Showing ${customers.length} of ${total} saved customers</span>
+      <button class="secondary-button" data-action="load-more-customers" ${canLoadMore ? "" : "disabled"}>Load 25 more</button>
+    </div>
+  `;
 }
 
 function renderBroadcasts() {
@@ -5133,6 +5152,12 @@ document.addEventListener("click", (event) => {
     "sync-shopify-customers": () => {
       state.audienceTab = "profiles";
       syncShopifyCustomers().catch((error) => showToast(error.message || "Shopify customer sync failed."));
+    },
+    "load-more-customers": () => {
+      customerPreviewLimit += 25;
+      customersLoadedAt = 0;
+      loadCustomers({ force: true, limit: customerPreviewLimit });
+      showToast(`Loading ${customerPreviewLimit} customers.`);
     },
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
