@@ -4126,8 +4126,8 @@ async function handleApi(req, res, parsed) {
 
   if (req.method === "POST" && parsed.pathname === "/api/shopify/sync-customers") {
     try {
-      const maxPages = Math.max(1, Math.min(5, Number(parsed.searchParams.get("pages") || 1) || 1));
-      const pageInfo = parsed.searchParams.get("page_info") || "";
+      const maxPages = Math.max(1, Math.min(5, Number(parsed.query.pages || 1) || 1));
+      const pageInfo = parsed.query.page_info || "";
       const result = await fetchShopifyCustomers(maxPages, pageInfo);
       if (!result.ok) {
         return sendJson(res, result.status || 500, {
