@@ -29,6 +29,7 @@ const ORGANIZATION_SLUG = process.env.ORGANIZATION_SLUG || "the-june-shop";
 const DISPLAY_PHONE_NUMBER = process.env.WHATSAPP_DISPLAY_PHONE_NUMBER || "";
 const BUSINESS_DISPLAY_NAME = process.env.WHATSAPP_BUSINESS_DISPLAY_NAME || ORGANIZATION_NAME;
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const STORAGE_RETRY_INTERVAL_MS = Number(process.env.STORAGE_RETRY_INTERVAL_MS || 15000);
 const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN || "";
 const SHOPIFY_ADMIN_ACCESS_TOKEN =
   process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
@@ -3807,28 +3808,12 @@ function createStorage() {
     active_mode: base.mode,
     last_init_error: null,
     fallback_used: false,
+    last_recovery_attempt_at: "",
+    last_recovery_ok: null,
   };
-  const initPromise = base
-    .init()
-    .then(() => {
-      console.log(`[storage] mode=${base.mode}`);
-      initState.active_mode = base.mode;
-    })
-    .catch((error) => {
-      console.error(`[storage] init failed for mode=${base.mode}`, error);
-      initState.last_init_error = error?.message || "unknown_init_error";
-      if (postgres) {
-        console.log("[storage] falling back to json storage");
-        const fallback = createJsonStorage();
-        storage.mode = fallback.mode;
-        storage.diagnostics = fallback.diagnostics;
-        storage._impl = fallback;
-        initState.active_mode = fallback.mode;
-        initState.fallback_used = true;
-        return fallback.init();
-      }
-      throw error;
-    });
+  let initPromise = null;
+  let recoveryPromise = null;
+  let lastRecoveryAttemptMs = 0;
 
   const storage = {
     mode: base.mode,
@@ -3837,6 +3822,37 @@ function createStorage() {
     _impl: base,
     async ready() {
       await initPromise;
+      await storage.recover();
+    },
+    async recover(options = {}) {
+      if (!postgres || storage._impl === postgres) return false;
+      const nowMs = Date.now();
+      if (!options.force && nowMs - lastRecoveryAttemptMs < STORAGE_RETRY_INTERVAL_MS) return false;
+      if (recoveryPromise) return recoveryPromise;
+
+      lastRecoveryAttemptMs = nowMs;
+      initState.last_recovery_attempt_at = new Date(nowMs).toISOString();
+      recoveryPromise = postgres
+        .init()
+        .then(() => {
+          activateStorage(postgres);
+          initState.last_init_error = null;
+          initState.fallback_used = false;
+          initState.last_recovery_ok = true;
+          console.log("[storage] recovered postgres storage");
+          return true;
+        })
+        .catch((error) => {
+          initState.last_init_error = error?.message || "postgres_recovery_failed";
+          initState.fallback_used = true;
+          initState.last_recovery_ok = false;
+          console.error("[storage] postgres recovery failed", error);
+          return false;
+        })
+        .finally(() => {
+          recoveryPromise = null;
+        });
+      return recoveryPromise;
     },
     async ingestWebhook(...args) {
       await storage.ready();
@@ -3919,6 +3935,32 @@ function createStorage() {
       return storage._impl.updateBroadcastMessageStatus(...args);
     },
   };
+
+  function activateStorage(impl) {
+    storage.mode = impl.mode;
+    storage.diagnostics = impl.diagnostics;
+    storage._impl = impl;
+    initState.active_mode = impl.mode;
+  }
+
+  initPromise = base
+    .init()
+    .then(() => {
+      console.log(`[storage] mode=${base.mode}`);
+      initState.active_mode = base.mode;
+    })
+    .catch((error) => {
+      console.error(`[storage] init failed for mode=${base.mode}`, error);
+      initState.last_init_error = error?.message || "unknown_init_error";
+      if (postgres) {
+        console.log("[storage] falling back to json storage until postgres is ready");
+        const fallback = createJsonStorage();
+        activateStorage(fallback);
+        initState.fallback_used = true;
+        return fallback.init();
+      }
+      throw error;
+    });
 
   return storage;
 }
@@ -4602,6 +4644,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   if (req.method === "GET" && parsed.pathname === "/health") {
+    await storage.ready();
     return sendJson(res, 200, {
       ok: true,
       now: new Date().toISOString(),
@@ -4633,6 +4676,8 @@ const server = http.createServer(async (req, res) => {
         active_mode: storage.initState?.active_mode || storage.mode,
         fallback_used: Boolean(storage.initState?.fallback_used),
         last_init_error: storage.initState?.last_init_error || null,
+        last_recovery_attempt_at: storage.initState?.last_recovery_attempt_at || "",
+        last_recovery_ok: storage.initState?.last_recovery_ok,
         database_url_configured: Boolean(DATABASE_URL),
         pg_module_available: Boolean(Pool),
       },
