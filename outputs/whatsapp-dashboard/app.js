@@ -2410,7 +2410,7 @@ function renderBroadcasts() {
       <div class="metric-grid four">
         ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
         ${metric("Broadcast revenue", formatMoney(attributedRevenue, "INR"), "From Shopify attribution")}
-        ${metric("Sent via campaigns", sentMessages, "Meta accepted campaign messages")}
+        ${metric("Accepted by Meta", sentMessages, "Delivery updates arrive from webhooks")}
         ${metric("Scheduled", scheduled, scheduled ? "Ready in campaign queue" : "No scheduled sends")}
       </div>
 
@@ -2447,25 +2447,37 @@ function renderBroadcastCampaigns() {
   if (!savedBroadcasts.length) {
     return emptyPanel("No campaign drafts yet", "Create a broadcast to save the audience, template, schedule and UTM plan.", "Create broadcast", "open-broadcast-builder");
   }
-  const rows = savedBroadcasts.map((draft) => `
-    <tr>
-      <td>
-        <span class="row-title">${escapeHtml(draft.name)}</span>
-        <div class="row-subtle">${escapeHtml(draft.template_name)} - ${escapeHtml(draft.audience_label || "Audience saved")}</div>
-      </td>
-      <td><span class="badge ${broadcastStatusTone(draft.status)}">${escapeHtml(broadcastStatusLabel(draft.status))}</span></td>
-      <td>${escapeHtml(formatCampaignSchedule(draft))}</td>
-      <td>${draft.recipient_count || 0}</td>
-      <td>${draft.analytics?.delivered || 0}/${draft.analytics?.sent || 0}</td>
-      <td>${draft.analytics?.read_rate || 0}%</td>
-      <td>${formatMoney(draft.analytics?.attributed_revenue || 0, draft.analytics?.currency || "INR")}</td>
-      <td>${draft.analytics?.order_rate || 0}%</td>
-      <td>
-        <button class="ghost-button" data-action="open-broadcast-report" data-campaign-id="${escapeHtml(draft.id)}">Report</button>
-        <button class="ghost-button" data-action="open-broadcast-builder">Duplicate</button>
-      </td>
-    </tr>
-  `).join("");
+  const rows = savedBroadcasts.map((draft) => {
+    const acceptedCount = Number(draft.analytics?.sent || 0);
+    const deliveredCount = Number(draft.analytics?.delivered || 0);
+    const failedCount = Number(draft.analytics?.failed || 0);
+    const pendingCopy = draft.status === "accepted" && acceptedCount
+      ? "Accepted by Meta, waiting for delivery webhook"
+      : draft.status === "failed"
+        ? (draft.last_send_error || "Meta rejected this send")
+        : "";
+    return `
+      <tr>
+        <td>
+          <span class="row-title">${escapeHtml(draft.name)}</span>
+          <div class="row-subtle">${escapeHtml(draft.template_name)} - ${escapeHtml(draft.audience_label || "Audience saved")}</div>
+          ${pendingCopy ? `<div class="row-warning">${escapeHtml(pendingCopy)}</div>` : ""}
+        </td>
+        <td><span class="badge ${broadcastStatusTone(draft.status)}">${escapeHtml(broadcastStatusLabel(draft.status))}</span></td>
+        <td>${escapeHtml(formatCampaignSchedule(draft))}</td>
+        <td>${draft.recipient_count || 0}</td>
+        <td>${deliveredCount}/${acceptedCount}</td>
+        <td>${draft.analytics?.read_rate || 0}%</td>
+        <td>${formatMoney(draft.analytics?.attributed_revenue || 0, draft.analytics?.currency || "INR")}</td>
+        <td>${draft.analytics?.order_rate || 0}%</td>
+        <td>
+          <button class="ghost-button" data-action="open-broadcast-report" data-campaign-id="${escapeHtml(draft.id)}">Report</button>
+          <button class="ghost-button" data-action="open-broadcast-builder">Duplicate</button>
+          ${failedCount ? `<span class="badge red">${failedCount} failed</span>` : ""}
+        </td>
+      </tr>
+    `;
+  }).join("");
   return table(["Campaign", "Status", "Send Time", "Recipients", "Delivered", "Read Rate", "Revenue", "Order Rate", ""], rows);
 }
 
@@ -2481,7 +2493,7 @@ function openBroadcastReportModal(campaignId) {
     `
       <div class="page-stack">
         <div class="metric-grid four">
-          ${metric("Sent", analytics.sent || 0, "Accepted by Meta")}
+          ${metric("Accepted", analytics.sent || 0, "Accepted by Meta")}
           ${metric("Delivered", analytics.delivered || 0, `${analytics.delivery_rate || 0}% delivery rate`)}
           ${metric("Read", analytics.read || 0, `${analytics.read_rate || 0}% read rate`)}
           ${metric("Revenue", formatMoney(analytics.attributed_revenue || 0, analytics.currency || "INR"), `${analytics.attributed_orders || 0} attributed orders`)}
@@ -2506,14 +2518,16 @@ function openBroadcastReportModal(campaignId) {
 }
 
 function broadcastStatusLabel(status) {
-  const labels = { draft: "Draft", scheduled: "Scheduled", sent: "Sent", sending: "Sending" };
+  const labels = { draft: "Draft", scheduled: "Scheduled", accepted: "Accepted", sent: "Sent", sending: "Sending", failed: "Failed" };
   return labels[status] || status || "Draft";
 }
 
 function broadcastStatusTone(status) {
   if (status === "sent") return "green";
+  if (status === "accepted") return "blue";
   if (status === "scheduled") return "blue";
   if (status === "sending") return "orange";
+  if (status === "failed") return "red";
   return "gray";
 }
 
@@ -2521,6 +2535,8 @@ function formatCampaignSchedule(campaign) {
   if (campaign.send_mode === "later" || campaign.status === "scheduled") {
     return campaign.scheduled_at ? formatContextDate(campaign.scheduled_at) : "Scheduled";
   }
+  if (campaign.status === "accepted") return `Accepted ${formatClientRelative(campaign.updated_at)} ago`;
+  if (campaign.status === "failed") return `Failed ${formatClientRelative(campaign.updated_at)} ago`;
   if (campaign.status === "sent") return `Sent ${formatClientRelative(campaign.updated_at)} ago`;
   return "Draft";
 }
@@ -3928,7 +3944,8 @@ async function sendBroadcastLive() {
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.ok === false) {
-      throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
+      const failedReason = (result.results || []).find((item) => !item.ok)?.reason;
+      throw new Error(failedReason || result?.error?.message || result?.error || "Broadcast failed.");
     }
 
     closeModal();
@@ -3943,8 +3960,8 @@ async function sendBroadcastLive() {
     render();
     const failed = Number(result.failed || 0);
     const message = failed
-      ? `Broadcast sent to ${result.accepted}/${result.total}. ${failed} failed.`
-      : `Broadcast sent to ${result.accepted}/${result.total} customers.`;
+      ? `Meta accepted ${result.accepted}/${result.total}. ${failed} failed.`
+      : `Meta accepted ${result.accepted}/${result.total}. Waiting for delivery status.`;
     showToast(message, 4500);
   } catch (error) {
     showToast(error.message || "Could not send broadcast.", 4500);

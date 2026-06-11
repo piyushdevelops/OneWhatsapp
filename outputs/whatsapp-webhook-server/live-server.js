@@ -41,6 +41,7 @@ const PLATFORM_STATE_FILE = process.env.PLATFORM_STATE_FILE || path.join(DATA_DI
 const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
 const BROADCAST_SCHEDULER_INTERVAL_MS = Number(process.env.BROADCAST_SCHEDULER_INTERVAL_MS || 60000);
 const BROADCAST_ATTRIBUTION_WINDOW_DAYS = Number(process.env.BROADCAST_ATTRIBUTION_WINDOW_DAYS || 14);
+const MAX_PENDING_BROADCAST_STATUSES = 500;
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -356,9 +357,12 @@ function readPlatformState() {
       segments: Array.isArray(parsed.segments) ? parsed.segments : [],
       broadcasts: Array.isArray(parsed.broadcasts) ? parsed.broadcasts : [],
       customerSync: parsed.customerSync && typeof parsed.customerSync === "object" ? parsed.customerSync : {},
+      pendingBroadcastStatuses: parsed.pendingBroadcastStatuses && typeof parsed.pendingBroadcastStatuses === "object"
+        ? parsed.pendingBroadcastStatuses
+        : {},
     };
   } catch {
-    return { segments: [], broadcasts: [], customerSync: {} };
+    return { segments: [], broadcasts: [], customerSync: {}, pendingBroadcastStatuses: {} };
   }
 }
 
@@ -371,11 +375,48 @@ function writePlatformState(state) {
         segments: Array.isArray(state.segments) ? state.segments : [],
         broadcasts: Array.isArray(state.broadcasts) ? state.broadcasts : [],
         customerSync: state.customerSync && typeof state.customerSync === "object" ? state.customerSync : {},
+        pendingBroadcastStatuses: state.pendingBroadcastStatuses && typeof state.pendingBroadcastStatuses === "object"
+          ? state.pendingBroadcastStatuses
+          : {},
       },
       null,
       2
     )
   );
+}
+
+function rememberPendingBroadcastStatus(status, receivedAt = new Date().toISOString()) {
+  if (!status?.id) return;
+  const platform = readPlatformState();
+  const pending = {
+    ...(platform.pendingBroadcastStatuses || {}),
+    [status.id]: {
+      status,
+      received_at: receivedAt,
+      stored_at: new Date().toISOString(),
+    },
+  };
+  const trimmed = Object.entries(pending)
+    .sort((left, right) => new Date(right[1]?.stored_at || 0) - new Date(left[1]?.stored_at || 0))
+    .slice(0, MAX_PENDING_BROADCAST_STATUSES);
+  writePlatformState({
+    ...platform,
+    pendingBroadcastStatuses: Object.fromEntries(trimmed),
+  });
+}
+
+function consumePendingBroadcastStatus(providerMessageId) {
+  if (!providerMessageId) return null;
+  const platform = readPlatformState();
+  const pending = platform.pendingBroadcastStatuses || {};
+  const item = pending[providerMessageId] || null;
+  if (!item) return null;
+  delete pending[providerMessageId];
+  writePlatformState({
+    ...platform,
+    pendingBroadcastStatuses: pending,
+  });
+  return item;
 }
 
 function normalizeAudienceSegment(input = {}) {
@@ -2006,6 +2047,18 @@ function createJsonStorage() {
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }));
+    for (const record of records) {
+      const pending = platform.pendingBroadcastStatuses?.[record.provider_message_id] || null;
+      if (!pending?.status) continue;
+      delete platform.pendingBroadcastStatuses[record.provider_message_id];
+      record.status = pending.status.status || record.status;
+      record.error_message = pending.status.errors?.[0]?.title || pending.status.errors?.[0]?.message || record.error_message || "";
+      record.updated_at = new Date().toISOString();
+      if (pending.status.status === "sent" && !record.sent_at) record.sent_at = fromProviderTimestamp(pending.status.timestamp, pending.received_at);
+      if (pending.status.status === "delivered" && !record.delivered_at) record.delivered_at = fromProviderTimestamp(pending.status.timestamp, pending.received_at);
+      if (pending.status.status === "read" && !record.read_at) record.read_at = fromProviderTimestamp(pending.status.timestamp, pending.received_at);
+      if (pending.status.status === "failed" && !record.failed_at) record.failed_at = fromProviderTimestamp(pending.status.timestamp, pending.received_at);
+    }
     campaign.messages = [...(campaign.messages || []), ...records];
     campaign.updated_at = new Date().toISOString();
     writePlatformState(platform);
@@ -2028,7 +2081,19 @@ function createJsonStorage() {
         changed = true;
       }
     }
-    if (changed) writePlatformState(platform);
+    if (changed) {
+      for (const campaign of platform.broadcasts) {
+        if (!campaign.messages?.some((message) => message.provider_message_id === status.id)) continue;
+        if (["sent", "delivered", "read"].includes(status.status)) {
+          campaign.status = "sent";
+          campaign.last_send_error = "";
+          campaign.updated_at = new Date().toISOString();
+        }
+      }
+      writePlatformState(platform);
+    } else {
+      rememberPendingBroadcastStatus(status);
+    }
   }
 
   return {
@@ -3496,6 +3561,10 @@ function createPostgresStorage() {
         ]
       );
       records.push(result.rows[0]);
+      const pending = consumePendingBroadcastStatus(item.provider_message_id);
+      if (pending?.status) {
+        await updateBroadcastMessageStatus(pending.status, pending.received_at);
+      }
     }
     return records;
   }
@@ -3503,7 +3572,7 @@ function createPostgresStorage() {
   async function updateBroadcastMessageStatus(status, receivedAt = new Date().toISOString()) {
     const statusTime = fromProviderTimestamp(status.timestamp, receivedAt);
     const errorMessage = status.errors?.[0]?.title || status.errors?.[0]?.message || "";
-    await query(
+    const result = await query(
       `
       update broadcast_messages
       set status = $2,
@@ -3514,9 +3583,60 @@ function createPostgresStorage() {
           failed_at = case when $2 = 'failed' and failed_at is null then $4 else failed_at end,
           updated_at = now()
       where provider_message_id = $1
+      returning campaign_id
       `,
       [status.id, status.status || "sent", errorMessage, statusTime]
     );
+    if (!result.rowCount) {
+      rememberPendingBroadcastStatus(status, receivedAt);
+      return;
+    }
+
+    const campaignIds = Array.from(new Set(result.rows.map((row) => row.campaign_id).filter(Boolean)));
+    for (const campaignId of campaignIds) {
+      if (["sent", "delivered", "read"].includes(status.status)) {
+        await query(
+          `
+          update broadcast_campaigns
+          set status = 'sent',
+              last_send_error = null,
+              updated_at = now()
+          where id = $1
+            and organization_id = $2
+            and status in ('accepted', 'sending', 'sent')
+          `,
+          [campaignId, await ensureOrganization()]
+        );
+      }
+      if (status.status === "failed") {
+        const summary = await query(
+          `
+          select
+            count(*) filter (where status in ('submitted', 'sent', 'delivered', 'read'))::int as active_count,
+            count(*) filter (where status = 'failed')::int as failed_count
+          from broadcast_messages
+          where campaign_id = $1
+            and organization_id = $2
+          `,
+          [campaignId, await ensureOrganization()]
+        );
+        const activeCount = Number(summary.rows[0]?.active_count || 0);
+        const failedCount = Number(summary.rows[0]?.failed_count || 0);
+        if (!activeCount && failedCount) {
+          await query(
+            `
+            update broadcast_campaigns
+            set status = 'failed',
+                last_send_error = $3,
+                updated_at = now()
+            where id = $1
+              and organization_id = $2
+            `,
+            [campaignId, await ensureOrganization(), errorMessage || "Meta reported delivery failure"]
+          );
+        }
+      }
+    }
   }
 
   async function attributeBroadcastRevenue(event, payload) {
@@ -3545,7 +3665,7 @@ function createPostgresStorage() {
           and bm.sent_at <= $4
           and bm.sent_at >= ($4::timestamptz - ($5::int * interval '1 day'))
         where bc.organization_id = $1
-          and bc.status in ('sent', 'scheduled')
+          and bc.status in ('accepted', 'sent', 'scheduled')
           and (
             (bc.utm_campaign is not null and bc.utm_campaign <> '' and $2 ilike '%' || lower(bc.utm_campaign) || '%')
             or (bc.utm_source is not null and bc.utm_source <> '' and $2 ilike '%' || lower(bc.utm_source) || '%')
@@ -3801,13 +3921,13 @@ async function executeBroadcastCampaign(campaign) {
     });
   }
 
-  await storage.recordBroadcastMessages(campaign.id, results);
   const accepted = results.filter((item) => item.ok).length;
   await storage.markBroadcastCampaignStatus(
     campaign.id,
-    accepted > 0 ? "sent" : "failed",
+    accepted > 0 ? "accepted" : "failed",
     accepted > 0 ? {} : { last_send_error: results[0]?.reason || "scheduled_broadcast_failed" }
   );
+  await storage.recordBroadcastMessages(campaign.id, results);
   return {
     ok: accepted > 0,
     accepted,
@@ -4177,12 +4297,12 @@ async function handleApi(req, res, parsed) {
 
       const accepted = results.filter((item) => item.ok).length;
       if (body.campaign_id) {
-        await storage.recordBroadcastMessages(String(body.campaign_id), results);
         await storage.markBroadcastCampaignStatus(
           String(body.campaign_id),
-          accepted > 0 ? "sent" : "failed",
+          accepted > 0 ? "accepted" : "failed",
           accepted > 0 ? {} : { last_send_error: results[0]?.reason || "broadcast_send_failed" }
         );
+        await storage.recordBroadcastMessages(String(body.campaign_id), results);
       }
       return sendJson(res, 200, {
         ok: accepted > 0,
