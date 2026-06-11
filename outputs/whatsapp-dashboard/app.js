@@ -786,21 +786,35 @@ async function syncShopifyCustomers() {
   customersLoading = true;
   customersLastError = "";
   render();
+  let pageInfo = "";
+  let synced = 0;
+  let skipped = 0;
+  let totalSeen = 0;
   try {
-    const response = await fetch(`${INBOX_API_BASE}/api/shopify/sync-customers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || payload.ok === false) {
-      throw new Error(payload?.error?.message || payload?.error || `Shopify sync returned ${response.status}`);
+    for (let page = 0; page < 100; page += 1) {
+      const url = new URL(`${INBOX_API_BASE}/api/shopify/sync-customers`);
+      url.searchParams.set("pages", "1");
+      if (pageInfo) url.searchParams.set("page_info", pageInfo);
+      const response = await fetch(url.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload?.error?.message || payload?.error || `Shopify sync returned ${response.status}`);
+      }
+      synced += Number(payload.synced || 0);
+      skipped += Number(payload.skipped || 0);
+      totalSeen += Number(payload.total_seen || 0);
+      pageInfo = payload.next_page_info || "";
+      if (!pageInfo) break;
     }
     customersLoadedAt = 0;
     customersLoading = false;
     await loadCustomers({ force: true });
-    showToast(`Synced ${payload.synced || 0} Shopify customers${payload.skipped ? `, skipped ${payload.skipped} without phone` : ""}.`);
+    showToast(`Synced ${synced} Shopify customers${skipped ? `, skipped ${skipped} without phone` : ""}.`);
   } catch (error) {
-    customersLastError = error.message || "Shopify customer sync failed";
+    customersLastError = `${error.message || "Shopify customer sync failed"}${totalSeen ? ` after checking ${totalSeen} customers` : ""}`;
     showToast(customersLastError);
   } finally {
     customersLoading = false;

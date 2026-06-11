@@ -1427,9 +1427,9 @@ function normalizeShopifyContactAttributes(customer) {
   };
 }
 
-async function fetchShopifyCustomers(maxPages = 50) {
+async function fetchShopifyCustomers(maxPages = 1, startPageInfo = "") {
   const customers = [];
-  let pageInfo = "";
+  let pageInfo = startPageInfo || "";
   let pages = 0;
 
   do {
@@ -1459,9 +1459,11 @@ async function fetchShopifyCustomers(maxPages = 50) {
       customers,
       pages,
       truncated: Boolean(pageInfo),
+      next_page_info: pageInfo,
     },
     customers,
     pages,
+    nextPageInfo: pageInfo,
   };
 }
 
@@ -4123,30 +4125,46 @@ async function handleApi(req, res, parsed) {
   }
 
   if (req.method === "POST" && parsed.pathname === "/api/shopify/sync-customers") {
-    const maxPages = Math.max(1, Math.min(100, Number(parsed.searchParams.get("pages") || 50) || 50));
-    const result = await fetchShopifyCustomers(maxPages);
-    if (!result.ok) {
-      return sendJson(res, result.status || 500, {
+    try {
+      const maxPages = Math.max(1, Math.min(5, Number(parsed.searchParams.get("pages") || 1) || 1));
+      const pageInfo = parsed.searchParams.get("page_info") || "";
+      const result = await fetchShopifyCustomers(maxPages, pageInfo);
+      if (!result.ok) {
+        return sendJson(res, result.status || 500, {
+          ok: false,
+          error: result.payload?.errors || result.payload?.error || result.payload || "shopify_customer_sync_failed",
+          synced: 0,
+          skipped: 0,
+          total_seen: result.customers?.length || 0,
+          pages: result.pages || 0,
+          next_page_info: "",
+        });
+      }
+
+      const saved = await storage.upsertShopifyCustomers(result.customers);
+      return sendJson(res, 200, {
+        ok: true,
+        synced: saved.synced || 0,
+        skipped: saved.skipped || 0,
+        total_seen: result.customers.length,
+        pages: result.pages || result.payload?.pages || 0,
+        truncated: Boolean(result.payload?.truncated),
+        next_page_info: result.nextPageInfo || result.payload?.next_page_info || "",
+        errors: saved.errors || [],
+        note: saved.note || "",
+      });
+    } catch (error) {
+      console.log(`[shopify.sync_customers] failed error=${error?.message || "unknown"}`);
+      return sendJson(res, 500, {
         ok: false,
-        error: result.payload?.errors || result.payload?.error || result.payload || "shopify_customer_sync_failed",
+        error: error?.message || "shopify_customer_sync_failed",
         synced: 0,
         skipped: 0,
-        total_seen: result.customers?.length || 0,
-        pages: result.pages || 0,
+        total_seen: 0,
+        pages: 0,
+        next_page_info: "",
       });
     }
-
-    const saved = await storage.upsertShopifyCustomers(result.customers);
-    return sendJson(res, 200, {
-      ok: true,
-      synced: saved.synced || 0,
-      skipped: saved.skipped || 0,
-      total_seen: result.customers.length,
-      pages: result.pages || result.payload?.pages || 0,
-      truncated: Boolean(result.payload?.truncated),
-      errors: saved.errors || [],
-      note: saved.note || "",
-    });
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/customers") {
