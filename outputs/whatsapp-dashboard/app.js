@@ -61,6 +61,7 @@ let savedBroadcasts = [];
 let savedBroadcastsLoading = false;
 let savedBroadcastsLoadedAt = 0;
 let savedBroadcastsLastError = "";
+let broadcastSending = false;
 let automationOverview = {
   mode: "observe",
   sends_enabled: false,
@@ -2405,6 +2406,13 @@ function renderBroadcasts() {
         </div>
       </section>
 
+      <div class="toolbar">
+        <div class="section-title">Campaigns</div>
+        <button class="secondary-button" data-action="refresh-broadcasts" title="Refresh delivery, read and revenue status">
+          <span aria-hidden="true">↻</span>
+          Refresh status
+        </button>
+      </div>
       ${savedBroadcastsLastError ? `<section class="panel pad"><span class="badge red">Campaign ledger issue</span><p class="setting-copy">${escapeHtml(savedBroadcastsLastError)}</p></section>` : ""}
       ${renderBroadcastCampaigns()}
       <div class="section-title">Approved Templates</div>
@@ -3626,11 +3634,11 @@ function filterBySearch(items, keys) {
   return items.filter((item) => keys.some((key) => String(item[key]).toLowerCase().includes(query)));
 }
 
-function showToast(message) {
+function showToast(message, duration = 2300) {
   toast.textContent = message;
   toast.classList.add("show");
   window.clearTimeout(showToast.timer);
-  showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2300);
+  showToast.timer = window.setTimeout(() => toast.classList.remove("show"), duration);
 }
 
 function setModalNotice(message, tone = "info") {
@@ -3859,6 +3867,10 @@ async function submitMetaTemplate() {
 }
 
 async function sendBroadcastLive() {
+  if (broadcastSending) {
+    showToast("Broadcast send is already running.");
+    return;
+  }
   const campaignPayload = collectBroadcastPayload("sending");
   const template_name = campaignPayload.template_name;
   const language = campaignPayload.template_language;
@@ -3880,25 +3892,51 @@ async function sendBroadcastLive() {
     return;
   }
 
-  const campaign = await saveBroadcastCampaignRecord(campaignPayload, { silent: true });
-  const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/send`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ campaign_id: campaign.id, template_name, language, variables, recipients }),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok || result.ok === false) {
-    throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
+  broadcastSending = true;
+  const sendButton = document.querySelector('[data-action="send-broadcast-live"]');
+  if (sendButton) {
+    sendButton.disabled = true;
+    sendButton.textContent = "Sending...";
   }
+  showToast(`Sending broadcast to ${recipients.length} customer${recipients.length === 1 ? "" : "s"}...`, 3200);
 
-  closeModal();
-  state.broadcastBuilderOpen = false;
-  inboxLoadedAt = 0;
-  savedBroadcastsLoadedAt = 0;
-  await loadInboxData({ force: true });
-  await loadSavedBroadcasts({ force: true });
-  render();
-  showToast(`Broadcast submitted: ${result.accepted}/${result.total} accepted by Meta.`);
+  try {
+    const campaign = await saveBroadcastCampaignRecord(campaignPayload, { silent: true, reload: false });
+    const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ campaign_id: campaign.id, template_name, language, variables, recipients }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || result.ok === false) {
+      throw new Error(result?.error?.message || result?.error || "Broadcast failed.");
+    }
+
+    closeModal();
+    state.broadcastBuilderOpen = false;
+    state.broadcastSegmentSeed = "";
+    inboxLoadedAt = 0;
+    savedBroadcastsLoadedAt = 0;
+    await Promise.all([
+      loadInboxData({ force: true }),
+      loadSavedBroadcasts({ force: true }),
+    ]);
+    render();
+    const failed = Number(result.failed || 0);
+    const message = failed
+      ? `Broadcast sent to ${result.accepted}/${result.total}. ${failed} failed.`
+      : `Broadcast sent to ${result.accepted}/${result.total} customers.`;
+    showToast(message, 4500);
+  } catch (error) {
+    showToast(error.message || "Could not send broadcast.", 4500);
+  } finally {
+    broadcastSending = false;
+    const currentSendButton = document.querySelector('[data-action="send-broadcast-live"]');
+    if (state.broadcastBuilderOpen && currentSendButton) {
+      currentSendButton.disabled = false;
+      currentSendButton.textContent = "Send broadcast";
+    }
+  }
 }
 
 function broadcastScheduledAt() {
@@ -3940,7 +3978,7 @@ function collectBroadcastPayload(status = "draft") {
   };
 }
 
-async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("draft"), { silent = false } = {}) {
+async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("draft"), { silent = false, reload = true } = {}) {
   if (!payload.template_name) throw new Error("Select an approved template first.");
   if (payload.send_mode === "later" && !payload.scheduled_at) throw new Error("Add schedule date and time.");
   const response = await fetch(`${INBOX_API_BASE}/api/broadcasts`, {
@@ -3953,7 +3991,7 @@ async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("dr
     throw new Error(result?.error || "Could not save campaign.");
   }
   savedBroadcastsLoadedAt = 0;
-  await loadSavedBroadcasts({ force: true });
+  if (reload) await loadSavedBroadcasts({ force: true });
   if (!silent) {
     closeModal();
     state.broadcastBuilderOpen = false;
@@ -4355,8 +4393,8 @@ function renderBroadcastBuilderPage() {
           </div>
         </div>
         <div class="builder-header-actions">
-          <button class="secondary-button" data-action="save-broadcast">Save Draft</button>
-          <button class="primary-button" data-action="send-broadcast-live">Send broadcast</button>
+          <button class="secondary-button" data-action="save-broadcast" ${broadcastSending ? "disabled" : ""}>Save Draft</button>
+          <button class="primary-button" data-action="send-broadcast-live" ${broadcastSending ? "disabled" : ""}>${broadcastSending ? "Sending..." : "Send broadcast"}</button>
         </div>
       </div>
 
@@ -5114,6 +5152,12 @@ document.addEventListener("click", (event) => {
       loadSystemStatus();
       showToast("Signals refreshed.");
     },
+    "refresh-broadcasts": () => {
+      savedBroadcastsLoadedAt = 0;
+      loadSavedBroadcasts({ force: true })
+        .then(() => showToast("Campaign delivery and read status refreshed."))
+        .catch((error) => showToast(error.message || "Could not refresh campaigns."));
+    },
     "simulate-automation-event": () => {
       simulateAutomationEvent().catch((error) => showToast(error.message || "Could not simulate trigger."));
     },
@@ -5222,9 +5266,7 @@ document.addEventListener("click", (event) => {
         { successMessage: "Template submitted to WhatsApp.", pendingDraftClear: false }
       ).catch((error) => showToast(error.message || "Could not send template."));
     },
-    "send-broadcast-live": () => {
-      sendBroadcastLive().catch((error) => showToast(error.message || "Could not send broadcast."));
-    },
+    "send-broadcast-live": () => sendBroadcastLive(),
     "add-node": () => showToast("Node added to canvas draft."),
     "new-flow": () => showToast("New flow draft created."),
     "previous-page": () => showToast("Previous page"),
