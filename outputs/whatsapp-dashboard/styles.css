@@ -1160,6 +1160,10 @@ h1 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.metric-grid.compact-metrics {
+  gap: 10px;
+}
+
 .metric-card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -1193,6 +1197,53 @@ h1 {
 
 .metric-delta.warn {
   color: var(--orange);
+}
+
+.customer-sync-monitor {
+  display: grid;
+  gap: 14px;
+  background:
+    linear-gradient(135deg, rgba(238, 249, 232, 0.95), rgba(255, 255, 255, 0.96) 46%, rgba(238, 244, 255, 0.88));
+  border-color: #d7e5dc;
+}
+
+.customer-sync-monitor .campaign-head {
+  align-items: flex-start;
+}
+
+.customer-sync-monitor .eyebrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.customer-sync-monitor .metric-card {
+  min-height: 88px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.8);
+  box-shadow: none;
+}
+
+.customer-sync-monitor .metric-value {
+  font-size: 22px;
+}
+
+.sync-progress-track {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(23, 33, 38, 0.08);
+}
+
+.sync-progress-track span {
+  display: block;
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--green), var(--cyan), var(--blue));
+  transition: width 0.35s ease;
 }
 
 .content-grid {

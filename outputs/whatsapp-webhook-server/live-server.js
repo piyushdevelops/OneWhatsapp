@@ -355,9 +355,10 @@ function readPlatformState() {
     return {
       segments: Array.isArray(parsed.segments) ? parsed.segments : [],
       broadcasts: Array.isArray(parsed.broadcasts) ? parsed.broadcasts : [],
+      customerSync: parsed.customerSync && typeof parsed.customerSync === "object" ? parsed.customerSync : {},
     };
   } catch {
-    return { segments: [], broadcasts: [] };
+    return { segments: [], broadcasts: [], customerSync: {} };
   }
 }
 
@@ -369,6 +370,7 @@ function writePlatformState(state) {
       {
         segments: Array.isArray(state.segments) ? state.segments : [],
         broadcasts: Array.isArray(state.broadcasts) ? state.broadcasts : [],
+        customerSync: state.customerSync && typeof state.customerSync === "object" ? state.customerSync : {},
       },
       null,
       2
@@ -575,6 +577,18 @@ function formatPhoneE164(waId) {
 
 function compactDigits(value) {
   return String(value || "").replace(/\D/g, "");
+}
+
+function errorText(value, fallback = "unknown_error") {
+  if (!value) return fallback;
+  if (typeof value === "string") return value;
+  if (value.message) return String(value.message);
+  if (Array.isArray(value)) return value.map((item) => errorText(item, "")).filter(Boolean).join(", ") || fallback;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return fallback;
+  }
 }
 
 function topicEventType(topic) {
@@ -1467,6 +1481,24 @@ async function fetchShopifyCustomers(maxPages = 1, startPageInfo = "") {
   };
 }
 
+async function countShopifyCustomers() {
+  const result = await shopifyGet("customers/count.json");
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: result.status,
+      count: null,
+      error: errorText(result.payload?.errors || result.payload?.error || result.payload, "shopify_count_failed"),
+    };
+  }
+  return {
+    ok: true,
+    status: result.status,
+    count: Number(result.payload?.count || 0),
+    error: null,
+  };
+}
+
 function normalizeShopifySegment(node) {
   const count =
     node.customerCount ??
@@ -2048,6 +2080,18 @@ function createJsonStorage() {
         note: "Shopify customer sync requires Postgres storage.",
       };
     },
+    async customerSyncStatus() {
+      const platform = readPlatformState();
+      const contacts = await this.listContacts();
+      return {
+        total_contacts: contacts.length,
+        shopify_synced: 0,
+        whatsapp_contacts: contacts.length,
+        last_synced_at: platform.customerSync?.last_synced_at || "",
+        last_checked_at: platform.customerSync?.last_checked_at || "",
+        last_skipped: Number(platform.customerSync?.last_skipped || 0),
+      };
+    },
     async getConversation(id) {
       return buildInbox().find((item) => item.id === id) || null;
     },
@@ -2462,6 +2506,33 @@ function createPostgresStorage() {
     }
 
     return { synced, skipped, errors };
+  }
+
+  async function customerSyncStatus() {
+    const organizationId = await ensureOrganization();
+    const platform = readPlatformState();
+    const result = await query(
+      `
+      select
+        count(*)::int as total_contacts,
+        count(*) filter (where attributes->>'source' = 'shopify')::int as shopify_synced,
+        count(*) filter (where last_inbound_at is not null)::int as whatsapp_contacts,
+        max(updated_at) filter (where attributes->>'source' = 'shopify') as last_synced_at
+      from contacts
+      where organization_id = $1
+      `,
+      [organizationId]
+    );
+    const row = result.rows[0] || {};
+    return {
+      total_contacts: Number(row.total_contacts || 0),
+      shopify_synced: Number(row.shopify_synced || 0),
+      whatsapp_contacts: Number(row.whatsapp_contacts || 0),
+      last_synced_at: row.last_synced_at || platform.customerSync?.last_synced_at || "",
+      last_checked_at: platform.customerSync?.last_checked_at || "",
+      last_skipped: Number(platform.customerSync?.last_skipped || 0),
+      last_total_seen: Number(platform.customerSync?.last_total_seen || 0),
+    };
   }
 
   async function listContacts() {
@@ -3541,6 +3612,7 @@ function createPostgresStorage() {
     ingestWebhook,
     listContacts,
     upsertShopifyCustomers,
+    customerSyncStatus,
     listConversations,
     getConversation,
     saveReply,
@@ -3614,6 +3686,10 @@ function createStorage() {
     async upsertShopifyCustomers(...args) {
       await storage.ready();
       return storage._impl.upsertShopifyCustomers(...args);
+    },
+    async customerSyncStatus(...args) {
+      await storage.ready();
+      return storage._impl.customerSyncStatus(...args);
     },
     async getConversation(id) {
       await storage.ready();
@@ -4142,6 +4218,20 @@ async function handleApi(req, res, parsed) {
       }
 
       const saved = await storage.upsertShopifyCustomers(result.customers);
+      const checkedAt = new Date().toISOString();
+      const platform = readPlatformState();
+      writePlatformState({
+        ...platform,
+        customerSync: {
+          ...(platform.customerSync || {}),
+          last_checked_at: checkedAt,
+          last_synced_at: saved.synced ? checkedAt : platform.customerSync?.last_synced_at || "",
+          last_total_seen: result.customers.length,
+          last_skipped: saved.skipped || 0,
+          last_error: saved.errors?.[0]?.reason || "",
+        },
+      });
+      const status = await storage.customerSyncStatus();
       return sendJson(res, 200, {
         ok: true,
         synced: saved.synced || 0,
@@ -4152,6 +4242,7 @@ async function handleApi(req, res, parsed) {
         next_page_info: result.nextPageInfo || result.payload?.next_page_info || "",
         errors: saved.errors || [],
         note: saved.note || "",
+        status,
       });
     } catch (error) {
       console.log(`[shopify.sync_customers] failed error=${error?.message || "unknown"}`);
@@ -4167,8 +4258,23 @@ async function handleApi(req, res, parsed) {
     }
   }
 
+  if (req.method === "GET" && parsed.pathname === "/api/shopify/sync-status") {
+    const status = await storage.customerSyncStatus();
+    const shopifyCount = shopifyConfig().enabled ? await countShopifyCustomers() : { ok: false, count: null, error: "shopify_not_configured" };
+    return sendJson(res, 200, {
+      ok: true,
+      status: {
+        ...status,
+        total_available: shopifyCount.count,
+        total_available_ok: shopifyCount.ok,
+        total_available_error: shopifyCount.error || null,
+      },
+    });
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/customers") {
     const items = await storage.listContacts();
+    const status = await storage.customerSyncStatus();
     return sendJson(res, 200, {
       ok: true,
       items,
@@ -4177,6 +4283,7 @@ async function handleApi(req, res, parsed) {
         shopify: items.filter((item) => item.shopify?.matched || item.channel === "Shopify").length,
         whatsapp: items.filter((item) => item.conversation_id).length,
       },
+      sync_status: status,
     });
   }
 

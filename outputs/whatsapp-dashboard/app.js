@@ -39,6 +39,20 @@ let syncedCustomers = [];
 let customersLoading = false;
 let customersLoadedAt = 0;
 let customersLastError = "";
+let customerSyncStatus = {
+  loading: false,
+  syncing: false,
+  loadedAt: 0,
+  synced: 0,
+  totalAvailable: null,
+  totalContacts: 0,
+  whatsappContacts: 0,
+  skipped: 0,
+  checked: 0,
+  pages: 0,
+  lastSyncedAt: "",
+  lastError: "",
+};
 let savedSegments = [];
 let savedSegmentsLoading = false;
 let savedSegmentsLoadedAt = 0;
@@ -377,6 +391,32 @@ function normalizeAudienceCustomer(item) {
 
 function audienceCustomers() {
   return syncedCustomers.length ? syncedCustomers : liveCustomers();
+}
+
+function applyCustomerSyncStatus(status = {}) {
+  customerSyncStatus = {
+    ...customerSyncStatus,
+    synced: Number(status.shopify_synced ?? status.synced ?? customerSyncStatus.synced ?? 0),
+    totalAvailable: status.total_available === null || status.total_available === undefined ? customerSyncStatus.totalAvailable : Number(status.total_available),
+    totalContacts: Number(status.total_contacts ?? customerSyncStatus.totalContacts ?? 0),
+    whatsappContacts: Number(status.whatsapp_contacts ?? customerSyncStatus.whatsappContacts ?? 0),
+    skipped: Number(status.last_skipped ?? status.skipped ?? customerSyncStatus.skipped ?? 0),
+    lastSyncedAt: status.last_synced_at || customerSyncStatus.lastSyncedAt || "",
+    lastError: status.total_available_error || status.last_error || customerSyncStatus.lastError || "",
+  };
+}
+
+function customerSyncProgressText() {
+  if (customerSyncStatus.syncing) {
+    const total = customerSyncStatus.totalAvailable;
+    return total
+      ? `${customerSyncStatus.checked} checked / ${total} Shopify customers`
+      : `${customerSyncStatus.checked} Shopify customers checked`;
+  }
+  if (customerSyncStatus.totalAvailable !== null) {
+    return `${customerSyncStatus.synced} synced / ${customerSyncStatus.totalAvailable} Shopify customers`;
+  }
+  return `${customerSyncStatus.synced} Shopify customers synced`;
 }
 
 function customerShopifyStats(customer) {
@@ -772,6 +812,11 @@ async function loadCustomers({ force = false } = {}) {
       throw new Error(payload?.error?.message || payload?.error || `Customers returned ${response.status}`);
     }
     syncedCustomers = (payload.items || []).map(normalizeAudienceCustomer);
+    applyCustomerSyncStatus(payload.sync_status || {
+      shopify_synced: payload.counts?.shopify,
+      total_contacts: payload.counts?.total,
+      whatsapp_contacts: payload.counts?.whatsapp,
+    });
     customersLoadedAt = Date.now();
   } catch (error) {
     customersLastError = error.message || "Customer sync unavailable";
@@ -782,8 +827,36 @@ async function loadCustomers({ force = false } = {}) {
   }
 }
 
+async function loadCustomerSyncStatus({ force = false } = {}) {
+  if (customerSyncStatus.loading) return;
+  if (!force && Date.now() - customerSyncStatus.loadedAt < 60000) return;
+  customerSyncStatus = { ...customerSyncStatus, loading: true };
+  try {
+    const response = await fetch(`${INBOX_API_BASE}/api/shopify/sync-status`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Sync status returned ${response.status}`);
+    }
+    applyCustomerSyncStatus(payload.status || {});
+    customerSyncStatus.loadedAt = Date.now();
+  } catch (error) {
+    customerSyncStatus.lastError = error.message || "Sync status unavailable";
+    customerSyncStatus.loadedAt = Date.now();
+  } finally {
+    customerSyncStatus.loading = false;
+    if (state.screen === "audience") render();
+  }
+}
+
 async function syncShopifyCustomers() {
-  customersLoading = true;
+  customerSyncStatus = {
+    ...customerSyncStatus,
+    syncing: true,
+    checked: 0,
+    pages: 0,
+    skipped: 0,
+    lastError: "",
+  };
   customersLastError = "";
   render();
   let pageInfo = "";
@@ -806,18 +879,28 @@ async function syncShopifyCustomers() {
       synced += Number(payload.synced || 0);
       skipped += Number(payload.skipped || 0);
       totalSeen += Number(payload.total_seen || 0);
+      customerSyncStatus = {
+        ...customerSyncStatus,
+        synced: payload.status?.shopify_synced ?? customerSyncStatus.synced + Number(payload.synced || 0),
+        skipped,
+        checked: totalSeen,
+        pages: page + 1,
+        lastSyncedAt: payload.status?.last_synced_at || customerSyncStatus.lastSyncedAt,
+      };
+      render();
       pageInfo = payload.next_page_info || "";
       if (!pageInfo) break;
     }
     customersLoadedAt = 0;
-    customersLoading = false;
     await loadCustomers({ force: true });
+    await loadCustomerSyncStatus({ force: true });
     showToast(`Synced ${synced} Shopify customers${skipped ? `, skipped ${skipped} without phone` : ""}.`);
   } catch (error) {
     customersLastError = `${error.message || "Shopify customer sync failed"}${totalSeen ? ` after checking ${totalSeen} customers` : ""}`;
+    customerSyncStatus.lastError = customersLastError;
     showToast(customersLastError);
   } finally {
-    customersLoading = false;
+    customerSyncStatus.syncing = false;
     if (state.screen === "audience") render();
   }
 }
@@ -1406,6 +1489,7 @@ function setScreen(next) {
   }
   if (next === "audience") {
     loadCustomers({ force: true });
+    loadCustomerSyncStatus({ force: true });
     loadSavedSegments({ force: true });
   }
   if (next === "broadcasts") {
@@ -1855,6 +1939,7 @@ function legend(label, value, color) {
 
 function renderAudience() {
   loadCustomers();
+  loadCustomerSyncStatus();
   loadSavedSegments();
   if (state.segmentBuilderOpen) return renderSegmentBuilder();
   const customers = filterBySearch(audienceCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
@@ -1880,8 +1965,40 @@ function renderAudience() {
       <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
       ${customersLastError ? `<section class="panel pad"><span class="badge red">Customer sync issue</span><p class="setting-copy">${escapeHtml(customersLastError)}</p></section>` : ""}
       ${savedSegmentsLastError ? `<section class="panel pad"><span class="badge red">Segment storage issue</span><p class="setting-copy">${escapeHtml(savedSegmentsLastError)}</p></section>` : ""}
+      ${state.audienceTab === "profiles" ? renderCustomerSyncMonitor(customers) : ""}
       ${renderAudienceTab(customers, segments)}
     </div>
+  `;
+}
+
+function renderCustomerSyncMonitor(customers) {
+  const loadingSaved = customersLoading && !customersLoadedAt && !customers.length;
+  const total = customerSyncStatus.totalAvailable;
+  const synced = customerSyncStatus.synced || customers.filter((customer) => customer.channel === "Shopify" || customer.shopify?.matched).length;
+  const percent = total ? Math.min(100, Math.round((synced / total) * 100)) : (synced ? 100 : 0);
+  const lastSynced = customerSyncStatus.lastSyncedAt ? formatContextDate(customerSyncStatus.lastSyncedAt) : "Not synced yet";
+  const stateLabel = customerSyncStatus.syncing ? "Syncing now" : loadingSaved ? "Loading saved list" : synced ? "Saved" : "Ready to sync";
+  const stateTone = customerSyncStatus.syncing || loadingSaved ? "orange" : synced ? "green" : "gray";
+  return `
+    <section class="panel pad customer-sync-monitor">
+      <div class="campaign-head">
+        <div>
+          <span class="eyebrow">Shopify customer sync <span class="badge ${stateTone}">${escapeHtml(stateLabel)}</span></span>
+          <h2>${escapeHtml(customerSyncStatus.syncing ? "Syncing customers into CRM" : loadingSaved ? "Loading saved customers" : "Customer list is saved")}</h2>
+          <p>${escapeHtml(customerSyncStatus.syncing ? customerSyncProgressText() : "Synced Shopify contacts are saved in your Customers view and reused for segments and broadcasts.")}</p>
+        </div>
+        <button class="primary-button" data-action="sync-shopify-customers" ${customerSyncStatus.syncing ? "disabled" : ""}>${customerSyncStatus.syncing ? "Syncing..." : "Sync Shopify Customers"}</button>
+      </div>
+      <div class="sync-progress-track"><span style="width:${percent}%"></span></div>
+      <div class="metric-grid four compact-metrics">
+        ${metric("Shopify synced", synced, total === null ? "Saved contacts with phone" : `${percent}% of Shopify total`)}
+        ${metric("Shopify total", total === null ? "-" : total, customerSyncStatus.totalAvailable === null ? "Total check pending" : "Available in Shopify")}
+        ${metric("All customers", customerSyncStatus.totalContacts || customers.length, "WhatsApp + Shopify saved")}
+        ${metric("Last synced", lastSynced, customerSyncStatus.skipped ? `${customerSyncStatus.skipped} skipped without phone` : "Ready")}
+      </div>
+      ${loadingSaved ? `<p class="setting-copy">Pulling saved contacts from the server. Existing synced customers are not being re-imported.</p>` : ""}
+      ${customerSyncStatus.lastError ? `<p class="setting-copy"><span class="badge orange">Notice</span> ${escapeHtml(customerSyncStatus.lastError)}</p>` : ""}
+    </section>
   `;
 }
 
@@ -1908,6 +2025,9 @@ function renderAudienceTab(customers, segments) {
   }
   if (state.audienceTab === "shopify_segments") {
     return renderShopifySegmentsTable();
+  }
+  if (customersLoading && !customersLoadedAt && !customers.length) {
+    return emptyPanel("Loading saved customers", "Checking the saved Shopify and WhatsApp customer list.");
   }
   return customers.length
     ? renderCustomersTable(customers)
