@@ -11,6 +11,7 @@ const state = {
   replyDrafts: {},
   copilotPrompts: {},
   broadcastSegmentSeed: "",
+  broadcastAudienceSegmentId: "all_customers",
   segmentBuilderOpen: false,
   broadcastBuilderOpen: false,
   templateBuilderOpen: false,
@@ -474,7 +475,8 @@ function textContains(value, query) {
 
 function dateValue(value) {
   if (!value) return null;
-  const parsed = new Date(value);
+  const raw = String(value).trim();
+  const parsed = /^\d{10}$/.test(raw) ? new Date(Number(raw) * 1000) : new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
 }
@@ -528,21 +530,74 @@ function compareDateRule(actualValue, operator, expected) {
   return actual < target;
 }
 
+function eventDateWithinWindow(value, rule = {}) {
+  if (rule.window !== "within_last") return true;
+  const days = daysSince(value);
+  return days !== null && days <= Number(rule.window_value || 0);
+}
+
+function customerEventDates(customer, eventName, stats) {
+  const shopify = customer.shopify || {};
+  const orders = shopify.orders || [];
+  const rawEvents = [
+    ...(Array.isArray(customer.events) ? customer.events : []),
+    ...(Array.isArray(shopify.events) ? shopify.events : []),
+    ...(Array.isArray(shopify.checkouts) ? shopify.checkouts.map((checkout) => ({ ...checkout, type: "checkout_started" })) : []),
+  ];
+  const eventMatches = rawEvents
+    .filter((event) => {
+      const type = String(event.type || event.topic || event.name || event.event || "").toLowerCase();
+      if (eventName === "checkout_started") return /checkout|cart/.test(type);
+      if (eventName === "order_placed") return /orders\/create|orders\/paid|order_placed/.test(type);
+      if (eventName === "offline_order_placed") return /offline_order|pos|draft_orders\/create/.test(type);
+      if (eventName === "fulfillment_created") return /fulfillment/.test(type);
+      if (eventName === "order_cancelled") return /cancel/.test(type);
+      if (eventName === "order_refunded") return /refund/.test(type);
+      if (eventName === "whatsapp_message_received") return /whatsapp|message/.test(type);
+      return type.includes(eventName.replace(/_/g, "/")) || type.includes(eventName);
+    })
+    .map((event) => event.created_at || event.processed_at || event.timestamp || event.date)
+    .filter(Boolean);
+  if (eventMatches.length) return eventMatches;
+
+  if (["order_placed", "offline_order_placed"].includes(eventName)) {
+    return orders.map((order) => order.processed_at || order.created_at).filter(Boolean);
+  }
+  if (eventName === "fulfillment_created") {
+    return orders.flatMap((order) => order.fulfillments || []).map((fulfillment) => fulfillment.created_at || fulfillment.updated_at).filter(Boolean);
+  }
+  if (eventName === "order_cancelled") {
+    return orders
+      .filter((order) => order.cancelled_at || /cancel/i.test(order.fulfillment_status || ""))
+      .map((order) => order.cancelled_at || order.updated_at || order.processed_at || order.created_at)
+      .filter(Boolean);
+  }
+  if (eventName === "order_refunded") {
+    return orders.flatMap((order) => {
+      const refunds = Array.isArray(order.refunds) ? order.refunds : [];
+      if (refunds.length) return refunds.map((refund) => refund.created_at || refund.processed_at || order.updated_at);
+      return /refund/i.test(order.financial_status || "") ? [order.updated_at || order.processed_at || order.created_at] : [];
+    }).filter(Boolean);
+  }
+  if (eventName === "whatsapp_message_received") {
+    return (customer.messages || [])
+      .filter((message) => message.direction === "inbound" || message.from === "in")
+      .map((message) => message.timestamp || message.created_at || message.time)
+      .filter(Boolean);
+  }
+  if (eventName === "checkout_started") {
+    return [];
+  }
+  return [];
+}
+
 function segmentBuilderRuleMatches(customer, rule = {}) {
   const stats = customerShopifyStats(customer);
   const latestOrderDate = stats.latestOrder?.processed_at || stats.latestOrder?.created_at;
   if (rule.type === "event") {
-    let matched = false;
-    let supported = true;
-    if (["order_placed", "offline_order_placed"].includes(rule.event)) matched = stats.orderCount > 0;
-    else if (rule.event === "fulfillment_created") matched = Boolean(stats.fulfillmentStatus);
-    else if (rule.event === "order_cancelled") matched = /cancel/i.test(stats.fulfillmentStatus);
-    else if (rule.event === "order_refunded") matched = /refund/i.test(stats.financialStatus);
-    else if (rule.event === "whatsapp_message_received") matched = Boolean(customer.messages?.some((message) => message.direction === "inbound" || message.from));
-    else supported = false;
-    if (!supported) return false;
-    if (rule.occurrence === "zero_times") matched = !matched;
-    return matched;
+    const dates = customerEventDates(customer, rule.event, stats);
+    const matched = dates.some((date) => eventDateWithinWindow(date, rule));
+    return rule.occurrence === "zero_times" ? !matched : matched;
   }
   if (rule.type === "list") {
     const inList = rule.list === "all_whatsapp"
@@ -803,6 +858,11 @@ function recipientsForSegment(segmentId) {
   if (!segmentId || segmentId === "all_customers") return audienceCustomers();
   const segment = localSegments().find((item) => item.id === segmentId);
   return segment?.members || [];
+}
+
+function validBroadcastAudienceId(segments, requestedId) {
+  if (!requestedId || requestedId === "all_customers") return "all_customers";
+  return segments.some((segment) => segment.id === requestedId) ? requestedId : "all_customers";
 }
 
 async function loadCustomers({ force = false, limit = customerPreviewLimit } = {}) {
@@ -4491,8 +4551,9 @@ function broadcastBuilderData() {
   const templates = approvedTemplates();
   const customers = audienceCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
-  const seededSegmentId = state.broadcastSegmentSeed;
-  const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
+  const requestedSegmentId = state.broadcastAudienceSegmentId || state.broadcastSegmentSeed || "all_customers";
+  const selectedSegmentId = validBroadcastAudienceId(segments, requestedSegmentId);
+  state.broadcastAudienceSegmentId = selectedSegmentId;
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")} - ${escapeHtml(template.language || "en_US")}</option>`).join("")
@@ -4648,8 +4709,9 @@ function openBroadcastModal() {
   const templates = approvedTemplates();
   const customers = audienceCustomers();
   const segments = localSegments().filter((segment) => segment.size > 0);
-  const seededSegmentId = state.broadcastSegmentSeed;
-  const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
+  const seededSegmentId = state.broadcastAudienceSegmentId || state.broadcastSegmentSeed;
+  const selectedSegmentId = validBroadcastAudienceId(segments, seededSegmentId);
+  state.broadcastAudienceSegmentId = selectedSegmentId;
   state.broadcastSegmentSeed = "";
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
@@ -5197,7 +5259,9 @@ document.addEventListener("click", (event) => {
       render();
     },
     "open-broadcast-builder": () => {
-      state.broadcastSegmentSeed = actionTarget.dataset.segmentId || "";
+      const selectedAudienceId = actionTarget.dataset.segmentId || "all_customers";
+      state.broadcastSegmentSeed = selectedAudienceId;
+      state.broadcastAudienceSegmentId = selectedAudienceId;
       state.broadcastBuilderOpen = true;
       state.screen = "broadcasts";
       closeModal();
@@ -5206,6 +5270,7 @@ document.addEventListener("click", (event) => {
     "close-broadcast-builder": () => {
       state.broadcastBuilderOpen = false;
       state.broadcastSegmentSeed = "";
+      state.broadcastAudienceSegmentId = "all_customers";
       render();
     },
     "open-broadcast-report": () => openBroadcastReportModal(actionTarget.dataset.campaignId),
@@ -5472,6 +5537,7 @@ document.addEventListener("change", (event) => {
     updateTemplateLiveFields(target);
   }
   if (target.id === "broadcast-audience-segment") {
+    state.broadcastAudienceSegmentId = target.value || "all_customers";
     const recipients = broadcastEligibleCustomers(recipientsForSegment(target.value));
     const list = document.querySelector(".recipient-list");
     const count = document.getElementById("broadcast-recipient-count");
