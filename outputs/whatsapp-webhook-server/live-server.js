@@ -957,9 +957,39 @@ function outboundConfig(storageMode = "json") {
   };
 }
 
-function buildTemplateComponents(variables = []) {
-  const cleanVariables = Array.isArray(variables)
-    ? variables.map((item) => String(item || "").trim()).filter(Boolean)
+function sanitizeTemplateParameter(parameter) {
+  if (!parameter || typeof parameter !== "object") return null;
+  const type = parameter.type || "text";
+  if (type === "text") return { type: "text", text: String(parameter.text || "") };
+  if (type === "currency" || type === "date_time" || type === "image" || type === "document" || type === "video") {
+    return parameter;
+  }
+  return null;
+}
+
+function sanitizeTemplateComponent(component) {
+  if (!component || typeof component !== "object") return null;
+  const type = String(component.type || "").toLowerCase();
+  if (!["header", "body", "button"].includes(type)) return null;
+  const parameters = Array.isArray(component.parameters)
+    ? component.parameters.map(sanitizeTemplateParameter).filter(Boolean)
+    : [];
+  if (!parameters.length) return null;
+  const normalized = { type, parameters };
+  if (type === "button") {
+    normalized.sub_type = component.sub_type || component.subType || "url";
+    normalized.index = String(component.index ?? "0");
+  }
+  return normalized;
+}
+
+function buildTemplateComponents(request = {}) {
+  if (Array.isArray(request.components)) {
+    const components = request.components.map(sanitizeTemplateComponent).filter(Boolean);
+    return components.length ? components : undefined;
+  }
+  const cleanVariables = Array.isArray(request.variables)
+    ? request.variables.map((item) => String(item || "").trim()).filter(Boolean)
     : [];
   if (!cleanVariables.length) return undefined;
   return [
@@ -997,7 +1027,7 @@ function buildMetaMessagePayload(conversation, request) {
         language: {
           code: request.language || "en_US",
         },
-        components: buildTemplateComponents(request.variables),
+        components: buildTemplateComponents(request),
       },
     };
   }
@@ -1670,6 +1700,7 @@ function normalizeConversation(conversation, storageMode = "json") {
     delivery_mode: message.delivery_mode || "whatsapp",
     media_url: message.media_url || "",
     template_name: message.template_name || "",
+    error_message: message.error_message || "",
   }));
 
   const lastInboundAt =
@@ -1844,6 +1875,7 @@ function createJsonStorage() {
         delivery_mode: reply.delivery_mode || "local_only",
         media_url: reply.media_url || "",
         template_name: reply.template_name || "",
+        error_message: reply.error_message || "",
       });
       if (new Date(reply.created_at) >= new Date(conversation.last_message_at)) {
         conversation.last_message_at = reply.created_at;
@@ -2177,6 +2209,7 @@ function createJsonStorage() {
         : outbound.localOnly
           ? "local_only"
           : "whatsapp_failed";
+      const errorMessage = outbound.ok ? "" : (outbound.reason || outbound.payload?.error?.message || "");
 
       const reply = {
         id: `local_${Date.now()}`,
@@ -2190,6 +2223,7 @@ function createJsonStorage() {
         provider_message_id: outbound.providerMessageId || "",
         status,
         delivery_mode: deliveryMode,
+        error_message: errorMessage,
         created_at: new Date().toISOString(),
       };
       replies.push(reply);
@@ -2817,6 +2851,7 @@ function createPostgresStorage() {
         template_name,
         provider_message_id,
         status,
+        error_message,
         raw_payload,
         created_at
       from messages
@@ -2892,6 +2927,7 @@ function createPostgresStorage() {
       outbound_payload: outbound.payload || {},
       request_payload: outbound.request_payload || {},
     });
+    const errorMessage = outbound.ok ? "" : (outbound.reason || outbound.payload?.error?.message || "");
     const createdAt = new Date().toISOString();
     const result = await query(
       `
@@ -2908,12 +2944,13 @@ function createPostgresStorage() {
         template_name,
         provider_message_id,
         status,
+        error_message,
         raw_payload,
         queued_at,
         created_at,
         updated_at
       )
-      values ($1, $2, $3, $4, $5, 'outbound', $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $13, now())
+      values ($1, $2, $3, $4, $5, 'outbound', $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $14, now())
       returning id
       `,
       [
@@ -2928,6 +2965,7 @@ function createPostgresStorage() {
         request.template_name || "",
         outbound.providerMessageId || null,
         status,
+        errorMessage,
         rawPayload,
         createdAt,
       ]
@@ -2950,6 +2988,7 @@ function createPostgresStorage() {
       provider_message_id: outbound.providerMessageId || "",
       status,
       delivery_mode: deliveryMode,
+      error_message: errorMessage,
       created_at: createdAt,
     };
   }
@@ -4517,6 +4556,7 @@ async function handleApi(req, res, parsed) {
           status: reply.status,
           delivery_mode: reply.delivery_mode,
           provider_message_id: reply.provider_message_id,
+          error_message: reply.error_message || "",
         },
         outbound: {
           ok: outbound.ok,

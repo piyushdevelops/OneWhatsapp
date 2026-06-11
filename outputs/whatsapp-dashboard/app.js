@@ -161,6 +161,7 @@ function normalizeInboxConversation(item) {
     media_url: message.media_url || "",
     template_name: message.template_name || "",
     provider_message_id: message.provider_message_id || "",
+    error_message: message.error_message || message.error?.message || "",
   }));
 
   return {
@@ -1143,6 +1144,62 @@ async function loadMetaTemplates({ force = false } = {}) {
 
 function approvedTemplates() {
   return metaTemplates.filter((template) => template.status === "APPROVED");
+}
+
+function templateByNameLanguage(name, language) {
+  const cleanName = String(name || "").trim();
+  const cleanLanguage = String(language || "").trim();
+  return approvedTemplates().find((template) =>
+    template.name === cleanName && (!cleanLanguage || template.language === cleanLanguage)
+  ) || approvedTemplates().find((template) => template.name === cleanName) || null;
+}
+
+function templateBodyText(template) {
+  const bodyComponent = (template?.components || []).find((component) => component.type === "BODY") || {};
+  return bodyComponent.text || template?.body || "";
+}
+
+function templatePlaceholderCount(text) {
+  const matches = String(text || "").matchAll(/{{\s*(\d+)\s*}}/g);
+  const numbers = Array.from(matches).map((match) => Number(match[1])).filter(Boolean);
+  return numbers.length ? Math.max(...numbers) : 0;
+}
+
+function templateRequiredBodyVariables(template) {
+  return templatePlaceholderCount(templateBodyText(template));
+}
+
+function templateHasNonBodyVariables(template) {
+  return (template?.components || []).some((component) => {
+    if (component.type === "BODY") return false;
+    if (component.type === "HEADER" && templatePlaceholderCount(component.text || "")) return true;
+    if (component.type === "BUTTONS") {
+      return (component.buttons || []).some((button) => templatePlaceholderCount(button.url || button.text || ""));
+    }
+    return false;
+  });
+}
+
+function templateVariableHelp(template) {
+  if (!template) return "Sync templates first so the dashboard can validate language and variables.";
+  const bodyVars = templateRequiredBodyVariables(template);
+  const nonBodyNote = templateHasNonBodyVariables(template)
+    ? " This template also has header/button variables, so send it from Meta until component mapping is added."
+    : "";
+  if (!bodyVars) return `No body variables needed.${nonBodyNote}`;
+  return `Needs ${bodyVars} body value${bodyVars === 1 ? "" : "s"} for {{1}}${bodyVars > 1 ? ` to {{${bodyVars}}}` : ""}.${nonBodyNote}`;
+}
+
+function templateVariableProblem(template, variables) {
+  if (!template) return "";
+  if (templateHasNonBodyVariables(template)) {
+    return "This template has header or button variables. Send it from Meta for now, or remove those variables before broadcasting.";
+  }
+  const required = templateRequiredBodyVariables(template);
+  if (variables.length < required) {
+    return `This template needs ${required} variable value${required === 1 ? "" : "s"}. Add them in order: {{1}}, {{2}}, etc.`;
+  }
+  return "";
 }
 
 function templateUsageLabel(template) {
@@ -3003,7 +3060,11 @@ function messageContent(message) {
     type === "template" && message.template_name
       ? `<div class="message-template-name">${escapeHtml(message.template_name)}</div>`
       : "";
-  return `${label}${templateHint}<div>${body}</div>${link}`;
+  const failureReason =
+    message.from === "out" && message.status === "failed" && message.error_message
+      ? `<div class="message-error">${escapeHtml(message.error_message)}</div>`
+      : "";
+  return `${label}${templateHint}<div>${body}</div>${link}${failureReason}`;
 }
 
 function messageMeta(message) {
@@ -3752,26 +3813,54 @@ function openTemplateSendModal() {
     showToast("Select a conversation first.");
     return;
   }
+  const templates = approvedTemplates();
+  const firstTemplate = templates[0] || null;
+  const templateOptions = templates.map((template) =>
+    `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")} - ${escapeHtml(template.language || "en_US")}</option>`
+  ).join("");
   openModal(
     "Send approved template",
     `
       <div class="form-grid">
-        <div>
-          <label class="label">Template name</label>
-          <input id="template-live-name" class="field" placeholder="hello_world" />
-        </div>
+        ${templates.length ? `
+          <div>
+            <label class="label">Approved Meta template</label>
+            <select id="template-live-name" class="select">${templateOptions}</select>
+          </div>
+        ` : `
+          <div>
+            <label class="label">Template name</label>
+            <input id="template-live-name" class="field" placeholder="hello_world" />
+          </div>
+        `}
         <div>
           <label class="label">Language code</label>
-          <input id="template-live-language" class="field" placeholder="en_US" value="en_US" />
+          <input id="template-live-language" class="field" placeholder="en_US" value="${escapeHtml(firstTemplate?.language || "en_US")}" ${templates.length ? "readonly" : ""} />
         </div>
         <div class="wide">
           <label class="label">Variables</label>
           <input id="template-live-vars" class="field" placeholder="Piyush, #301887" />
+          <p id="template-live-help" class="setting-copy">${escapeHtml(templateVariableHelp(firstTemplate))}</p>
+        </div>
+        <div class="wide template-live-preview">
+          <span class="eyebrow">Preview</span>
+          <p id="template-live-preview">${escapeHtml(templateBodyText(firstTemplate) || "Select a synced Meta template to preview its approved body.")}</p>
         </div>
       </div>
     `,
     `<button class="ghost-button" data-action="close-modal">Cancel</button><button class="primary-button" data-action="send-template-live">Send template</button>`
   );
+}
+
+function updateTemplateLiveFields(select) {
+  const language = select?.selectedOptions?.[0]?.dataset.language || "en_US";
+  const template = templateByNameLanguage(select?.value, language);
+  const languageInput = document.getElementById("template-live-language");
+  const help = document.getElementById("template-live-help");
+  const preview = document.getElementById("template-live-preview");
+  if (languageInput) languageInput.value = language;
+  if (help) help.textContent = templateVariableHelp(template);
+  if (preview) preview.textContent = templateBodyText(template) || "No body text available.";
 }
 
 function splitVariables(value) {
@@ -3926,6 +4015,12 @@ async function sendBroadcastLive() {
     showToast("Confirm opt-in and approved template before sending.");
     return;
   }
+  const selectedTemplate = templateByNameLanguage(template_name, language);
+  const variableProblem = templateVariableProblem(selectedTemplate, variables);
+  if (variableProblem) {
+    showToast(variableProblem, 5500);
+    return;
+  }
 
   broadcastSending = true;
   const sendButton = document.querySelector('[data-action="send-broadcast-live"]');
@@ -3987,6 +4082,8 @@ function broadcastScheduledAt() {
 
 function collectBroadcastPayload(status = "draft") {
   const segmentSelect = document.getElementById("broadcast-audience-segment");
+  const templateSelect = document.getElementById("broadcast-template-name");
+  const selectedTemplateLanguage = templateSelect?.selectedOptions?.[0]?.dataset.language || "";
   const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
     .map((input) => input.value)
     .filter(Boolean);
@@ -3994,8 +4091,8 @@ function collectBroadcastPayload(status = "draft") {
   const sendMode = sendModeRaw === "later" ? "later" : "now";
   return {
     name: document.getElementById("broadcast-name")?.value?.trim() || `WhatsApp campaign ${new Date().toLocaleDateString()}`,
-    template_name: document.getElementById("broadcast-template-name")?.value || "",
-    template_language: document.getElementById("broadcast-template-language")?.value?.trim() || "en_US",
+    template_name: templateSelect?.value || "",
+    template_language: selectedTemplateLanguage || document.getElementById("broadcast-template-language")?.value?.trim() || "en_US",
     audience_segment_id: segmentSelect?.value || "all_customers",
     audience_label: segmentSelect?.selectedOptions?.[0]?.textContent || "All current WhatsApp customers",
     recipient_count: recipients.length,
@@ -4017,6 +4114,11 @@ function collectBroadcastPayload(status = "draft") {
 async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("draft"), { silent = false, reload = true } = {}) {
   if (!payload.template_name) throw new Error("Select an approved template first.");
   if (payload.send_mode === "later" && !payload.scheduled_at) throw new Error("Add schedule date and time.");
+  if (payload.status !== "draft") {
+    const selectedTemplate = templateByNameLanguage(payload.template_name, payload.template_language);
+    const variableProblem = templateVariableProblem(selectedTemplate, payload.variables || []);
+    if (variableProblem) throw new Error(variableProblem);
+  }
   const response = await fetch(`${INBOX_API_BASE}/api/broadcasts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -4393,7 +4495,7 @@ function broadcastBuilderData() {
   const selectedSegmentId = segments.some((segment) => segment.id === seededSegmentId) ? seededSegmentId : "all_customers";
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
-    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
+    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")} - ${escapeHtml(template.language || "en_US")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
     `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
@@ -4455,7 +4557,7 @@ function renderBroadcastBuilderPage() {
               </div>
               <div>
                 <label class="label">Language</label>
-                <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
+                <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" readonly />
               </div>
               <div>
                 <label class="label">Audience</label>
@@ -4500,6 +4602,7 @@ function renderBroadcastBuilderPage() {
               <div class="wide">
                 <label class="label">Template variables</label>
                 <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
+                <p id="broadcast-template-help" class="setting-copy">${escapeHtml(templateVariableHelp(templates[0] || null))}</p>
               </div>
             </div>
           </section>
@@ -4550,7 +4653,7 @@ function openBroadcastModal() {
   state.broadcastSegmentSeed = "";
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const templateOptions = templates.length
-    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")}</option>`).join("")
+    ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")} - ${escapeHtml(template.language || "en_US")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
     `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
@@ -4573,7 +4676,7 @@ function openBroadcastModal() {
             </div>
             <div>
               <label class="label">Language</label>
-              <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" />
+              <input id="broadcast-template-language" class="field" value="${escapeHtml(templates[0]?.language || "en_US")}" readonly />
             </div>
             <div>
               <label class="label">Audience</label>
@@ -4607,6 +4710,7 @@ function openBroadcastModal() {
           <div class="wide">
             <label class="label">Template variables</label>
             <input id="broadcast-template-vars" class="field" placeholder="Comma separated values for {{1}}, {{2}}" />
+            <p id="broadcast-template-help" class="setting-copy">${escapeHtml(templateVariableHelp(templates[0] || null))}</p>
           </div>
           <div class="checklist wide">
             <label><input id="broadcast-optin-check" type="checkbox" /> These contacts have WhatsApp opt-in.</label>
@@ -5303,6 +5407,12 @@ document.addEventListener("click", (event) => {
         showToast("Add the approved template name.");
         return;
       }
+      const selectedTemplate = templateByNameLanguage(template_name, language);
+      const variableProblem = templateVariableProblem(selectedTemplate, variables);
+      if (variableProblem) {
+        showToast(variableProblem, 5500);
+        return;
+      }
       sendConversationPayload(
         { type: "template", template_name, language, variables },
         { successMessage: "Template submitted to WhatsApp.", pendingDraftClear: false }
@@ -5354,6 +5464,12 @@ document.addEventListener("change", (event) => {
     const language = target.selectedOptions[0]?.dataset.language || "en_US";
     const input = document.getElementById("broadcast-template-language");
     if (input) input.value = language;
+    const template = templateByNameLanguage(target.value, language);
+    const help = document.getElementById("broadcast-template-help");
+    if (help) help.textContent = templateVariableHelp(template);
+  }
+  if (target.id === "template-live-name") {
+    updateTemplateLiveFields(target);
   }
   if (target.id === "broadcast-audience-segment") {
     const recipients = broadcastEligibleCustomers(recipientsForSegment(target.value));
