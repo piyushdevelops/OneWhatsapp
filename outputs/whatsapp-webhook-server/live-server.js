@@ -43,6 +43,15 @@ const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
 const BROADCAST_SCHEDULER_INTERVAL_MS = Number(process.env.BROADCAST_SCHEDULER_INTERVAL_MS || 60000);
 const BROADCAST_ATTRIBUTION_WINDOW_DAYS = Number(process.env.BROADCAST_ATTRIBUTION_WINDOW_DAYS || 14);
 const MAX_PENDING_BROADCAST_STATUSES = 500;
+const DB_CLEANUP_INTERVAL_MS = Number(process.env.DB_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000);
+const DB_WEBHOOK_EVENT_RETENTION_DAYS = Number(process.env.DB_WEBHOOK_EVENT_RETENTION_DAYS || 14);
+const DB_COMMERCE_EVENT_RETENTION_DAYS = Number(process.env.DB_COMMERCE_EVENT_RETENTION_DAYS || 180);
+const DB_AUTOMATION_RUN_RETENTION_DAYS = Number(process.env.DB_AUTOMATION_RUN_RETENTION_DAYS || 180);
+const DB_BROADCAST_MESSAGE_RETENTION_DAYS = Number(process.env.DB_BROADCAST_MESSAGE_RETENTION_DAYS || 180);
+const DB_MAX_WEBHOOK_EVENTS = Number(process.env.DB_MAX_WEBHOOK_EVENTS || 1000);
+const DB_MAX_COMMERCE_EVENTS = Number(process.env.DB_MAX_COMMERCE_EVENTS || 10000);
+const DB_MAX_AUTOMATION_RUNS = Number(process.env.DB_MAX_AUTOMATION_RUNS || 10000);
+const DB_MAX_BROADCAST_MESSAGES = Number(process.env.DB_MAX_BROADCAST_MESSAGES || 25000);
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -869,6 +878,138 @@ function extractSummary(payload) {
       wa_id: contact.wa_id,
       name: contact.profile?.name || "",
     })),
+  };
+}
+
+function compactMetaWebhookPayload(payload) {
+  const changes = (payload?.entry || []).flatMap((entry) => entry.changes || []);
+  return {
+    object: payload?.object || "whatsapp_business_account",
+    summary: extractSummary(payload || {}),
+    metadata: changes.map((change) => ({
+      field: change.field || "",
+      phone_number_id: change.value?.metadata?.phone_number_id || "",
+      display_phone_number: change.value?.metadata?.display_phone_number || "",
+    })),
+  };
+}
+
+function compactInboundMessagePayload(message) {
+  if (!message || typeof message !== "object") return {};
+  return {
+    id: message.id || "",
+    from: message.from || "",
+    type: message.type || "text",
+    text: extractInboundText(message),
+    timestamp: message.timestamp || "",
+    media_id: message.image?.id || message.document?.id || message.video?.id || "",
+    button: message.button?.text || "",
+    interactive:
+      message.interactive?.button_reply?.title ||
+      message.interactive?.list_reply?.title ||
+      "",
+  };
+}
+
+function compactStatusPayload(status) {
+  if (!status || typeof status !== "object") return {};
+  return {
+    id: status.id || "",
+    recipient_id: status.recipient_id || "",
+    status: status.status || "",
+    timestamp: status.timestamp || "",
+    conversation_id: status.conversation?.id || "",
+    errors: status.errors || [],
+  };
+}
+
+function compactShopifyEventPayload(payload) {
+  if (!payload || typeof payload !== "object") return {};
+  const customer = payload.customer || {};
+  const shipping = payload.shipping_address || {};
+  const billing = payload.billing_address || {};
+  return {
+    id: payload.id || payload.admin_graphql_api_id || payload.order_id || "",
+    name: payload.name || payload.order_number || "",
+    token: payload.token || payload.checkout_token || "",
+    created_at: payload.created_at || "",
+    updated_at: payload.updated_at || "",
+    processed_at: payload.processed_at || "",
+    total_price: payload.total_price || payload.current_total_price || payload.subtotal_price || "",
+    currency: payload.currency || payload.presentment_currency || "",
+    financial_status: payload.financial_status || "",
+    fulfillment_status: payload.fulfillment_status || "",
+    gateway: payload.gateway || "",
+    payment_gateway_names: payload.payment_gateway_names || [],
+    tags: payload.tags || "",
+    landing_site: payload.landing_site || "",
+    referring_site: payload.referring_site || "",
+    source_url: payload.source_url || "",
+    note_attributes: payload.note_attributes || [],
+    customer: {
+      id: customer.id || customer.admin_graphql_api_id || payload.customer_id || "",
+      email: customer.email || payload.email || "",
+      phone: customer.phone || payload.phone || "",
+      tags: customer.tags || "",
+    },
+    shipping_address: {
+      phone: shipping.phone || "",
+      city: shipping.city || "",
+      province: shipping.province || "",
+      country: shipping.country || "",
+      zip: shipping.zip || "",
+    },
+    billing_address: {
+      phone: billing.phone || "",
+      city: billing.city || "",
+      province: billing.province || "",
+      country: billing.country || "",
+      zip: billing.zip || "",
+    },
+    line_items: (payload.line_items || []).slice(0, 10).map((item) => ({
+      id: item.id || "",
+      product_id: item.product_id || "",
+      variant_id: item.variant_id || "",
+      title: item.title || item.name || "",
+      quantity: item.quantity || 0,
+      price: item.price || "",
+    })),
+  };
+}
+
+function compactOutboundStoragePayload(request, outbound) {
+  return {
+    delivery_mode: outbound.ok
+      ? "whatsapp"
+      : outbound.localOnly
+        ? "local_only"
+        : "whatsapp_failed",
+    request: {
+      type: request.type || "text",
+      body: request.body || "",
+      template_name: request.template_name || "",
+      language: request.language || "",
+      variables: Array.isArray(request.variables) ? request.variables : [],
+      link: request.link || "",
+      caption: request.caption || "",
+      filename: request.filename || "",
+    },
+    provider: {
+      ok: Boolean(outbound.ok),
+      reason: outbound.reason || "",
+      provider_message_id: outbound.providerMessageId || "",
+      error: outbound.payload?.error || null,
+    },
+  };
+}
+
+function compactBroadcastResultPayload(item) {
+  return {
+    recipient: item.recipient || "",
+    ok: Boolean(item.ok),
+    reason: item.reason || item.error?.message || "",
+    provider_message_id: item.provider_message_id || "",
+    error: item.error || null,
   };
 }
 
@@ -2244,6 +2385,25 @@ function createJsonStorage() {
     findDueBroadcastCampaigns,
     recordBroadcastMessages,
     updateBroadcastMessageStatus,
+    maintenanceStatus() {
+      return {
+        last_run_at: "",
+        last_deleted: {},
+        last_error: null,
+      };
+    },
+    async storageUsage() {
+      return {
+        database_bytes: 0,
+        tables: [],
+        maintenance: {
+          last_run_at: "",
+          last_deleted: {},
+          last_error: null,
+          retention_days: {},
+        },
+      };
+    },
   };
 }
 
@@ -2257,10 +2417,142 @@ function createPostgresStorage() {
 
   const state = {
     organizationId: "",
+    lastMaintenanceAt: "",
+    lastMaintenanceDeleted: {},
+    lastMaintenanceError: null,
   };
 
   async function query(text, params = []) {
     return pool.query(text, params);
+  }
+
+  async function countDelete(sql, params = []) {
+    const result = await query(sql, params);
+    return Number(result.rowCount || 0);
+  }
+
+  async function pruneByAgeAndCap(table, timestampColumn, retentionDays, maxRows) {
+    const days = Math.max(1, Number(retentionDays) || 1);
+    const cap = Math.max(100, Number(maxRows) || 100);
+    const deletedOld = await countDelete(
+      `
+      delete from ${table}
+      where ${timestampColumn} < now() - ($1::int * interval '1 day')
+      `,
+      [days]
+    );
+    const deletedOverflow = await countDelete(
+      `
+      with ranked as (
+        select id, row_number() over (order by ${timestampColumn} desc, id desc) as row_number
+        from ${table}
+      )
+      delete from ${table}
+      using ranked
+      where ${table}.id = ranked.id
+        and ranked.row_number > $1
+      `,
+      [cap]
+    );
+    return deletedOld + deletedOverflow;
+  }
+
+  async function runMaintenance(options = {}) {
+    const nowMs = Date.now();
+    if (
+      !options.force &&
+      state.lastMaintenanceAt &&
+      nowMs - new Date(state.lastMaintenanceAt).getTime() < DB_CLEANUP_INTERVAL_MS
+    ) {
+      return state.lastMaintenanceDeleted;
+    }
+
+    const deleted = {};
+    try {
+      deleted.webhook_events = await pruneByAgeAndCap(
+        "webhook_events",
+        "received_at",
+        DB_WEBHOOK_EVENT_RETENTION_DAYS,
+        DB_MAX_WEBHOOK_EVENTS
+      );
+      deleted.automation_runs = await pruneByAgeAndCap(
+        "automation_runs",
+        "created_at",
+        DB_AUTOMATION_RUN_RETENTION_DAYS,
+        DB_MAX_AUTOMATION_RUNS
+      );
+      deleted.commerce_events = await pruneByAgeAndCap(
+        "commerce_events",
+        "received_at",
+        DB_COMMERCE_EVENT_RETENTION_DAYS,
+        DB_MAX_COMMERCE_EVENTS
+      );
+      deleted.broadcast_messages = await pruneByAgeAndCap(
+        "broadcast_messages",
+        "created_at",
+        DB_BROADCAST_MESSAGE_RETENTION_DAYS,
+        DB_MAX_BROADCAST_MESSAGES
+      );
+
+      state.lastMaintenanceAt = new Date(nowMs).toISOString();
+      state.lastMaintenanceDeleted = deleted;
+      state.lastMaintenanceError = null;
+
+      try {
+        await query("vacuum analyze webhook_events");
+        await query("vacuum analyze commerce_events");
+        await query("vacuum analyze automation_runs");
+        await query("vacuum analyze broadcast_messages");
+      } catch (vacuumError) {
+        console.log(`[storage.maintenance] vacuum skipped: ${vacuumError.message}`);
+      }
+
+      const totalDeleted = Object.values(deleted).reduce((sum, value) => sum + Number(value || 0), 0);
+      if (totalDeleted) {
+        console.log(`[storage.maintenance] pruned=${JSON.stringify(deleted)}`);
+      }
+      return deleted;
+    } catch (error) {
+      state.lastMaintenanceAt = new Date(nowMs).toISOString();
+      state.lastMaintenanceError = error?.message || "maintenance_failed";
+      console.error("[storage.maintenance] failed", error);
+      return deleted;
+    }
+  }
+
+  async function storageUsage() {
+    const database = await query("select pg_database_size(current_database())::bigint as bytes");
+    const tables = await query(
+      `
+      select
+        relname as table_name,
+        pg_total_relation_size(c.oid)::bigint as bytes
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind = 'r'
+        and n.nspname = 'public'
+      order by pg_total_relation_size(c.oid) desc
+      limit 20
+      `
+    );
+    return {
+      database_bytes: Number(database.rows[0]?.bytes || 0),
+      tables: tables.rows.map((row) => ({
+        table_name: row.table_name,
+        bytes: Number(row.bytes || 0),
+      })),
+      maintenance: {
+        last_run_at: state.lastMaintenanceAt,
+        last_deleted: state.lastMaintenanceDeleted,
+        last_error: state.lastMaintenanceError,
+        retention_days: {
+          webhook_events: DB_WEBHOOK_EVENT_RETENTION_DAYS,
+          commerce_events: DB_COMMERCE_EVENT_RETENTION_DAYS,
+          automation_runs: DB_AUTOMATION_RUN_RETENTION_DAYS,
+          broadcast_messages: DB_BROADCAST_MESSAGE_RETENTION_DAYS,
+        },
+      },
+    };
   }
 
   async function ensureOrganization() {
@@ -2400,7 +2692,7 @@ function createPostgresStorage() {
   async function ingestMessageStatus(status, receivedAt, rawPayload) {
     const statusTime = fromProviderTimestamp(status.timestamp, receivedAt);
     const errorMessage = status.errors?.[0]?.title || status.errors?.[0]?.message || "";
-    const rawPayloadJson = JSON.stringify(rawPayload || {});
+    const rawPayloadJson = JSON.stringify(compactStatusPayload(rawPayload || status));
     const result = await query(
       `
       update messages
@@ -2436,7 +2728,7 @@ function createPostgresStorage() {
     const createdAt = fromProviderTimestamp(message.timestamp, receivedAt);
     const body = extractInboundText(message);
     const organizationId = await ensureOrganization();
-    const rawPayloadJson = JSON.stringify(message || {});
+    const rawPayloadJson = JSON.stringify(compactInboundMessagePayload(message));
     const result = await query(
       `
       insert into messages (
@@ -2493,8 +2785,10 @@ function createPostgresStorage() {
   }
 
   async function ingestWebhook(payload, receivedAt, signatureChecked) {
+    await runMaintenance();
     const organizationId = await ensureOrganization();
     const eventFingerprint = sha1(JSON.stringify(payload));
+    const compactPayload = compactMetaWebhookPayload(payload);
     await query(
       `
       insert into webhook_events (
@@ -2511,7 +2805,7 @@ function createPostgresStorage() {
       values ($1, $2, 'meta_whatsapp', 'webhook', $3, $4::jsonb, 'processed', $5, now())
       on conflict (provider, event_fingerprint) do nothing
       `,
-      [uuid(), organizationId, eventFingerprint, JSON.stringify(payload), receivedAt]
+      [uuid(), organizationId, eventFingerprint, JSON.stringify(compactPayload), receivedAt]
     );
 
     for (const entry of payload.entry || []) {
@@ -2552,6 +2846,7 @@ function createPostgresStorage() {
   }
 
   async function upsertShopifyCustomers(customers) {
+    await runMaintenance();
     const organizationId = await ensureOrganization();
     let synced = 0;
     let skipped = 0;
@@ -2894,6 +3189,7 @@ function createPostgresStorage() {
   }
 
   async function saveReply(conversation, request, outbound) {
+    await runMaintenance();
     const organizationId = await ensureOrganization();
     const channelResult = await query(
       `
@@ -2922,12 +3218,7 @@ function createPostgresStorage() {
     const body =
       request.body ||
       (request.type === "template" ? `[Template] ${request.template_name}` : request.caption || "");
-    const rawPayload = JSON.stringify({
-      delivery_mode: deliveryMode,
-      request,
-      outbound_payload: outbound.payload || {},
-      request_payload: outbound.request_payload || {},
-    });
+    const rawPayload = JSON.stringify(compactOutboundStoragePayload(request, outbound));
     const errorMessage = outbound.ok ? "" : (outbound.reason || outbound.payload?.error?.message || "");
     const createdAt = new Date().toISOString();
     const result = await query(
@@ -2995,9 +3286,10 @@ function createPostgresStorage() {
   }
 
   async function recordAutomationEvent(topic, payload, receivedAt) {
+    await runMaintenance();
     const organizationId = await ensureOrganization();
     const normalized = normalizeShopifyAutomationEvent(topic, payload, receivedAt);
-    const rawPayloadJson = JSON.stringify(payload || {});
+    const rawPayloadJson = JSON.stringify(compactShopifyEventPayload(payload));
     const inserted = await query(
       `
       insert into commerce_events (
@@ -3556,6 +3848,7 @@ function createPostgresStorage() {
   }
 
   async function recordBroadcastMessages(campaignId, results) {
+    await runMaintenance();
     const organizationId = await ensureOrganization();
     const records = [];
     for (const item of results || []) {
@@ -3581,7 +3874,7 @@ function createPostgresStorage() {
         values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $9, now())
         on conflict (organization_id, provider_message_id) where provider_message_id is not null do update
         set status = excluded.status,
-            error_message = excluded.error_message,
+          error_message = excluded.error_message,
             raw_payload = excluded.raw_payload,
             updated_at = now()
         returning *
@@ -3594,7 +3887,7 @@ function createPostgresStorage() {
           item.provider_message_id || null,
           status,
           item.reason || item.error?.message || "",
-          JSON.stringify(item || {}),
+          JSON.stringify(compactBroadcastResultPayload(item || {})),
           timestamp,
           item.ok ? timestamp : null,
           item.ok ? null : timestamp,
@@ -3769,6 +4062,7 @@ function createPostgresStorage() {
           throw error;
         }
       }
+      await runMaintenance({ force: true });
       await ensureOrganization();
       if (WHATSAPP_PHONE_NUMBER_ID) {
         await ensureChannel(WHATSAPP_PHONE_NUMBER_ID, {
@@ -3797,6 +4091,14 @@ function createPostgresStorage() {
     findDueBroadcastCampaigns,
     recordBroadcastMessages,
     updateBroadcastMessageStatus,
+    maintenanceStatus() {
+      return {
+        last_run_at: state.lastMaintenanceAt,
+        last_deleted: state.lastMaintenanceDeleted,
+        last_error: state.lastMaintenanceError,
+      };
+    },
+    storageUsage,
   };
 }
 
@@ -3933,6 +4235,13 @@ function createStorage() {
     async updateBroadcastMessageStatus(...args) {
       await storage.ready();
       return storage._impl.updateBroadcastMessageStatus(...args);
+    },
+    maintenanceStatus() {
+      return storage._impl.maintenanceStatus ? storage._impl.maintenanceStatus() : null;
+    },
+    async storageUsage() {
+      await storage.ready();
+      return storage._impl.storageUsage ? storage._impl.storageUsage() : null;
     },
   };
 
@@ -4678,6 +4987,7 @@ const server = http.createServer(async (req, res) => {
         last_init_error: storage.initState?.last_init_error || null,
         last_recovery_attempt_at: storage.initState?.last_recovery_attempt_at || "",
         last_recovery_ok: storage.initState?.last_recovery_ok,
+        maintenance: storage.maintenanceStatus ? storage.maintenanceStatus() : null,
         database_url_configured: Boolean(DATABASE_URL),
         pg_module_available: Boolean(Pool),
       },
@@ -4700,6 +5010,22 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/outbound") {
     return sendJson(res, 200, outboundDiagnostics);
+  }
+
+  if (req.method === "GET" && parsed.pathname === "/api/diagnostics/storage") {
+    try {
+      return sendJson(res, 200, {
+        ok: true,
+        mode: storage.mode,
+        usage: await storage.storageUsage(),
+      });
+    } catch (error) {
+      return sendJson(res, 500, {
+        ok: false,
+        mode: storage.mode,
+        error: error?.message || "storage_diagnostics_failed",
+      });
+    }
   }
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/shopify") {
