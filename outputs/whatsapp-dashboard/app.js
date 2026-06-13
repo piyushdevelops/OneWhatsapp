@@ -13,6 +13,7 @@ const state = {
   broadcastSegmentSeed: "",
   broadcastAudienceSegmentId: "all_customers",
   segmentBuilderOpen: false,
+  editingSegmentId: "",
   broadcastBuilderOpen: false,
   templateBuilderOpen: false,
 };
@@ -405,7 +406,9 @@ function applyCustomerSyncStatus(status = {}) {
     totalAvailable: status.total_available === null || status.total_available === undefined ? customerSyncStatus.totalAvailable : Number(status.total_available),
     totalContacts: Number(status.total_contacts ?? customerSyncStatus.totalContacts ?? 0),
     whatsappContacts: Number(status.whatsapp_contacts ?? customerSyncStatus.whatsappContacts ?? 0),
-    skipped: Number(status.last_skipped ?? status.skipped ?? customerSyncStatus.skipped ?? 0),
+    skipped: Number(status.total_skipped ?? status.last_skipped ?? status.skipped ?? customerSyncStatus.skipped ?? 0),
+    checked: Number(status.total_checked ?? status.last_total_seen ?? customerSyncStatus.checked ?? 0),
+    pages: Number(status.pages ?? customerSyncStatus.pages ?? 0),
     lastSyncedAt: status.last_synced_at || customerSyncStatus.lastSyncedAt || "",
     lastError: status.total_available_error || status.last_error || customerSyncStatus.lastError || "",
     nextPageInfo: status.next_page_info ?? customerSyncStatus.nextPageInfo ?? "",
@@ -482,8 +485,26 @@ function dateValue(value) {
 }
 
 function segmentHasShopifyRules(rules = {}) {
+  const builderRules = Array.isArray(rules.builder_rules) ? rules.builder_rules : [];
+  const builderHasShopifyRule = builderRules.some((rule) => {
+    if (rule.type === "event") return /order|checkout|fulfillment|refund|cancel/i.test(rule.event || "");
+    if (rule.type === "list") return !["all_whatsapp", "needs_reply", "return_refund"].includes(rule.list || "");
+    return [
+      "number_of_orders",
+      "total_spent",
+      "average_order_value",
+      "last_order_date",
+      "payment_status",
+      "fulfillment_status",
+      "shopify_segment",
+      "customer_tag",
+      "product_keyword",
+      "city",
+      "province",
+    ].includes(rule.field || "");
+  });
   return Boolean(
-    (Array.isArray(rules.builder_rules) && rules.builder_rules.length)
+    builderHasShopifyRule
     || Number(rules.min_orders || 0)
     || Number(rules.max_orders || 0)
     || Number(rules.min_spend || 0)
@@ -786,16 +807,25 @@ function localSegments() {
     };
   });
   const stored = [...savedSegments, ...customSegments].map((segment) => {
-    const members = customers.filter((customer) => customSegmentMatches(customer, segment));
+    const evaluatedMembers = Array.isArray(segment.members)
+      ? segment.members.map(normalizeAudienceCustomer)
+      : [];
+    const members = evaluatedMembers.length
+      ? evaluatedMembers
+      : customers.filter((customer) => customSegmentMatches(customer, segment));
+    const evaluatedSize = Number(segment.size);
     return {
       id: segment.id,
       name: segment.name,
       source: segment.source,
       description: segment.description,
       ruleText: segment.ruleText || segmentRuleText(segment),
-      size: members.length,
+      size: Number.isFinite(evaluatedSize) ? evaluatedSize : members.length,
       members,
       updated_at: segment.updated_at,
+      evaluated_at: segment.evaluated_at || "",
+      member_limit_reached: Boolean(segment.member_limit_reached),
+      rules: segment.rules || {},
       custom: true,
     };
   });
@@ -862,7 +892,9 @@ function recipientsForSegment(segmentId) {
 
 function validBroadcastAudienceId(segments, requestedId) {
   if (!requestedId || requestedId === "all_customers") return "all_customers";
-  return segments.some((segment) => segment.id === requestedId) ? requestedId : "all_customers";
+  if (segments.some((segment) => segment.id === requestedId)) return requestedId;
+  if (savedSegmentsLoading || !savedSegmentsLoadedAt) return requestedId;
+  return "all_customers";
 }
 
 async function loadCustomers({ force = false, limit = customerPreviewLimit } = {}) {
@@ -916,20 +948,21 @@ async function loadCustomerSyncStatus({ force = false } = {}) {
 }
 
 async function syncShopifyCustomers() {
+  const resumeFromCursor = Boolean(customerSyncStatus.nextPageInfo);
   customerSyncStatus = {
     ...customerSyncStatus,
     syncing: true,
-    checked: 0,
-    pages: 0,
-    skipped: 0,
+    checked: resumeFromCursor ? customerSyncStatus.checked : 0,
+    pages: resumeFromCursor ? customerSyncStatus.pages : 0,
+    skipped: resumeFromCursor ? customerSyncStatus.skipped : 0,
     lastError: "",
   };
   customersLastError = "";
   render();
   let pageInfo = customerSyncStatus.nextPageInfo || "";
   let synced = 0;
-  let skipped = 0;
-  let totalSeen = 0;
+  let skipped = resumeFromCursor ? customerSyncStatus.skipped : 0;
+  let totalSeen = resumeFromCursor ? customerSyncStatus.checked : 0;
   let lastProgressRender = 0;
   try {
     for (let page = 0; page < 5000; page += 1) {
@@ -950,9 +983,9 @@ async function syncShopifyCustomers() {
       customerSyncStatus = {
         ...customerSyncStatus,
         synced: payload.status?.shopify_synced ?? customerSyncStatus.synced + Number(payload.synced || 0),
-        skipped,
-        checked: totalSeen,
-        pages: page + 1,
+        skipped: payload.status?.total_skipped ?? skipped,
+        checked: payload.status?.total_checked ?? totalSeen,
+        pages: payload.status?.pages ?? (resumeFromCursor ? customerSyncStatus.pages + 1 : page + 1),
         lastSyncedAt: payload.status?.last_synced_at || customerSyncStatus.lastSyncedAt,
         nextPageInfo: payload.next_page_info || "",
       };
@@ -1794,6 +1827,8 @@ function renderDashboard() {
   const revenue = revenueStats();
   const tasks = crmTasks();
   const shopifyReady = Boolean(systemStatus.shopify?.enabled);
+  const storageReady = systemStatus.storageMode === "postgres" && !systemStatus.storageFallbackUsed;
+  const storageLabel = storageReady ? "Saved safely" : "Needs attention";
   const lastMessage = latest ? `${latest.name}: ${latest.preview}` : "Waiting for the first customer conversation.";
   const strictAttributionReady = revenue.trackedCampaigns > 0 && revenue.utmCoverage > 0;
   const strictAttributionTone = strictAttributionReady ? "green" : "red";
@@ -1837,6 +1872,7 @@ function renderDashboard() {
         </div>
         <div class="health-strip">
           ${healthLight("Inbox", stats.apiState === "Connected", stats.apiState)}
+          ${healthLight("Storage", storageReady, storageLabel)}
           ${healthLight("Replies", systemStatus.outboundEnabled, outboundLabel)}
           ${healthLight("Shopify", shopifyReady, shopifyReady ? "Connected" : "Pending")}
           ${healthLight("Attribution", strictAttributionReady, strictAttributionLabel)}
@@ -1871,6 +1907,7 @@ function renderDashboard() {
           <div class="section-title">Revenue Engine</div>
           <section class="panel pad compact-status-panel">
             ${commandSignal("Shopify order match", shopifyReady ? "Green light" : "Red light", shopifyReady ? "Customer cards can show order value and history." : "Add Shopify token/domain in Railway.", shopifyReady ? "green" : "red")}
+            ${commandSignal("Saved data", storageReady ? "Green light" : "Red light", storageReady ? "Customers, chats and campaigns are using live database storage." : "Railway database needs attention before more sends.", storageReady ? "green" : "red")}
             ${commandSignal("WhatsApp outbound", systemStatus.outboundEnabled ? "Green light" : "Red light", systemStatus.outboundEnabled ? "Replies can be sent from the dashboard." : "Outbound token is missing or rejected.", outboundTone)}
             ${commandSignal("UTM revenue tracking", strictAttributionLabel, "Next build: campaign IDs, UTM links and Shopify order attribution per broadcast.", strictAttributionTone)}
           </section>
@@ -2171,8 +2208,18 @@ function renderSegmentTable(segments) {
         <div class="row-subtle">${escapeHtml(segment.ruleText || segment.description || "Dynamic audience segment")}</div>
       </td>
       <td><strong>${segment.size}</strong></td>
-      <td>${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-builder" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button></td>
+      <td>
+        ${escapeHtml(segment.updated_at ? formatContextDate(segment.updated_at) : "Live")}
+        ${segment.member_limit_reached ? `<div class="row-subtle">Showing first saved recipients</div>` : ""}
+      </td>
+      <td>
+        <div class="row-actions">
+          ${segment.custom ? `<button class="ghost-button" data-action="open-segment-builder" data-segment-id="${escapeHtml(segment.id)}">Edit</button>` : ""}
+          ${segment.custom ? `<button class="ghost-button" data-action="duplicate-segment" data-segment-id="${escapeHtml(segment.id)}">Duplicate</button>` : ""}
+          ${segment.custom ? `<button class="ghost-button danger" data-action="delete-segment" data-segment-id="${escapeHtml(segment.id)}">Delete</button>` : ""}
+          <button class="ghost-button" data-action="open-broadcast-builder" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button>
+        </div>
+      </td>
     </tr>
   `).join("");
   return table(["Segment Name", "Segment Size", "Updated At", ""], rows);
@@ -2233,13 +2280,19 @@ function renderSegmentBuilder() {
   const segmentCount = localSegments().length;
   const customerCount = audienceCustomers().length;
   const syncedShopifyCount = shopifySegments.length || 0;
+  const editingSegment = state.editingSegmentId
+    ? localSegments().find((segment) => segment.id === state.editingSegmentId)
+    : null;
+  const initialRules = Array.isArray(editingSegment?.rules?.builder_rules) && editingSegment.rules.builder_rules.length
+    ? editingSegment.rules.builder_rules
+    : [{}];
   return `
     <div id="segment-builder" class="segment-builder-page">
       <div class="segment-builder-header">
         <button class="segment-back-button" data-action="close-segment-builder" aria-label="Back">‹</button>
         <div class="segment-builder-title">
           <span class="eyebrow">Audience rules</span>
-          <h2>Create live segment</h2>
+          <h2>${editingSegment ? "Edit live segment" : "Create live segment"}</h2>
           <p>Combine WhatsApp intent, Shopify order history and customer fields into one reusable audience.</p>
           <div class="segment-builder-pills">
             <span>${segmentCount} saved segments</span>
@@ -2254,7 +2307,7 @@ function renderSegmentBuilder() {
           <div class="segment-composer-head">
             <div>
               <span class="eyebrow">Segment name</span>
-              <input id="segment-name" class="field segment-name-field" placeholder="Abandoned Users Last 30 Days" />
+              <input id="segment-name" class="field segment-name-field" placeholder="Abandoned Users Last 30 Days" value="${escapeHtml(editingSegment?.name || "")}" />
             </div>
             <div class="segment-save-hint">
               <strong>Live audience</strong>
@@ -2274,7 +2327,7 @@ function renderSegmentBuilder() {
           </div>
           <div class="segment-criteria-card">
             <div id="segment-rules">
-              ${renderSegmentRuleRow(0, true)}
+              ${initialRules.map((rule, index) => renderSegmentRuleRow(index, index === 0, rule)).join("")}
             </div>
             <div class="segment-rule-actions">
               <button class="secondary-button" data-action="add-segment-rule" type="button">+ Add Filter Rule</button>
@@ -2310,7 +2363,8 @@ function renderSegmentBuilder() {
   `;
 }
 
-function renderSegmentRuleRow(index, isFirst = false) {
+function renderSegmentRuleRow(index, isFirst = false, rule = {}) {
+  const type = rule.type || "property";
   return `
     <div class="segment-rule-row" data-segment-rule>
       <div class="segment-rule-prefix">
@@ -2322,11 +2376,15 @@ function renderSegmentRuleRow(index, isFirst = false) {
         <div class="segment-condition-wrap">
           <span>Condition</span>
           <select class="select segment-condition-type">
-            ${selectOptions(segmentConditionTypes, "property")}
+            ${selectOptions(segmentConditionTypes, type)}
           </select>
         </div>
         <div class="segment-rule-detail">
-          ${renderSegmentPropertyControls()}
+          ${type === "event"
+            ? renderSegmentEventControls(rule.event || "", rule.occurrence || "", rule.window || "over_all_time", rule.window_value || "")
+            : type === "list"
+              ? renderSegmentListControls(rule.list || "", rule.operator || "in")
+              : renderSegmentPropertyControls(rule.field || "", rule.operator || "", rule.value || "")}
         </div>
       </div>
       <button class="ghost-button icon-only segment-delete" data-action="delete-segment-rule" type="button" ${isFirst ? "disabled" : ""} aria-label="Delete rule">x</button>
@@ -2598,13 +2656,34 @@ function renderBroadcastCampaigns() {
   return table(["Campaign", "Status", "Send Time", "Recipients", "Delivered", "Read Rate", "Revenue", "Order Rate", ""], rows);
 }
 
-function openBroadcastReportModal(campaignId) {
-  const campaign = savedBroadcasts.find((item) => item.id === campaignId);
-  if (!campaign) {
+async function openBroadcastReportModal(campaignId) {
+  const cachedCampaign = savedBroadcasts.find((item) => item.id === campaignId);
+  if (!cachedCampaign) {
     showToast("Campaign report is not loaded yet.");
     return;
   }
+  openModal(
+    `${cachedCampaign.name} report`,
+    `<section class="panel pad"><span class="eyebrow">Loading</span><h3>Fetching recipient delivery report...</h3></section>`,
+    `<button class="ghost-button" data-action="close-modal">Close</button>`
+  );
+  const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/${encodeURIComponent(campaignId)}/report`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok === false) {
+    throw new Error(payload?.error || "Campaign report could not be loaded.");
+  }
+  const campaign = payload.campaign || cachedCampaign;
   const analytics = campaign.analytics || {};
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  const reportRows = messages.map((message) => `
+    <tr>
+      <td><span class="row-title">${escapeHtml(message.recipient_wa_id ? `+${message.recipient_wa_id}` : "-")}</span><div class="row-subtle">${escapeHtml(message.recipient_wa_id || "-")}</div></td>
+      <td><span class="badge ${broadcastStatusTone(message.status)}">${escapeHtml(broadcastStatusLabel(message.status))}</span></td>
+      <td>${escapeHtml(message.provider_message_id || "-")}</td>
+      <td>${escapeHtml(message.updated_at ? formatContextDate(message.updated_at) : "-")}</td>
+      <td>${escapeHtml(message.error_message || message.raw_payload?.error?.message || "-")}</td>
+    </tr>
+  `).join("");
   openModal(
     `${campaign.name} report`,
     `
@@ -2628,6 +2707,12 @@ function openBroadcastReportModal(campaignId) {
             ${contextMetric("Last error", campaign.last_send_error || "-")}
           </div>
         </section>
+        <section class="panel pad">
+          <div class="setting-title">Recipient delivery report</div>
+          ${messages.length
+            ? table(["Recipient", "Status", "Meta message ID", "Updated", "Failure reason"], reportRows)
+            : emptyPanel("No recipient rows yet", "Send the campaign or refresh after Meta delivery updates arrive.")}
+        </section>
       </div>
     `,
     `<button class="ghost-button" data-action="close-modal">Close</button><button class="primary-button" data-action="open-broadcast-builder">Duplicate campaign</button>`
@@ -2635,13 +2720,23 @@ function openBroadcastReportModal(campaignId) {
 }
 
 function broadcastStatusLabel(status) {
-  const labels = { draft: "Draft", scheduled: "Scheduled", accepted: "Accepted", sent: "Sent", sending: "Sending", failed: "Failed" };
+  const labels = {
+    draft: "Draft",
+    scheduled: "Scheduled",
+    accepted: "Accepted",
+    submitted: "Submitted",
+    sent: "Sent",
+    delivered: "Delivered",
+    read: "Read",
+    sending: "Sending",
+    failed: "Failed",
+  };
   return labels[status] || status || "Draft";
 }
 
 function broadcastStatusTone(status) {
-  if (status === "sent") return "green";
-  if (status === "accepted") return "blue";
+  if (["sent", "delivered", "read"].includes(status)) return "green";
+  if (["accepted", "submitted"].includes(status)) return "blue";
   if (status === "scheduled") return "blue";
   if (status === "sending") return "orange";
   if (status === "failed") return "red";
@@ -3221,6 +3316,21 @@ function generatedReplyFor(selected, prompt = "") {
     return "Hi, thanks for checking. I will confirm the current offer and availability for you shortly.";
   }
   return brief.reply;
+}
+
+async function requestCopilot(selected, prompt = "", action = "draft_reply") {
+  const response = await fetch(`${INBOX_API_BASE}/api/copilot/reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conversation_id: selected.id,
+      prompt,
+      action,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok === false) throw new Error(payload?.error || "Copilot could not prepare a response.");
+  return payload;
 }
 
 function replyCopilot(selected, messages, prompt) {
@@ -4337,6 +4447,7 @@ function collectSegmentBuilderPayload() {
     return null;
   }
   const payload = {
+    id: state.editingSegmentId || undefined,
     name,
     source: rules.some((rule) => ["event", "list"].includes(rule.type) || /order|spent|shopify|payment|fulfillment|city|province|tag|product/i.test(rule.field || ""))
       ? "WhatsApp + Shopify"
@@ -4409,6 +4520,7 @@ async function saveCustomSegment() {
     if (!payload) return;
     await persistAudienceSegment(payload);
     state.segmentBuilderOpen = false;
+    state.editingSegmentId = "";
     state.audienceTab = "segments";
     showToast("Segment saved.");
     render();
@@ -4503,6 +4615,35 @@ async function persistAudienceSegment(payload) {
   await loadSavedSegments({ force: true });
 }
 
+async function duplicateAudienceSegment(segmentId) {
+  if (!segmentId) return;
+  const response = await fetch(`${INBOX_API_BASE}/api/audience/segments/${encodeURIComponent(segmentId)}/duplicate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) throw new Error(result?.error || "Could not duplicate segment.");
+  savedSegmentsLoadedAt = 0;
+  await loadSavedSegments({ force: true });
+  showToast("Segment duplicated.");
+  render();
+}
+
+async function deleteAudienceSegment(segmentId) {
+  if (!segmentId) return;
+  const segment = localSegments().find((item) => item.id === segmentId);
+  if (!window.confirm(`Delete ${segment?.name || "this segment"}?`)) return;
+  const response = await fetch(`${INBOX_API_BASE}/api/audience/segments/${encodeURIComponent(segmentId)}`, {
+    method: "DELETE",
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) throw new Error(result?.error || "Could not delete segment.");
+  savedSegmentsLoadedAt = 0;
+  await loadSavedSegments({ force: true });
+  showToast("Segment deleted.");
+  render();
+}
+
 function closeModal() {
   modalRoot.innerHTML = "";
 }
@@ -4550,7 +4691,7 @@ function broadcastEligibleCustomers(customers) {
 function broadcastBuilderData() {
   const templates = approvedTemplates();
   const customers = audienceCustomers();
-  const segments = localSegments().filter((segment) => segment.size > 0);
+  const segments = localSegments();
   const requestedSegmentId = state.broadcastAudienceSegmentId || state.broadcastSegmentSeed || "all_customers";
   const selectedSegmentId = validBroadcastAudienceId(segments, requestedSegmentId);
   state.broadcastAudienceSegmentId = selectedSegmentId;
@@ -4560,6 +4701,9 @@ function broadcastBuilderData() {
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
     `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
+    selectedSegmentId !== "all_customers" && !segments.some((segment) => segment.id === selectedSegmentId)
+      ? `<option value="${escapeHtml(selectedSegmentId)}" selected>Loading selected audience...</option>`
+      : "",
     ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
   return {
@@ -4708,7 +4852,7 @@ function renderBroadcastBuilderPage() {
 function openBroadcastModal() {
   const templates = approvedTemplates();
   const customers = audienceCustomers();
-  const segments = localSegments().filter((segment) => segment.size > 0);
+  const segments = localSegments();
   const seededSegmentId = state.broadcastAudienceSegmentId || state.broadcastSegmentSeed;
   const selectedSegmentId = validBroadcastAudienceId(segments, seededSegmentId);
   state.broadcastAudienceSegmentId = selectedSegmentId;
@@ -4719,6 +4863,9 @@ function openBroadcastModal() {
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
     `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
+    selectedSegmentId !== "all_customers" && !segments.some((segment) => segment.id === selectedSegmentId)
+      ? `<option value="${escapeHtml(selectedSegmentId)}" selected>Loading selected audience...</option>`
+      : "",
     ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
   const customerRows = broadcastRecipientRows(defaultRecipients);
@@ -5273,7 +5420,9 @@ document.addEventListener("click", (event) => {
       state.broadcastAudienceSegmentId = "all_customers";
       render();
     },
-    "open-broadcast-report": () => openBroadcastReportModal(actionTarget.dataset.campaignId),
+    "open-broadcast-report": () => {
+      openBroadcastReportModal(actionTarget.dataset.campaignId).catch((error) => showToast(error.message || "Could not load report."));
+    },
     "open-template-modal": () => {
       state.templateBuilderOpen = true;
       state.screen = "templates";
@@ -5292,6 +5441,7 @@ document.addEventListener("click", (event) => {
     },
     "open-segment-modal": openSegmentModal,
     "open-segment-builder": () => {
+      state.editingSegmentId = actionTarget.dataset.segmentId || "";
       state.segmentBuilderOpen = true;
       state.audienceTab = "segments";
       render();
@@ -5299,6 +5449,7 @@ document.addEventListener("click", (event) => {
     },
     "close-segment-builder": () => {
       state.segmentBuilderOpen = false;
+      state.editingSegmentId = "";
       render();
     },
     "add-segment-rule": () => {
@@ -5322,6 +5473,12 @@ document.addEventListener("click", (event) => {
     },
     "save-segment": () => {
       saveCustomSegment().catch((error) => showToast(error.message || "Could not save segment."));
+    },
+    "duplicate-segment": () => {
+      duplicateAudienceSegment(actionTarget.dataset.segmentId).catch((error) => showToast(error.message || "Could not duplicate segment."));
+    },
+    "delete-segment": () => {
+      deleteAudienceSegment(actionTarget.dataset.segmentId).catch((error) => showToast(error.message || "Could not delete segment."));
     },
     "sync-templates": () => {
       metaTemplatesLoadedAt = 0;
@@ -5394,17 +5551,32 @@ document.addEventListener("click", (event) => {
       const input = document.getElementById("reply-input");
       const prompt = document.getElementById("copilot-prompt")?.value || "";
       if (!selected || !input) return;
-      const reply = generatedReplyFor(selected, prompt);
-      input.value = reply;
-      state.replyDrafts[selected.id] = reply;
-      input.focus();
-      showToast("Reply draft prepared.");
+      requestCopilot(selected, prompt, "draft_reply")
+        .then((payload) => {
+          const reply = payload.reply || generatedReplyFor(selected, prompt);
+          input.value = reply;
+          state.replyDrafts[selected.id] = reply;
+          input.focus();
+          showToast(payload.mode === "openai_ready" ? "AI draft prepared." : "Guarded draft prepared.");
+        })
+        .catch(() => {
+          const reply = generatedReplyFor(selected, prompt);
+          input.value = reply;
+          state.replyDrafts[selected.id] = reply;
+          input.focus();
+          showToast("Local draft prepared.");
+        });
     },
     "summarize-chat": () => {
       const selected = selectedLiveConversation();
       if (!selected) return;
-      const rundown = conversationRundown(selected);
-      showToast(`Customer: ${rundown.lastInbound.slice(0, 90)}`);
+      const prompt = document.getElementById("copilot-prompt")?.value || "";
+      requestCopilot(selected, prompt, "summarize")
+        .then((payload) => showToast((payload.summary || "Summary prepared.").slice(0, 180)))
+        .catch(() => {
+          const rundown = conversationRundown(selected);
+          showToast(`Customer: ${rundown.lastInbound.slice(0, 90)}`);
+        });
     },
     "jump-latest-message": () => {
       const messages = document.querySelector(".messages");

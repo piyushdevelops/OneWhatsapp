@@ -518,6 +518,344 @@ function broadcastAnalyticsFromJson(campaign = {}) {
   };
 }
 
+function numberValue(value) {
+  const parsed = Number(String(value ?? "").replace(/[^\d.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function daysSince(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
+}
+
+function textContains(value, query) {
+  if (!query) return true;
+  return String(value || "").toLowerCase().includes(String(query).toLowerCase());
+}
+
+function dateValue(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  const parsed = /^\d{10}$/.test(raw) ? new Date(Number(raw) * 1000) : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function compareStringRule(actual, operator, expected) {
+  const hasValue = textContains(actual, expected);
+  if (operator === "is") return String(actual || "").toLowerCase() === String(expected || "").toLowerCase();
+  if (operator === "is_not" || operator === "not_in") return !hasValue;
+  return hasValue;
+}
+
+function compareNumberRule(actual, operator, expected) {
+  const current = numberValue(actual);
+  const target = numberValue(expected);
+  if (operator === "lte") return current <= target;
+  if (operator === "eq") return current === target;
+  return current >= target;
+}
+
+function compareDateRule(actualValue, operator, expected) {
+  const actual = dateValue(actualValue);
+  if (!actual) return false;
+  if (operator === "within_last") return daysSince(actualValue) !== null && daysSince(actualValue) <= Number(expected || 0);
+  if (operator === "not_within_last") return daysSince(actualValue) !== null && daysSince(actualValue) > Number(expected || 0);
+  const target = dateValue(expected);
+  if (!target) return false;
+  if (operator === "after") return actual > target;
+  return actual < target;
+}
+
+function segmentHasShopifyRules(rules = {}) {
+  const builderRules = Array.isArray(rules.builder_rules) ? rules.builder_rules : [];
+  const builderHasShopifyRule = builderRules.some((rule) => {
+    if (rule.type === "event") return /order|checkout|fulfillment|refund|cancel/i.test(rule.event || "");
+    if (rule.type === "list") return !["all_whatsapp", "needs_reply", "return_refund"].includes(rule.list || "");
+    return [
+      "number_of_orders",
+      "total_spent",
+      "average_order_value",
+      "last_order_date",
+      "payment_status",
+      "fulfillment_status",
+      "shopify_segment",
+      "customer_tag",
+      "product_keyword",
+      "city",
+      "province",
+    ].includes(rule.field || "");
+  });
+  return Boolean(
+    builderHasShopifyRule
+    || Number(rules.min_orders || 0)
+    || Number(rules.max_orders || 0)
+    || Number(rules.min_spend || 0)
+    || Number(rules.max_spend || 0)
+    || Number(rules.min_aov || 0)
+    || Number(rules.last_order_within_days || 0)
+    || Number(rules.last_order_older_than_days || 0)
+    || rules.last_order_before
+    || rules.last_order_after
+    || rules.event_name
+    || rules.tag
+    || rules.product_keyword
+    || rules.city
+    || rules.province
+    || rules.financial_status
+    || rules.fulfillment_status
+    || rules.shopify_segment
+  );
+}
+
+function segmentCustomerStats(customer = {}) {
+  const shopify = customer.shopify || {};
+  const shopifyCustomer = shopify.customer || {};
+  const orders = Array.isArray(shopify.orders) ? shopify.orders : [];
+  const totalSpent = numberValue(shopifyCustomer.total_spent || shopifyCustomer.display_total_spent);
+  const orderCount = Number(shopifyCustomer.orders_count || orders.length || 0);
+  const averageOrder = orderCount ? totalSpent / orderCount : 0;
+  const latestOrder = orders[0] || null;
+  const latestAddress = latestOrder?.shipping_address || shopifyCustomer.default_address || {};
+  const productText = orders
+    .flatMap((order) => Array.isArray(order.line_items) ? order.line_items : [])
+    .map((item) => item.name || item.title || "")
+    .join(" ");
+  return {
+    matched: Boolean(shopify.matched || shopify.connected),
+    totalSpent,
+    orderCount,
+    averageOrder,
+    tags: shopifyCustomer.tags || "",
+    latestOrder,
+    latestOrderDays: daysSince(latestOrder?.processed_at || latestOrder?.created_at),
+    financialStatus: latestOrder?.financial_status || "",
+    fulfillmentStatus: latestOrder?.fulfillment_status || "",
+    city: latestAddress.city || "",
+    province: latestAddress.province || latestAddress.province_code || "",
+    productText,
+  };
+}
+
+function segmentCustomerText(customer = {}) {
+  return [
+    customer.lastMessage,
+    customer.preview,
+    ...(Array.isArray(customer.messages) ? customer.messages.map((message) => message.text || message.body || "") : []),
+  ].join(" ");
+}
+
+function eventDateWithinWindow(value, rule = {}) {
+  if (rule.window !== "within_last") return true;
+  const days = daysSince(value);
+  return days !== null && days <= Number(rule.window_value || 0);
+}
+
+function customerEventDates(customer = {}, eventName = "", stats = segmentCustomerStats(customer)) {
+  const shopify = customer.shopify || {};
+  const orders = Array.isArray(shopify.orders) ? shopify.orders : [];
+  const rawEvents = [
+    ...(Array.isArray(customer.events) ? customer.events : []),
+    ...(Array.isArray(shopify.events) ? shopify.events : []),
+    ...(Array.isArray(shopify.checkouts) ? shopify.checkouts.map((checkout) => ({ ...checkout, type: "checkout_started" })) : []),
+  ];
+  const eventMatches = rawEvents
+    .filter((event) => {
+      const type = String(event.type || event.topic || event.name || event.event || "").toLowerCase();
+      if (eventName === "checkout_started") return /checkout|cart/.test(type);
+      if (eventName === "order_placed") return /orders\/create|orders\/paid|order_placed/.test(type);
+      if (eventName === "offline_order_placed") return /offline_order|pos|draft_orders\/create/.test(type);
+      if (eventName === "fulfillment_created") return /fulfillment/.test(type);
+      if (eventName === "order_cancelled") return /cancel/.test(type);
+      if (eventName === "order_refunded") return /refund/.test(type);
+      if (eventName === "whatsapp_message_received") return /whatsapp|message/.test(type);
+      return type.includes(eventName.replace(/_/g, "/")) || type.includes(eventName);
+    })
+    .map((event) => event.created_at || event.processed_at || event.timestamp || event.date)
+    .filter(Boolean);
+  if (eventMatches.length) return eventMatches;
+
+  if (["order_placed", "offline_order_placed"].includes(eventName)) {
+    return orders.map((order) => order.processed_at || order.created_at).filter(Boolean);
+  }
+  if (eventName === "fulfillment_created") {
+    return orders.flatMap((order) => Array.isArray(order.fulfillments) ? order.fulfillments : [])
+      .map((fulfillment) => fulfillment.created_at || fulfillment.updated_at)
+      .filter(Boolean);
+  }
+  if (eventName === "order_cancelled") {
+    return orders
+      .filter((order) => order.cancelled_at || /cancel/i.test(order.fulfillment_status || ""))
+      .map((order) => order.cancelled_at || order.updated_at || order.processed_at || order.created_at)
+      .filter(Boolean);
+  }
+  if (eventName === "order_refunded") {
+    return orders.flatMap((order) => {
+      const refunds = Array.isArray(order.refunds) ? order.refunds : [];
+      if (refunds.length) return refunds.map((refund) => refund.created_at || refund.processed_at || order.updated_at);
+      return /refund/i.test(order.financial_status || "") ? [order.updated_at || order.processed_at || order.created_at] : [];
+    }).filter(Boolean);
+  }
+  if (eventName === "whatsapp_message_received") {
+    return (Array.isArray(customer.messages) ? customer.messages : [])
+      .filter((message) => message.direction === "inbound" || message.from === "in")
+      .map((message) => message.timestamp || message.created_at || message.time)
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function segmentBuilderRuleMatches(customer, rule = {}) {
+  const stats = segmentCustomerStats(customer);
+  const latestOrderDate = stats.latestOrder?.processed_at || stats.latestOrder?.created_at;
+  if (rule.type === "event") {
+    const dates = customerEventDates(customer, rule.event, stats);
+    const matched = dates.some((date) => eventDateWithinWindow(date, rule));
+    return rule.occurrence === "zero_times" ? !matched : matched;
+  }
+  if (rule.type === "list") {
+    const inList = rule.list === "all_whatsapp" ? Boolean(compactDigits(customer.phone || customer.wa_id)) : textContains(stats.tags, rule.list);
+    return rule.operator === "not_in" ? !inList : inList;
+  }
+  const value = rule.value;
+  switch (rule.field) {
+    case "whatsapp_subscriber": {
+      const matched = Boolean(compactDigits(customer.phone || customer.wa_id)) === (value !== "false");
+      return rule.operator === "is_not" ? !matched : matched;
+    }
+    case "has_unread": {
+      const matched = (Number(customer.unread || 0) > 0) === (value !== "false");
+      return rule.operator === "is_not" ? !matched : matched;
+    }
+    case "message_keyword":
+      return compareStringRule(segmentCustomerText(customer), rule.operator, value);
+    case "customer_tag":
+      return compareStringRule(stats.tags, rule.operator, value);
+    case "product_keyword":
+      return compareStringRule(stats.productText, rule.operator, value);
+    case "city":
+      return compareStringRule(stats.city, rule.operator, value);
+    case "province":
+      return compareStringRule(stats.province, rule.operator, value);
+    case "email":
+      return compareStringRule(customer.email, rule.operator, value);
+    case "phone_number":
+      return compareStringRule(customer.phone || customer.wa_id, rule.operator, value);
+    case "payment_status":
+      return compareStringRule(stats.financialStatus, rule.operator, value);
+    case "fulfillment_status":
+      return compareStringRule(stats.fulfillmentStatus, rule.operator, value);
+    case "shopify_segment":
+      return compareStringRule(stats.tags, rule.operator, value);
+    case "number_of_orders":
+      return compareNumberRule(stats.orderCount, rule.operator, value);
+    case "total_spent":
+      return compareNumberRule(stats.totalSpent, rule.operator, value);
+    case "average_order_value":
+      return compareNumberRule(stats.averageOrder, rule.operator, value);
+    case "last_order_date":
+      return compareDateRule(latestOrderDate, rule.operator, value);
+    default:
+      return true;
+  }
+}
+
+function segmentBuilderRulesMatch(customer, rules = []) {
+  if (!rules.length) return true;
+  return rules.reduce((result, rule, index) => {
+    const matched = segmentBuilderRuleMatches(customer, rule);
+    if (index === 0) return matched;
+    return rule.logic === "or" ? result || matched : result && matched;
+  }, true);
+}
+
+function customSegmentMatchesCustomer(customer = {}, segment = {}) {
+  const stats = segmentCustomerStats(customer);
+  const text = segmentCustomerText(customer);
+  const rules = segment.rules || {};
+  if (Array.isArray(rules.builder_rules) && rules.builder_rules.length) {
+    return segmentBuilderRulesMatch(customer, rules.builder_rules);
+  }
+  const checks = [];
+  const source = segment.source || "Combined";
+  if (source === "Shopify" || segmentHasShopifyRules(rules)) checks.push(stats.matched);
+  if (Number(rules.min_orders || 0)) checks.push(stats.orderCount >= Number(rules.min_orders));
+  if (Number(rules.max_orders || 0)) checks.push(stats.orderCount <= Number(rules.max_orders));
+  if (Number(rules.min_spend || 0)) checks.push(stats.totalSpent >= Number(rules.min_spend));
+  if (Number(rules.max_spend || 0)) checks.push(stats.totalSpent <= Number(rules.max_spend));
+  if (Number(rules.min_aov || 0)) checks.push(stats.averageOrder >= Number(rules.min_aov));
+  if (Number(rules.last_order_within_days || 0)) {
+    checks.push(stats.latestOrderDays !== null && stats.latestOrderDays <= Number(rules.last_order_within_days));
+  }
+  if (Number(rules.last_order_older_than_days || 0)) {
+    checks.push(stats.latestOrderDays !== null && stats.latestOrderDays >= Number(rules.last_order_older_than_days));
+  }
+  if (rules.last_order_before) {
+    const latestDate = dateValue(stats.latestOrder?.processed_at || stats.latestOrder?.created_at);
+    const limitDate = dateValue(rules.last_order_before);
+    checks.push(Boolean(latestDate && limitDate && latestDate < limitDate));
+  }
+  if (rules.last_order_after) {
+    const latestDate = dateValue(stats.latestOrder?.processed_at || stats.latestOrder?.created_at);
+    const limitDate = dateValue(rules.last_order_after);
+    checks.push(Boolean(latestDate && limitDate && latestDate > limitDate));
+  }
+  if (rules.keyword) checks.push(textContains(text, rules.keyword));
+  if (rules.tag) checks.push(textContains(stats.tags, rules.tag));
+  if (rules.product_keyword) checks.push(textContains(stats.productText, rules.product_keyword));
+  if (rules.city) checks.push(textContains(stats.city, rules.city));
+  if (rules.province) checks.push(textContains(stats.province, rules.province));
+  if (rules.financial_status) checks.push(textContains(stats.financialStatus, rules.financial_status));
+  if (rules.fulfillment_status) checks.push(textContains(stats.fulfillmentStatus, rules.fulfillment_status));
+  if (rules.has_unread === true || rules.has_unread === "true") checks.push(Number(customer.unread || 0) > 0);
+  if (rules.has_unread === false || rules.has_unread === "false") checks.push(Number(customer.unread || 0) === 0);
+  if (rules.whatsapp_subscriber === true || rules.whatsapp_subscriber === "true") checks.push(Boolean(compactDigits(customer.phone || customer.wa_id)));
+  if (rules.event_name) {
+    const eventMode = rules.event_count_mode || "at_least_once";
+    let eventMatched = false;
+    if (rules.event_name === "order_placed" || rules.event_name === "offline_order_placed") eventMatched = stats.orderCount > 0;
+    if (rules.event_name === "order_cancelled") eventMatched = /cancel/i.test(stats.fulfillmentStatus);
+    if (rules.event_name === "order_refunded") eventMatched = /refund/i.test(stats.financialStatus);
+    if (eventMode === "zero_times") eventMatched = !eventMatched;
+    checks.push(eventMatched);
+  }
+  if (!checks.length) return true;
+  return (segment.match_mode || segment.matchMode || "all") === "any" ? checks.some(Boolean) : checks.every(Boolean);
+}
+
+function broadcastMemberFromCustomer(customer = {}) {
+  return {
+    id: customer.id || customer.conversation_id || customer.wa_id || compactDigits(customer.phone),
+    conversation_id: customer.conversation_id || "",
+    wa_id: customer.wa_id || compactDigits(customer.phone),
+    name: customer.name || "Customer",
+    initials: customer.initials || initials(customer.name, customer.phone || customer.wa_id),
+    phone: customer.phone || formatPhone(customer.wa_id),
+    email: customer.email || "",
+    channel: customer.channel || (customer.conversation_id ? "WhatsApp" : "Shopify"),
+    segment: customer.segment || "Customer",
+    unread: Number(customer.unread || 0),
+    lastMessage: customer.lastMessage || customer.preview || "",
+    lastSeen: customer.lastSeen || customer.time || "",
+    shopify: customer.shopify || null,
+    messages: customer.messages || [],
+  };
+}
+
+function decorateAudienceSegment(segment, customers = [], memberLimit = 250) {
+  const matched = customers.filter((customer) => customSegmentMatchesCustomer(customer, segment));
+  return {
+    ...segment,
+    size: matched.length,
+    members: matched.slice(0, memberLimit).map(broadcastMemberFromCustomer),
+    member_limit: memberLimit,
+    member_limit_reached: matched.length > memberLimit,
+    evaluated_at: new Date().toISOString(),
+  };
+}
+
 function defaultAutomationConfig(automationId) {
   const defaults = AUTOMATION_CONFIG_DEFAULTS[automationId] || {};
   return {
@@ -1910,6 +2248,64 @@ async function conversationResponse(conversation, storageMode = "json") {
   };
 }
 
+function latestConversationText(messages, direction) {
+  return (messages || [])
+    .filter((message) => !direction || message.direction === direction)
+    .slice(-1)[0]?.body
+    || (messages || [])
+      .filter((message) => !direction || message.direction === direction)
+      .slice(-1)[0]?.text
+    || "";
+}
+
+function buildCopilotResponse(detail, input = {}) {
+  const prompt = String(input.prompt || "").trim();
+  const action = String(input.action || "draft_reply");
+  const latestInbound = latestConversationText(detail.messages, "inbound") || detail.preview || "";
+  const latestOutbound = latestConversationText(detail.messages, "outbound");
+  const orders = detail.shopify?.orders || [];
+  const latestOrder = orders[0] || null;
+  const orderLine = latestOrder
+    ? `${latestOrder.name || "latest order"} is ${latestOrder.fulfillment_status || "unfulfilled"} and payment is ${latestOrder.financial_status || "unknown"}`
+    : "No Shopify order is matched yet";
+  const customerName = detail.name || "there";
+  const summary = [
+    `Customer: ${customerName}`,
+    latestInbound ? `Last customer message: ${latestInbound}` : "No customer message in the current thread",
+    latestOutbound ? `Last team reply: ${latestOutbound}` : "No previous team reply in this thread",
+    orderLine,
+  ].join(". ");
+
+  let reply = `Hi ${customerName.split(" ")[0] || "there"}, thanks for writing in. I am checking this and will update you shortly.`;
+  if (/track|status|order|delivery|where/i.test(`${prompt} ${latestInbound}`)) {
+    reply = latestOrder
+      ? `Hi ${customerName.split(" ")[0] || "there"}, I can see ${latestOrder.name || "your order"} in our system. It is currently ${latestOrder.fulfillment_status || "being processed"}. I am checking the latest delivery update and will share it here shortly.`
+      : `Hi ${customerName.split(" ")[0] || "there"}, please share your order number and I will check the latest status for you.`;
+  } else if (/refund|return|exchange/i.test(`${prompt} ${latestInbound}`)) {
+    reply = `Hi ${customerName.split(" ")[0] || "there"}, I can help with this. Please share the item name and reason, and I will check the return or refund eligibility for you.`;
+  } else if (/angry|upset|delay|late|not received/i.test(`${prompt} ${latestInbound}`)) {
+    reply = `Hi ${customerName.split(" ")[0] || "there"}, I am sorry for the trouble. I am checking this on priority and will come back with the clearest update here.`;
+  } else if (/product|recommend|suggest|buy/i.test(`${prompt} ${latestInbound}`)) {
+    reply = `Hi ${customerName.split(" ")[0] || "there"}, happy to help. Tell me what kind of home or gifting product you are looking for and I will suggest the best options from The June Shop.`;
+  }
+
+  if (action === "summarize") {
+    return {
+      mode: process.env.OPENAI_API_KEY ? "openai_ready" : "local_guarded",
+      summary,
+      reply: "",
+      actions: ["draft_reply", "order_status", "refund_follow_up", "product_suggestion"],
+    };
+  }
+
+  return {
+    mode: process.env.OPENAI_API_KEY ? "openai_ready" : "local_guarded",
+    summary,
+    reply,
+    actions: ["summarize", "order_status", "refund_follow_up", "product_suggestion"],
+  };
+}
+
 function createJsonStorage() {
   ensureDataDir();
 
@@ -2134,9 +2530,36 @@ function createJsonStorage() {
     return config;
   }
 
+  async function jsonContactsForSegments() {
+    const limit = Math.max(500, Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000));
+    return buildInbox().slice(0, limit).map((item) => {
+      const conversation = normalizeConversation(item, "json");
+      return broadcastMemberFromCustomer({
+        id: conversation.id,
+        conversation_id: conversation.id,
+        wa_id: conversation.wa_id,
+        name: conversation.name,
+        initials: conversation.initials,
+        phone: conversation.phone,
+        email: conversation.email || "",
+        channel: "WhatsApp",
+        segment: conversation.segment || "Customer",
+        unread: conversation.unread || 0,
+        lastMessage: conversation.preview || "",
+        lastSeen: conversation.time || "",
+        intent: conversation.intent || "general_support",
+        shopify: null,
+        messages: conversation.messages || [],
+      });
+    });
+  }
+
   async function listCustomSegments() {
     const platform = readPlatformState();
-    return platform.segments.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+    const contacts = await jsonContactsForSegments();
+    return platform.segments
+      .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+      .map((segment) => decorateAudienceSegment(segment, contacts));
   }
 
   async function saveCustomSegment(input) {
@@ -2151,7 +2574,30 @@ function createJsonStorage() {
       platform.segments.unshift(segment);
     }
     writePlatformState(platform);
-    return segment;
+    return decorateAudienceSegment(segment, await jsonContactsForSegments());
+  }
+
+  async function deleteCustomSegment(id) {
+    const platform = readPlatformState();
+    const before = platform.segments.length;
+    platform.segments = platform.segments.filter((segment) => segment.id !== id);
+    writePlatformState(platform);
+    return { deleted: before - platform.segments.length };
+  }
+
+  async function duplicateCustomSegment(id) {
+    const platform = readPlatformState();
+    const existing = platform.segments.find((segment) => segment.id === id);
+    if (!existing) throw new Error("segment_not_found");
+    const duplicate = normalizeAudienceSegment({
+      ...existing,
+      id: uuid(),
+      name: `${existing.name} copy`,
+      created_at: new Date().toISOString(),
+    });
+    platform.segments.unshift(duplicate);
+    writePlatformState(platform);
+    return decorateAudienceSegment(duplicate, await jsonContactsForSegments());
   }
 
   async function listBroadcastCampaigns() {
@@ -2240,6 +2686,12 @@ function createJsonStorage() {
     campaign.updated_at = new Date().toISOString();
     writePlatformState(platform);
     return records;
+  }
+
+  async function listBroadcastMessages(campaignId) {
+    const platform = readPlatformState();
+    const campaign = platform.broadcasts.find((item) => item.id === campaignId);
+    return (campaign?.messages || []).slice().sort((a, b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
   }
 
   async function updateBroadcastMessageStatus(status) {
@@ -2334,6 +2786,14 @@ function createJsonStorage() {
         last_synced_at: platform.customerSync?.last_synced_at || "",
         last_checked_at: platform.customerSync?.last_checked_at || "",
         last_skipped: Number(platform.customerSync?.last_skipped || 0),
+        total_checked: Number(platform.customerSync?.total_checked || 0),
+        total_synced: Number(platform.customerSync?.total_synced || 0),
+        total_skipped: Number(platform.customerSync?.total_skipped || platform.customerSync?.last_skipped || 0),
+        pages: Number(platform.customerSync?.pages || 0),
+        syncing: Boolean(platform.customerSync?.syncing),
+        started_at: platform.customerSync?.started_at || "",
+        completed_at: platform.customerSync?.completed_at || "",
+        last_error: platform.customerSync?.last_error || "",
         next_page_info: platform.customerSync?.next_page_info || "",
       };
     },
@@ -2382,11 +2842,14 @@ function createJsonStorage() {
     saveAutomationConfig,
     listCustomSegments,
     saveCustomSegment,
+    deleteCustomSegment,
+    duplicateCustomSegment,
     listBroadcastCampaigns,
     saveBroadcastCampaign,
     markBroadcastCampaignStatus,
     findDueBroadcastCampaigns,
     recordBroadcastMessages,
+    listBroadcastMessages,
     updateBroadcastMessageStatus,
     maintenanceStatus() {
       return {
@@ -3028,6 +3491,14 @@ function createPostgresStorage() {
       last_synced_at: row.last_synced_at || platform.customerSync?.last_synced_at || "",
       last_checked_at: platform.customerSync?.last_checked_at || "",
       last_skipped: Number(platform.customerSync?.last_skipped || 0),
+      total_checked: Number(platform.customerSync?.total_checked || 0),
+      total_synced: Number(platform.customerSync?.total_synced || row.shopify_synced || 0),
+      total_skipped: Number(platform.customerSync?.total_skipped || platform.customerSync?.last_skipped || 0),
+      pages: Number(platform.customerSync?.pages || 0),
+      syncing: Boolean(platform.customerSync?.syncing),
+      started_at: platform.customerSync?.started_at || "",
+      completed_at: platform.customerSync?.completed_at || "",
+      last_error: platform.customerSync?.last_error || "",
       last_total_seen: Number(platform.customerSync?.last_total_seen || 0),
       next_page_info: platform.customerSync?.next_page_info || "",
     };
@@ -3714,7 +4185,8 @@ function createPostgresStorage() {
       `,
       [organizationId]
     );
-    return result.rows.map(mapAudienceSegment);
+    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000) });
+    return result.rows.map((row) => decorateAudienceSegment(mapAudienceSegment(row), contacts));
   }
 
   async function saveCustomSegment(input) {
@@ -3752,7 +4224,52 @@ function createPostgresStorage() {
         segment.description || null,
       ]
     );
-    return mapAudienceSegment(result.rows[0]);
+    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000) });
+    return decorateAudienceSegment(mapAudienceSegment(result.rows[0]), contacts);
+  }
+
+  async function deleteCustomSegment(id) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      delete from audience_segments
+      where id = $1 and organization_id = $2
+      `,
+      [id, organizationId]
+    );
+    return { deleted: Number(result.rowCount || 0) };
+  }
+
+  async function duplicateCustomSegment(id) {
+    const organizationId = await ensureOrganization();
+    const existing = await query(
+      `
+      select *
+      from audience_segments
+      where id = $1 and organization_id = $2
+      limit 1
+      `,
+      [id, organizationId]
+    );
+    if (!existing.rowCount) throw new Error("segment_not_found");
+    const original = mapAudienceSegment(existing.rows[0]);
+    let nextName = `${original.name} copy`;
+    const nameCheck = await query(
+      `
+      select count(*)::int as count
+      from audience_segments
+      where organization_id = $1 and name ilike $2
+      `,
+      [organizationId, `${nextName}%`]
+    );
+    const count = Number(nameCheck.rows[0]?.count || 0);
+    if (count) nextName = `${nextName} ${count + 1}`;
+    return saveCustomSegment({
+      ...original,
+      id: uuid(),
+      name: nextName,
+      created_at: new Date().toISOString(),
+    });
   }
 
   function mapBroadcastCampaign(row) {
@@ -4001,6 +4518,50 @@ function createPostgresStorage() {
     return records;
   }
 
+  async function listBroadcastMessages(campaignId) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      select
+        id,
+        campaign_id,
+        recipient_wa_id,
+        provider_message_id,
+        status,
+        error_message,
+        raw_payload,
+        queued_at,
+        sent_at,
+        delivered_at,
+        read_at,
+        failed_at,
+        created_at,
+        updated_at
+      from broadcast_messages
+      where organization_id = $1 and campaign_id = $2
+      order by coalesce(updated_at, created_at) desc
+      limit 500
+      `,
+      [organizationId, campaignId]
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      campaign_id: row.campaign_id,
+      recipient_wa_id: row.recipient_wa_id || "",
+      provider_message_id: row.provider_message_id || "",
+      status: row.status || "",
+      error_message: row.error_message || "",
+      raw_payload: safeJsonParse(row.raw_payload, {}),
+      queued_at: row.queued_at || "",
+      sent_at: row.sent_at || "",
+      delivered_at: row.delivered_at || "",
+      read_at: row.read_at || "",
+      failed_at: row.failed_at || "",
+      created_at: row.created_at || "",
+      updated_at: row.updated_at || "",
+    }));
+  }
+
   async function updateBroadcastMessageStatus(status, receivedAt = new Date().toISOString()) {
     const statusTime = fromProviderTimestamp(status.timestamp, receivedAt);
     const errorMessage = status.errors?.[0]?.title || status.errors?.[0]?.message || "";
@@ -4184,11 +4745,14 @@ function createPostgresStorage() {
     saveAutomationConfig,
     listCustomSegments,
     saveCustomSegment,
+    deleteCustomSegment,
+    duplicateCustomSegment,
     listBroadcastCampaigns,
     saveBroadcastCampaign,
     markBroadcastCampaignStatus,
     findDueBroadcastCampaigns,
     recordBroadcastMessages,
+    listBroadcastMessages,
     updateBroadcastMessageStatus,
     maintenanceStatus() {
       return {
@@ -4311,6 +4875,14 @@ function createStorage() {
       await storage.ready();
       return storage._impl.saveCustomSegment(...args);
     },
+    async deleteCustomSegment(...args) {
+      await storage.ready();
+      return storage._impl.deleteCustomSegment(...args);
+    },
+    async duplicateCustomSegment(...args) {
+      await storage.ready();
+      return storage._impl.duplicateCustomSegment(...args);
+    },
     async listBroadcastCampaigns(...args) {
       await storage.ready();
       return storage._impl.listBroadcastCampaigns(...args);
@@ -4330,6 +4902,10 @@ function createStorage() {
     async recordBroadcastMessages(...args) {
       await storage.ready();
       return storage._impl.recordBroadcastMessages(...args);
+    },
+    async listBroadcastMessages(...args) {
+      await storage.ready();
+      return storage._impl.listBroadcastMessages(...args);
     },
     async updateBroadcastMessageStatus(...args) {
       await storage.ready();
@@ -4730,6 +5306,32 @@ async function handleApi(req, res, parsed) {
     }
   }
 
+  const segmentPathMatch = parsed.pathname.match(/^\/api\/audience\/segments\/([^/]+)$/);
+  if (segmentPathMatch && req.method === "DELETE") {
+    try {
+      const result = await storage.deleteCustomSegment(decodeURIComponent(segmentPathMatch[1]));
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "segment_delete_failed",
+      });
+    }
+  }
+
+  const segmentDuplicateMatch = parsed.pathname.match(/^\/api\/audience\/segments\/([^/]+)\/duplicate$/);
+  if (segmentDuplicateMatch && req.method === "POST") {
+    try {
+      const segment = await storage.duplicateCustomSegment(decodeURIComponent(segmentDuplicateMatch[1]));
+      return sendJson(res, 200, { ok: true, segment });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "segment_duplicate_failed",
+      });
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/broadcasts") {
     const items = await storage.listBroadcastCampaigns();
     return sendJson(res, 200, { ok: true, items });
@@ -4747,6 +5349,27 @@ async function handleApi(req, res, parsed) {
         error: error?.message || "broadcast_save_failed",
       });
     }
+  }
+
+  const broadcastReportMatch = parsed.pathname.match(/^\/api\/broadcasts\/([^/]+)\/report$/);
+  if (broadcastReportMatch && req.method === "GET") {
+    const campaignId = decodeURIComponent(broadcastReportMatch[1]);
+    const campaigns = await storage.listBroadcastCampaigns();
+    const campaign = campaigns.find((item) => item.id === campaignId);
+    if (!campaign) return sendJson(res, 404, { ok: false, error: "campaign_not_found" });
+    const messages = await storage.listBroadcastMessages(campaignId);
+    return sendJson(res, 200, {
+      ok: true,
+      campaign,
+      messages,
+      summary: {
+        total: messages.length,
+        submitted: messages.filter((item) => ["submitted", "sent", "delivered", "read"].includes(item.status)).length,
+        delivered: messages.filter((item) => ["delivered", "read"].includes(item.status)).length,
+        read: messages.filter((item) => item.status === "read").length,
+        failed: messages.filter((item) => item.status === "failed").length,
+      },
+    });
   }
 
   if (req.method === "POST" && parsed.pathname === "/api/broadcasts/send") {
@@ -4808,6 +5431,27 @@ async function handleApi(req, res, parsed) {
     }
   }
 
+  if (req.method === "POST" && parsed.pathname === "/api/copilot/reply") {
+    try {
+      const rawBody = await readBody(req, 1_000_000);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const conversationId = String(body.conversation_id || "");
+      if (!conversationId) return sendJson(res, 400, { ok: false, error: "conversation_id_required" });
+      const conversation = await storage.getConversation(conversationId);
+      if (!conversation) return sendJson(res, 404, { ok: false, error: "conversation_not_found" });
+      const detail = await conversationResponse(conversation, storage.mode);
+      return sendJson(res, 200, {
+        ok: true,
+        ...buildCopilotResponse(detail, body),
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "copilot_failed",
+      });
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/shopify/segments") {
     const result = await listShopifySegments();
     return sendJson(res, result.ok ? 200 : result.status || 500, {
@@ -4837,16 +5481,30 @@ async function handleApi(req, res, parsed) {
       const saved = await storage.upsertShopifyCustomers(result.customers);
       const checkedAt = new Date().toISOString();
       const platform = readPlatformState();
+      const previousSync = platform.customerSync || {};
+      const isNewRun = !pageInfo;
+      const nextPageInfo = result.nextPageInfo || result.payload?.next_page_info || "";
+      const previousChecked = isNewRun ? 0 : Number(previousSync.total_checked || previousSync.last_total_seen || 0);
+      const previousSynced = isNewRun ? 0 : Number(previousSync.total_synced || previousSync.shopify_synced || 0);
+      const previousSkipped = isNewRun ? 0 : Number(previousSync.total_skipped || previousSync.last_skipped || 0);
+      const pageCount = Number(result.pages || result.payload?.pages || 1);
       writePlatformState({
         ...platform,
         customerSync: {
-          ...(platform.customerSync || {}),
+          ...previousSync,
+          syncing: Boolean(nextPageInfo),
+          started_at: isNewRun ? checkedAt : previousSync.started_at || checkedAt,
           last_checked_at: checkedAt,
-          last_synced_at: saved.synced ? checkedAt : platform.customerSync?.last_synced_at || "",
+          last_synced_at: saved.synced ? checkedAt : previousSync.last_synced_at || "",
           last_total_seen: result.customers.length,
           last_skipped: saved.skipped || 0,
           last_error: saved.errors?.[0]?.reason || "",
-          next_page_info: result.nextPageInfo || result.payload?.next_page_info || "",
+          total_checked: previousChecked + result.customers.length,
+          total_synced: previousSynced + Number(saved.synced || 0),
+          total_skipped: previousSkipped + Number(saved.skipped || 0),
+          pages: (isNewRun ? 0 : Number(previousSync.pages || 0)) + pageCount,
+          completed_at: nextPageInfo ? previousSync.completed_at || "" : checkedAt,
+          next_page_info: nextPageInfo,
         },
       });
       const status = await storage.customerSyncStatus();
@@ -4855,15 +5513,25 @@ async function handleApi(req, res, parsed) {
         synced: saved.synced || 0,
         skipped: saved.skipped || 0,
         total_seen: result.customers.length,
-        pages: result.pages || result.payload?.pages || 0,
+        pages: pageCount,
         truncated: Boolean(result.payload?.truncated),
-        next_page_info: result.nextPageInfo || result.payload?.next_page_info || "",
+        next_page_info: nextPageInfo,
         errors: saved.errors || [],
         note: saved.note || "",
         status,
       });
     } catch (error) {
       console.log(`[shopify.sync_customers] failed error=${error?.message || "unknown"}`);
+      const platform = readPlatformState();
+      writePlatformState({
+        ...platform,
+        customerSync: {
+          ...(platform.customerSync || {}),
+          syncing: false,
+          last_checked_at: new Date().toISOString(),
+          last_error: error?.message || "shopify_customer_sync_failed",
+        },
+      });
       return sendJson(res, 500, {
         ok: false,
         error: error?.message || "shopify_customer_sync_failed",

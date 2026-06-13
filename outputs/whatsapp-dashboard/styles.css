@@ -1102,10 +1102,28 @@ h1 {
   color: var(--ink);
 }
 
+.ghost-button.danger {
+  color: var(--red);
+  border-color: rgba(255, 88, 88, 0.35);
+  background: rgba(255, 88, 88, 0.07);
+}
+
 .danger-button {
   border: 1px solid var(--red);
   background: var(--red-soft);
   color: var(--red);
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.row-actions .ghost-button {
+  min-height: 32px;
+  padding: 0 10px;
 }
 
 .icon-only {
