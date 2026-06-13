@@ -30,6 +30,7 @@ const DISPLAY_PHONE_NUMBER = process.env.WHATSAPP_DISPLAY_PHONE_NUMBER || "";
 const BUSINESS_DISPLAY_NAME = process.env.WHATSAPP_BUSINESS_DISPLAY_NAME || ORGANIZATION_NAME;
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const STORAGE_RETRY_INTERVAL_MS = Number(process.env.STORAGE_RETRY_INTERVAL_MS || 15000);
+const PG_CONNECTION_TIMEOUT_MS = Number(process.env.PG_CONNECTION_TIMEOUT_MS || 5000);
 const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN || "";
 const SHOPIFY_ADMIN_ACCESS_TOKEN =
   process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
@@ -2415,6 +2416,7 @@ function createPostgresStorage() {
   const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: process.env.PGSSL_DISABLE === "true" ? false : { rejectUnauthorized: false },
+    connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
   });
 
   const state = {
