@@ -85,6 +85,9 @@ let systemStatus = {
   storageMode: "",
   attemptedStorageMode: "",
   storageFallbackUsed: false,
+  storageRequirePostgres: false,
+  storageWriteLocked: false,
+  storageWriteLockReason: "",
   phoneNumberConfigured: false,
   runtime: {},
   webhookDiagnostics: null,
@@ -118,6 +121,9 @@ async function loadSystemStatus() {
       storageMode: payload.storage?.active_mode || payload.storage?.mode || payload.outbound?.storage_mode || "",
       attemptedStorageMode: payload.storage?.attempted_mode || payload.storage?.mode || "",
       storageFallbackUsed: Boolean(payload.storage?.fallback_used),
+      storageRequirePostgres: Boolean(payload.storage?.require_postgres),
+      storageWriteLocked: Boolean(payload.storage?.write_locked),
+      storageWriteLockReason: payload.storage?.write_lock_reason || payload.storage?.last_init_error || "",
       phoneNumberConfigured: Boolean(payload.outbound?.phone_number_id_configured),
       runtime: payload.runtime || {},
       webhookDiagnostics: payload.webhook_diagnostics || null,
@@ -135,6 +141,9 @@ async function loadSystemStatus() {
       storageMode: "",
       attemptedStorageMode: "",
       storageFallbackUsed: false,
+      storageRequirePostgres: false,
+      storageWriteLocked: false,
+      storageWriteLockReason: "",
       phoneNumberConfigured: false,
       runtime: {},
       webhookDiagnostics: null,
@@ -948,6 +957,7 @@ async function loadCustomerSyncStatus({ force = false } = {}) {
 }
 
 async function syncShopifyCustomers() {
+  if (!canRunLiveWrite("Shopify customer sync")) return;
   const resumeFromCursor = Boolean(customerSyncStatus.nextPageInfo);
   customerSyncStatus = {
     ...customerSyncStatus,
@@ -1827,7 +1837,7 @@ function renderDashboard() {
   const revenue = revenueStats();
   const tasks = crmTasks();
   const shopifyReady = Boolean(systemStatus.shopify?.enabled);
-  const storageReady = systemStatus.storageMode === "postgres" && !systemStatus.storageFallbackUsed;
+  const storageReady = storageWritesReady();
   const storageLabel = storageReady ? "Saved safely" : "Needs attention";
   const lastMessage = latest ? `${latest.name}: ${latest.preview}` : "Waiting for the first customer conversation.";
   const strictAttributionReady = revenue.trackedCampaigns > 0 && revenue.utmCoverage > 0;
@@ -1877,6 +1887,7 @@ function renderDashboard() {
           ${healthLight("Shopify", shopifyReady, shopifyReady ? "Connected" : "Pending")}
           ${healthLight("Attribution", strictAttributionReady, strictAttributionLabel)}
         </div>
+        ${storageLockBanner()}
       </section>
 
       <section class="metric-grid revenue-grid">
@@ -1943,6 +1954,38 @@ function healthLight(label, isOk, detail) {
       </div>
     </article>
   `;
+}
+
+function storageWritesReady() {
+  return systemStatus.storageMode === "postgres"
+    && !systemStatus.storageFallbackUsed
+    && !systemStatus.storageWriteLocked;
+}
+
+function storageLockBanner() {
+  if (storageWritesReady()) return "";
+  const reason = systemStatus.storageWriteLockReason || "Live database storage is not ready.";
+  return `
+    <section class="storage-lock-banner">
+      <div>
+        <span class="eyebrow">Storage paused</span>
+        <h3>Syncs, replies and broadcasts are locked until Postgres is green.</h3>
+        <p>${escapeHtml(reason)}</p>
+      </div>
+      <span class="badge red">${escapeHtml(systemStatus.storageMode || "No database")}</span>
+    </section>
+  `;
+}
+
+function storageLockMessage() {
+  return systemStatus.storageWriteLockReason
+    || "Postgres storage is not green yet. Live writes are paused to avoid losing data.";
+}
+
+function canRunLiveWrite(actionLabel = "This action") {
+  if (storageWritesReady()) return true;
+  showToast(`${actionLabel} is paused: ${storageLockMessage()}`, 6500);
+  return false;
 }
 
 function revenueCard(item) {
@@ -2107,6 +2150,7 @@ function renderAudience() {
   loadCustomers();
   loadCustomerSyncStatus();
   loadSavedSegments();
+  const writesReady = storageWritesReady();
   if (state.segmentBuilderOpen) return renderSegmentBuilder();
   const customers = filterBySearch(audienceCustomers(), ["name", "email", "phone", "lastMessage", "segment"]);
   const segments = filterBySearch(localSegments(), ["name", "source", "description", "ruleText"]);
@@ -2123,11 +2167,12 @@ function renderAudience() {
           </div>
         </div>
         <div class="toolbar-right">
-          <button class="secondary-button" data-action="sync-shopify-customers">Sync Shopify Customers</button>
+          <button class="secondary-button" data-action="sync-shopify-customers" ${writesReady ? "" : "disabled"}>Sync Shopify Customers</button>
           <button class="ghost-button" data-action="sync-shopify-segments">Sync Segments</button>
-          <button class="primary-button" data-action="open-segment-builder">Create Segment</button>
+          <button class="primary-button" data-action="open-segment-builder" ${writesReady ? "" : "disabled"}>Create Segment</button>
         </div>
       </div>
+      ${storageLockBanner()}
       <input class="search full-search" data-search placeholder="${state.audienceTab === "profiles" ? "Search customers by name, phone, or message" : "Search segments by name, rule, or source"}" value="${escapeHtml(state.search)}" />
       ${customersLastError ? `<section class="panel pad"><span class="badge red">Customer sync issue</span><p class="setting-copy">${escapeHtml(customersLastError)}</p></section>` : ""}
       ${savedSegmentsLastError ? `<section class="panel pad"><span class="badge red">Segment storage issue</span><p class="setting-copy">${escapeHtml(savedSegmentsLastError)}</p></section>` : ""}
@@ -2138,6 +2183,7 @@ function renderAudience() {
 }
 
 function renderCustomerSyncMonitor(customers) {
+  const writesReady = storageWritesReady();
   const loadingSaved = customersLoading && !customersLoadedAt && !customers.length;
   const total = customerSyncStatus.totalAvailable;
   const synced = customerSyncStatus.synced || customers.filter((customer) => customer.channel === "Shopify" || customer.shopify?.matched).length;
@@ -2153,7 +2199,7 @@ function renderCustomerSyncMonitor(customers) {
           <h2>${escapeHtml(customerSyncStatus.syncing ? "Syncing customers into CRM" : loadingSaved ? "Loading saved customers" : "Customer list is saved")}</h2>
           <p>${escapeHtml(customerSyncStatus.syncing ? customerSyncProgressText() : "Synced Shopify contacts are saved in your Customers view and reused for segments and broadcasts.")}</p>
         </div>
-        <button class="primary-button" data-action="sync-shopify-customers" ${customerSyncStatus.syncing ? "disabled" : ""}>${customerSyncStatus.syncing ? "Syncing..." : "Sync Shopify Customers"}</button>
+        <button class="primary-button" data-action="sync-shopify-customers" ${customerSyncStatus.syncing || !writesReady ? "disabled" : ""}>${customerSyncStatus.syncing ? "Syncing..." : "Sync Shopify Customers"}</button>
       </div>
       <div class="sync-progress-track"><span style="width:${percent}%"></span></div>
       <div class="metric-grid four compact-metrics">
@@ -2217,7 +2263,7 @@ function renderSegmentTable(segments) {
           ${segment.custom ? `<button class="ghost-button" data-action="open-segment-builder" data-segment-id="${escapeHtml(segment.id)}">Edit</button>` : ""}
           ${segment.custom ? `<button class="ghost-button" data-action="duplicate-segment" data-segment-id="${escapeHtml(segment.id)}">Duplicate</button>` : ""}
           ${segment.custom ? `<button class="ghost-button danger" data-action="delete-segment" data-segment-id="${escapeHtml(segment.id)}">Delete</button>` : ""}
-          <button class="ghost-button" data-action="open-broadcast-builder" data-segment-id="${escapeHtml(segment.id)}" ${segment.size ? "" : "disabled"}>Broadcast</button>
+          <button class="ghost-button" data-action="open-broadcast-builder" data-segment-id="${escapeHtml(segment.id)}" ${segment.size && storageWritesReady() ? "" : "disabled"}>Broadcast</button>
         </div>
       </td>
     </tr>
@@ -2280,6 +2326,7 @@ function renderSegmentBuilder() {
   const segmentCount = localSegments().length;
   const customerCount = audienceCustomers().length;
   const syncedShopifyCount = shopifySegments.length || 0;
+  const writesReady = storageWritesReady();
   const editingSegment = state.editingSegmentId
     ? localSegments().find((segment) => segment.id === state.editingSegmentId)
     : null;
@@ -2300,8 +2347,9 @@ function renderSegmentBuilder() {
             <span>${syncedShopifyCount || "No"} Shopify segments</span>
           </div>
         </div>
-        <button id="segment-save-button" class="primary-button" data-action="save-segment" disabled>Save Segment</button>
+        <button id="segment-save-button" class="primary-button" data-action="save-segment" disabled ${writesReady ? "" : 'title="Postgres storage needs attention"'}>Save Segment</button>
       </div>
+      ${storageLockBanner()}
       <div class="segment-builder-shell">
         <section class="segment-builder-main segment-composer-card">
           <div class="segment-composer-head">
@@ -2565,6 +2613,7 @@ function renderBroadcasts() {
   loadSavedBroadcasts();
   loadSavedSegments();
   if (state.broadcastBuilderOpen) return renderBroadcastBuilderPage();
+  const writesReady = storageWritesReady();
   const templates = approvedTemplates();
   const scheduled = savedBroadcasts.filter((campaign) => campaign.status === "scheduled").length;
   const sentMessages = savedBroadcasts.reduce((sum, campaign) => sum + Number(campaign.analytics?.sent || 0), 0);
@@ -2578,9 +2627,10 @@ function renderBroadcasts() {
             <h2>Send approved WhatsApp templates to real customers.</h2>
             <p>Broadcasts use templates approved by Meta. Template approval happens in Templates; broadcast sends go through your connected WhatsApp Cloud API number.</p>
           </div>
-          <button class="primary-button" data-action="open-broadcast-builder">Create campaign draft</button>
+          <button class="primary-button" data-action="open-broadcast-builder" ${writesReady ? "" : "disabled"}>Create campaign draft</button>
         </div>
       </section>
+      ${storageLockBanner()}
 
       <div class="metric-grid four">
         ${metric("Approved templates", templates.length, metaTemplatesLastError || "Synced from Meta")}
@@ -2596,7 +2646,7 @@ function renderBroadcasts() {
         </div>
         <div class="builder-actions">
           <button class="secondary-button" data-action="sync-templates">Sync templates</button>
-          <button class="primary-button" data-action="open-broadcast-builder">Create broadcast</button>
+          <button class="primary-button" data-action="open-broadcast-builder" ${writesReady ? "" : "disabled"}>Create broadcast</button>
         </div>
       </section>
 
@@ -2811,7 +2861,7 @@ function renderTemplateTable(rowsData) {
       <td>${escapeHtml(template.language || "-")}</td>
       <td>${escapeHtml(template.created ? formatContextDate(template.created) : "-")}</td>
       <td>${escapeHtml(template.disabled || "-")}</td>
-      <td><button class="ghost-button" data-action="open-broadcast-builder" ${template.status !== "APPROVED" ? "disabled" : ""}>Use</button></td>
+      <td><button class="ghost-button" data-action="open-broadcast-builder" ${template.status !== "APPROVED" || !storageWritesReady() ? "disabled" : ""}>Use</button></td>
     </tr>
   `).join("");
   return table(["Template Name", "Approval Status", "Category", "Usage", "Language", "Created At", "Disabled At", ""], rows);
@@ -3110,6 +3160,7 @@ function renderAutomationInspector() {
 function renderInbox() {
   ensureInboxPolling();
   loadInboxData();
+  const writesReady = storageWritesReady();
   const activeConversations = liveConversations();
   if (!activeConversations.length) {
     return `
@@ -3187,16 +3238,16 @@ function renderInbox() {
         <div class="composer">
           ${replyCopilot(selected, visibleMessages, copilotPrompt)}
           <div class="composer-tools" aria-label="Message attachments">
-            <button class="tool-button" data-action="attach-image" title="Attach image">IMG</button>
-            <button class="tool-button" data-action="attach-document" title="Attach document">DOC</button>
-            <button class="tool-button" data-action="attach-template" title="Use approved template">TPL</button>
+            <button class="tool-button" data-action="attach-image" title="Attach image" ${writesReady ? "" : "disabled"}>IMG</button>
+            <button class="tool-button" data-action="attach-document" title="Attach document" ${writesReady ? "" : "disabled"}>DOC</button>
+            <button class="tool-button" data-action="attach-template" title="Use approved template" ${writesReady ? "" : "disabled"}>TPL</button>
             <button class="tool-button" data-action="attach-quick-reply" title="Add quick reply">QR</button>
           </div>
           <div class="composer-row">
-            <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" value="${escapeHtml(replyDraft)}" />
-            <button class="primary-button" data-action="send-reply">${canSendToWhatsApp ? "Send" : isLiveWebhookConversation ? "Save local" : "Send"}</button>
+            <input id="reply-input" placeholder="Reply to ${escapeHtml(selected.name)}" value="${escapeHtml(replyDraft)}" ${writesReady ? "" : "disabled"} />
+            <button class="primary-button" data-action="send-reply" ${writesReady ? "" : "disabled"}>${canSendToWhatsApp ? "Send" : isLiveWebhookConversation ? "Save local" : "Send"}</button>
           </div>
-          <div class="composer-note">${canSendToWhatsApp ? "Message will be sent from The June Shop WhatsApp." : isLiveWebhookConversation ? "Saved locally until WhatsApp sending is enabled." : "Conversation draft mode."}</div>
+          <div class="composer-note">${writesReady ? (canSendToWhatsApp ? "Message will be sent from The June Shop WhatsApp." : isLiveWebhookConversation ? "Saved locally until WhatsApp sending is enabled." : "Conversation draft mode.") : "Replies are paused until Postgres storage is green."}</div>
         </div>
       </section>
       ${customerContextPanel(selected, visibleMessages, brief)}
@@ -3706,11 +3757,12 @@ function renderSettings() {
   const shopify = systemStatus.shopify || {};
   const webhook = systemStatus.webhookDiagnostics || {};
   const outbound = systemStatus.outboundDiagnostics || {};
+  const writesReady = storageWritesReady();
   const readiness = [
     { label: "Dashboard live", ok: systemStatus.healthLoaded, detail: systemStatus.healthLoaded ? "Railway app responding" : "App not reachable" },
     { label: "WhatsApp webhook", ok: webhook.last_post_ok !== false && Boolean(webhook.last_post_at), detail: webhook.last_post_at ? `Last event ${formatClientRelative(webhook.last_post_at)} ago` : "Waiting for event" },
     { label: "WhatsApp sends", ok: systemStatus.outboundEnabled && outbound.last_attempt_ok !== false, detail: systemStatus.outboundEnabled ? "Outbound configured" : "Needs Meta token" },
-    { label: "Postgres storage", ok: systemStatus.storageMode === "postgres" && !systemStatus.storageFallbackUsed, detail: systemStatus.storageMode || "Unknown" },
+    { label: "Postgres storage", ok: writesReady, detail: writesReady ? "Live database ready" : storageLockMessage() },
     { label: "Shopify data", ok: Boolean(shopify.enabled), detail: shopify.enabled ? "Admin API connected" : "Add Shopify token/domain" },
     { label: "Shopify webhook", ok: Boolean(shopify.webhook_secret_configured), detail: shopify.webhook_secret_configured ? "Secret configured" : "Add webhook secret" },
   ];
@@ -3728,6 +3780,7 @@ function renderSettings() {
         <div class="health-board readiness-board">
           ${readiness.map((item) => healthLight(item.label, item.ok, item.detail)).join("")}
         </div>
+        ${storageLockBanner()}
 
         <div class="setting-row">
           <div>
@@ -4045,6 +4098,7 @@ function escapeRegExp(value) {
 }
 
 async function sendConversationPayload(payload, { successMessage, pendingDraftClear = true } = {}) {
+  if (!canRunLiveWrite("WhatsApp replies")) return;
   const selected = selectedLiveConversation();
   if (!isLiveConversation(selected)) {
     showToast("No live conversation selected.");
@@ -4161,6 +4215,7 @@ async function submitMetaTemplate() {
 }
 
 async function sendBroadcastLive() {
+  if (!canRunLiveWrite("Broadcast sending")) return;
   if (broadcastSending) {
     showToast("Broadcast send is already running.");
     return;
@@ -4282,6 +4337,7 @@ function collectBroadcastPayload(status = "draft") {
 }
 
 async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("draft"), { silent = false, reload = true } = {}) {
+  if (!storageWritesReady()) throw new Error(storageLockMessage());
   if (!payload.template_name) throw new Error("Select an approved template first.");
   if (payload.send_mode === "later" && !payload.scheduled_at) throw new Error("Add schedule date and time.");
   if (payload.status !== "draft") {
@@ -4310,6 +4366,7 @@ async function saveBroadcastCampaignRecord(payload = collectBroadcastPayload("dr
 }
 
 async function simulateAutomationEvent() {
+  if (!canRunLiveWrite("Automation test event")) return;
   const response = await fetch(`${INBOX_API_BASE}/api/automations/test-event`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -4467,7 +4524,7 @@ function updateSegmentBuilderSaveState() {
   if (!button) return;
   const name = document.getElementById("segment-name")?.value?.trim();
   const validRules = collectSegmentBuilderRules().filter(segmentRuleIsValid);
-  button.disabled = !name || !validRules.length;
+  button.disabled = !storageWritesReady() || !name || !validRules.length;
 }
 
 function refreshSegmentRuleControls(row) {
@@ -4515,6 +4572,7 @@ function refreshSegmentEventWindow(row) {
 }
 
 async function saveCustomSegment() {
+  if (!canRunLiveWrite("Segment saving")) return;
   if (document.getElementById("segment-builder")) {
     const payload = collectSegmentBuilderPayload();
     if (!payload) return;
@@ -4602,6 +4660,7 @@ async function saveCustomSegment() {
 }
 
 async function persistAudienceSegment(payload) {
+  if (!storageWritesReady()) throw new Error(storageLockMessage());
   const response = await fetch(`${INBOX_API_BASE}/api/audience/segments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -4616,6 +4675,7 @@ async function persistAudienceSegment(payload) {
 }
 
 async function duplicateAudienceSegment(segmentId) {
+  if (!canRunLiveWrite("Segment duplication")) return;
   if (!segmentId) return;
   const response = await fetch(`${INBOX_API_BASE}/api/audience/segments/${encodeURIComponent(segmentId)}/duplicate`, {
     method: "POST",
@@ -4630,6 +4690,7 @@ async function duplicateAudienceSegment(segmentId) {
 }
 
 async function deleteAudienceSegment(segmentId) {
+  if (!canRunLiveWrite("Segment deletion")) return;
   if (!segmentId) return;
   const segment = localSegments().find((item) => item.id === segmentId);
   if (!window.confirm(`Delete ${segment?.name || "this segment"}?`)) return;
@@ -4721,6 +4782,7 @@ function renderBroadcastBuilderPage() {
   const customerRows = broadcastRecipientRows(defaultRecipients);
   const templatesReady = templates.length;
   const audienceReady = defaultRecipients.length;
+  const writesReady = storageWritesReady();
   return `
     <div id="broadcast-builder" class="campaign-builder-page">
       <div class="segment-builder-header campaign-builder-header">
@@ -4736,10 +4798,11 @@ function renderBroadcastBuilderPage() {
           </div>
         </div>
         <div class="builder-header-actions">
-          <button class="secondary-button" data-action="save-broadcast" ${broadcastSending ? "disabled" : ""}>Save Draft</button>
-          <button class="primary-button" data-action="send-broadcast-live" ${broadcastSending ? "disabled" : ""}>${broadcastSending ? "Sending..." : "Send broadcast"}</button>
+          <button class="secondary-button" data-action="save-broadcast" ${broadcastSending || !writesReady ? "disabled" : ""}>Save Draft</button>
+          <button class="primary-button" data-action="send-broadcast-live" ${broadcastSending || !writesReady ? "disabled" : ""}>${broadcastSending ? "Sending..." : "Send broadcast"}</button>
         </div>
       </div>
+      ${storageLockBanner()}
 
       <div class="builder-page-shell">
         <section class="builder-page-main">
@@ -5399,6 +5462,7 @@ document.addEventListener("click", (event) => {
 
   const handlers = {
     "open-broadcast-modal": () => {
+      if (!canRunLiveWrite("Campaign creation")) return;
       state.broadcastSegmentSeed = actionTarget.dataset.segmentId || "";
       state.broadcastBuilderOpen = true;
       state.screen = "broadcasts";
@@ -5406,6 +5470,7 @@ document.addEventListener("click", (event) => {
       render();
     },
     "open-broadcast-builder": () => {
+      if (!canRunLiveWrite("Campaign creation")) return;
       const selectedAudienceId = actionTarget.dataset.segmentId || "all_customers";
       state.broadcastSegmentSeed = selectedAudienceId;
       state.broadcastAudienceSegmentId = selectedAudienceId;

@@ -29,6 +29,10 @@ const ORGANIZATION_SLUG = process.env.ORGANIZATION_SLUG || "the-june-shop";
 const DISPLAY_PHONE_NUMBER = process.env.WHATSAPP_DISPLAY_PHONE_NUMBER || "";
 const BUSINESS_DISPLAY_NAME = process.env.WHATSAPP_BUSINESS_DISPLAY_NAME || ORGANIZATION_NAME;
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const RUNNING_ON_RAILWAY = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_SERVICE_ID);
+const REQUIRE_POSTGRES_STORAGE =
+  ["1", "true", "yes"].includes(String(process.env.REQUIRE_POSTGRES_STORAGE || "").toLowerCase()) ||
+  (Boolean(DATABASE_URL) && (process.env.NODE_ENV === "production" || RUNNING_ON_RAILWAY));
 const STORAGE_RETRY_INTERVAL_MS = Number(process.env.STORAGE_RETRY_INTERVAL_MS || 15000);
 const PG_CONNECTION_TIMEOUT_MS = Number(process.env.PG_CONNECTION_TIMEOUT_MS || 5000);
 const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN || "";
@@ -989,6 +993,11 @@ function topicEventType(topic) {
 
 function firstTruthy(...values) {
   return values.find((value) => value !== undefined && value !== null && String(value).trim() !== "") || "";
+}
+
+function limitText(value, max = 240) {
+  const text = String(value || "").trim();
+  return text.length > max ? text.slice(0, max) : text;
 }
 
 function payloadContains(payload, patterns) {
@@ -1966,31 +1975,34 @@ function shopifyCustomerPhone(customer) {
 }
 
 function normalizeShopifyContactAttributes(customer) {
+  const defaultAddress = customer.default_address || {};
+  const recentOrders = Array.isArray(customer.orders) ? customer.orders : [];
   return {
     source: "shopify",
     shopify: {
       customer: {
         id: customer.id ? String(customer.id) : "",
-        name: shopifyCustomerName(customer),
-        email: customer.email || "",
-        phone: customer.phone || customer.default_address?.phone || "",
+        name: limitText(shopifyCustomerName(customer), 160),
+        email: limitText(customer.email, 180),
+        phone: limitText(customer.phone || defaultAddress.phone, 40),
         orders_count: Number(customer.orders_count || 0),
         total_spent: customer.total_spent || "0.00",
         display_total_spent: customer.total_spent ? `${customer.currency ? `${customer.currency} ` : ""}${customer.total_spent}` : "-",
-        tags: customer.tags || "",
-        state: customer.state || "",
+        tags: limitText(customer.tags, 500),
+        state: limitText(customer.state, 80),
         accepts_marketing: Boolean(customer.accepts_marketing),
         created_at: customer.created_at || "",
         updated_at: customer.updated_at || "",
-        default_address: customer.default_address
+        default_address: defaultAddress && Object.keys(defaultAddress).length
           ? {
-              city: customer.default_address.city || "",
-              province: customer.default_address.province || "",
-              country: customer.default_address.country || "",
-              zip: customer.default_address.zip || "",
+              city: limitText(defaultAddress.city, 120),
+              province: limitText(defaultAddress.province, 120),
+              country: limitText(defaultAddress.country, 80),
+              zip: limitText(defaultAddress.zip, 40),
             }
           : null,
       },
+      orders: recentOrders.slice(0, 3).map(normalizeShopifyOrder),
     },
   };
 }
@@ -4773,6 +4785,9 @@ function createStorage() {
     active_mode: base.mode,
     last_init_error: null,
     fallback_used: false,
+    require_postgres: REQUIRE_POSTGRES_STORAGE,
+    write_locked: false,
+    write_lock_reason: "",
     last_recovery_attempt_at: "",
     last_recovery_ok: null,
   };
@@ -4804,6 +4819,7 @@ function createStorage() {
           initState.last_init_error = null;
           initState.fallback_used = false;
           initState.last_recovery_ok = true;
+          updateWriteLock();
           console.log("[storage] recovered postgres storage");
           return true;
         })
@@ -4811,6 +4827,7 @@ function createStorage() {
           initState.last_init_error = error?.message || "postgres_recovery_failed";
           initState.fallback_used = true;
           initState.last_recovery_ok = false;
+          updateWriteLock();
           console.error("[storage] postgres recovery failed", error);
           return false;
         })
@@ -4918,6 +4935,14 @@ function createStorage() {
       await storage.ready();
       return storage._impl.storageUsage ? storage._impl.storageUsage() : null;
     },
+    writeLocked() {
+      updateWriteLock();
+      return initState.write_locked;
+    },
+    writeLockReason() {
+      updateWriteLock();
+      return initState.write_lock_reason;
+    },
   };
 
   function activateStorage(impl) {
@@ -4925,6 +4950,14 @@ function createStorage() {
     storage.diagnostics = impl.diagnostics;
     storage._impl = impl;
     initState.active_mode = impl.mode;
+    updateWriteLock();
+  }
+
+  function updateWriteLock() {
+    initState.write_locked = Boolean(REQUIRE_POSTGRES_STORAGE && storage._impl?.mode !== "postgres");
+    initState.write_lock_reason = initState.write_locked
+      ? "Postgres storage is required for live writes, but the app is currently using temporary JSON storage."
+      : "";
   }
 
   initPromise = base
@@ -4932,15 +4965,21 @@ function createStorage() {
     .then(() => {
       console.log(`[storage] mode=${base.mode}`);
       initState.active_mode = base.mode;
+      updateWriteLock();
     })
     .catch((error) => {
       console.error(`[storage] init failed for mode=${base.mode}`, error);
       initState.last_init_error = error?.message || "unknown_init_error";
       if (postgres) {
-        console.log("[storage] falling back to json storage until postgres is ready");
+        console.log(
+          REQUIRE_POSTGRES_STORAGE
+            ? "[storage] postgres unavailable; temporary json is read-only until recovery"
+            : "[storage] falling back to json storage until postgres is ready"
+        );
         const fallback = createJsonStorage();
         activateStorage(fallback);
         initState.fallback_used = true;
+        updateWriteLock();
         return fallback.init();
       }
       throw error;
@@ -4950,6 +4989,35 @@ function createStorage() {
 }
 
 const storage = createStorage();
+
+async function ensureWritableStorage(operation = "write") {
+  await storage.ready();
+  if (!storage.writeLocked()) return;
+  const error = new Error(storage.writeLockReason() || "Live storage is unavailable.");
+  error.status = 503;
+  error.code = "storage_unavailable";
+  error.operation = operation;
+  throw error;
+}
+
+function sendStorageUnavailable(res, error) {
+  return sendJson(res, error?.status || 503, {
+    ok: false,
+    error: error?.code || "storage_unavailable",
+    operation: error?.operation || "write",
+    message:
+      error?.message ||
+      "Postgres storage is not available. Live writes are paused to protect customer and campaign data.",
+    storage: {
+      active_mode: storage.initState?.active_mode || storage.mode,
+      fallback_used: Boolean(storage.initState?.fallback_used),
+      write_locked: Boolean(storage.initState?.write_locked),
+      last_init_error: storage.initState?.last_init_error || null,
+      last_recovery_attempt_at: storage.initState?.last_recovery_attempt_at || "",
+      last_recovery_ok: storage.initState?.last_recovery_ok,
+    },
+  });
+}
 
 let broadcastSchedulerRunning = false;
 
@@ -5004,6 +5072,8 @@ async function runBroadcastScheduler() {
   if (broadcastSchedulerRunning) return;
   broadcastSchedulerRunning = true;
   try {
+    await storage.ready();
+    if (storage.writeLocked()) return;
     const dueCampaigns = await storage.findDueBroadcastCampaigns(5);
     for (const campaign of dueCampaigns) {
       const result = await executeBroadcastCampaign(campaign);
@@ -5098,6 +5168,7 @@ async function handleWebhook(req, res, parsed) {
       const payload = rawBody ? JSON.parse(rawBody) : {};
       const summary = extractSummary(payload);
       const receivedAt = new Date().toISOString();
+      await ensureWritableStorage("whatsapp_webhook_ingest");
       await storage.ingestWebhook(payload, receivedAt, !signature.skipped);
       webhookDiagnostics = {
         ...webhookDiagnostics,
@@ -5112,6 +5183,20 @@ async function handleWebhook(req, res, parsed) {
       );
       return sendJson(res, 200, { ok: true });
     } catch (error) {
+      if (error?.code === "storage_unavailable") {
+        webhookDiagnostics = {
+          ...webhookDiagnostics,
+          last_post_at: new Date().toISOString(),
+          last_post_ok: false,
+          last_post_reason: "storage_unavailable",
+          last_post_summary: null,
+          last_error: {
+            message: error.message,
+            type: error.code,
+          },
+        };
+        return sendStorageUnavailable(res, error);
+      }
       webhookDiagnostics = {
         ...webhookDiagnostics,
         last_post_at: new Date().toISOString(),
@@ -5145,6 +5230,7 @@ async function handleShopifyWebhook(req, res) {
     const payload = rawBody ? JSON.parse(rawBody) : {};
     const topic = req.headers["x-shopify-topic"] || payload.topic || "shopify/event";
     const receivedAt = new Date().toISOString();
+    await ensureWritableStorage("shopify_webhook_ingest");
     const result = await storage.recordAutomationEvent(topic, payload, receivedAt);
 
     console.log(
@@ -5165,6 +5251,7 @@ async function handleShopifyWebhook(req, res) {
       runs_created: result.runs.length,
     });
   } catch (error) {
+    if (error?.code === "storage_unavailable") return sendStorageUnavailable(res, error);
     console.log(`[shopify.webhook] failed error=${error?.message || "unknown"}`);
     return sendJson(res, 400, {
       ok: false,
@@ -5175,6 +5262,26 @@ async function handleShopifyWebhook(req, res) {
 }
 
 async function handleApi(req, res, parsed) {
+  const guardedWriteRoutes = [
+    { method: "PUT", pattern: /^\/api\/automations\/configs\//, operation: "automation_config_save" },
+    { method: "POST", pattern: /^\/api\/automations\/test-event$/, operation: "automation_test_event" },
+    { method: "POST", pattern: /^\/api\/audience\/segments(?:\/.*)?$/, operation: "segment_write" },
+    { method: "DELETE", pattern: /^\/api\/audience\/segments\/[^/]+$/, operation: "segment_delete" },
+    { method: "POST", pattern: /^\/api\/broadcasts(?:\/send)?$/, operation: "broadcast_write" },
+    { method: "POST", pattern: /^\/api\/shopify\/sync-customers$/, operation: "shopify_customer_sync" },
+    { method: "POST", pattern: /^\/api\/inbox\/conversations\/[^/]+\/reply$/, operation: "inbox_reply" },
+  ];
+  const guardedRoute = guardedWriteRoutes.find(
+    (route) => route.method === req.method && route.pattern.test(parsed.pathname)
+  );
+  if (guardedRoute) {
+    try {
+      await ensureWritableStorage(guardedRoute.operation);
+    } catch (error) {
+      return sendStorageUnavailable(res, error);
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/automations/overview") {
     return sendJson(res, 200, {
       ok: true,
@@ -5720,9 +5827,11 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   if (req.method === "GET" && parsed.pathname === "/health") {
-    await storage.ready();
+    await storage.ready().catch((error) => {
+      storage.initState.last_init_error = storage.initState.last_init_error || error?.message || "storage_init_failed";
+    });
     return sendJson(res, 200, {
-      ok: true,
+      ok: !storage.writeLocked(),
       now: new Date().toISOString(),
       dashboard: true,
       webhook: "/webhooks/whatsapp",
@@ -5751,6 +5860,9 @@ const server = http.createServer(async (req, res) => {
         attempted_mode: storage.initState?.attempted_mode || storage.mode,
         active_mode: storage.initState?.active_mode || storage.mode,
         fallback_used: Boolean(storage.initState?.fallback_used),
+        require_postgres: Boolean(storage.initState?.require_postgres),
+        write_locked: Boolean(storage.initState?.write_locked),
+        write_lock_reason: storage.initState?.write_lock_reason || "",
         last_init_error: storage.initState?.last_init_error || null,
         last_recovery_attempt_at: storage.initState?.last_recovery_attempt_at || "",
         last_recovery_ok: storage.initState?.last_recovery_ok,
@@ -5781,15 +5893,33 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && parsed.pathname === "/api/diagnostics/storage") {
     try {
+      const usage = await storage.storageUsage();
       return sendJson(res, 200, {
-        ok: true,
+        ok: !storage.writeLocked(),
         mode: storage.mode,
-        usage: await storage.storageUsage(),
+        attempted_mode: storage.initState?.attempted_mode || storage.mode,
+        active_mode: storage.initState?.active_mode || storage.mode,
+        fallback_used: Boolean(storage.initState?.fallback_used),
+        require_postgres: Boolean(storage.initState?.require_postgres),
+        write_locked: Boolean(storage.initState?.write_locked),
+        write_lock_reason: storage.initState?.write_lock_reason || "",
+        last_init_error: storage.initState?.last_init_error || null,
+        last_recovery_attempt_at: storage.initState?.last_recovery_attempt_at || "",
+        last_recovery_ok: storage.initState?.last_recovery_ok,
+        maintenance: storage.maintenanceStatus ? storage.maintenanceStatus() : null,
+        usage,
       });
     } catch (error) {
       return sendJson(res, 500, {
         ok: false,
         mode: storage.mode,
+        attempted_mode: storage.initState?.attempted_mode || storage.mode,
+        active_mode: storage.initState?.active_mode || storage.mode,
+        fallback_used: Boolean(storage.initState?.fallback_used),
+        require_postgres: Boolean(storage.initState?.require_postgres),
+        write_locked: Boolean(storage.initState?.write_locked),
+        write_lock_reason: storage.initState?.write_lock_reason || "",
+        last_init_error: storage.initState?.last_init_error || null,
         error: error?.message || "storage_diagnostics_failed",
       });
     }

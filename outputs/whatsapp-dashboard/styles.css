@@ -44,6 +44,14 @@ button {
   cursor: pointer;
 }
 
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
@@ -349,6 +357,38 @@ h1 {
   color: var(--muted);
   font-size: 11px;
   font-weight: 750;
+}
+
+.storage-lock-banner {
+  border: 1px solid #f4b4b4;
+  border-left: 4px solid var(--red);
+  border-radius: 8px;
+  background: linear-gradient(90deg, #fff0f0, #fffafa);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  box-shadow: 0 12px 30px rgba(217, 77, 77, 0.08);
+}
+
+.storage-lock-banner h3,
+.storage-lock-banner p {
+  margin: 0;
+}
+
+.storage-lock-banner h3 {
+  margin-top: 8px;
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.storage-lock-banner p {
+  margin-top: 5px;
+  color: #8f3d3d;
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.4;
 }
 
 .light-dot {
