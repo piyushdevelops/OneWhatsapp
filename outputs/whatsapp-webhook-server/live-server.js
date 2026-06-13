@@ -52,6 +52,8 @@ const DB_MAX_WEBHOOK_EVENTS = Number(process.env.DB_MAX_WEBHOOK_EVENTS || 1000);
 const DB_MAX_COMMERCE_EVENTS = Number(process.env.DB_MAX_COMMERCE_EVENTS || 10000);
 const DB_MAX_AUTOMATION_RUNS = Number(process.env.DB_MAX_AUTOMATION_RUNS || 10000);
 const DB_MAX_BROADCAST_MESSAGES = Number(process.env.DB_MAX_BROADCAST_MESSAGES || 25000);
+const DB_CONTACT_COMPACTION_LIMIT = Number(process.env.DB_CONTACT_COMPACTION_LIMIT || 250);
+const DB_CONTACT_COMPACTION_MIN_BYTES = Number(process.env.DB_CONTACT_COMPACTION_MIN_BYTES || 2048);
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -2457,6 +2459,74 @@ function createPostgresStorage() {
     return deletedOld + deletedOverflow;
   }
 
+  async function compactShopifyContactAttributes(limit = DB_CONTACT_COMPACTION_LIMIT) {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      with candidates as (
+        select id
+        from contacts
+        where organization_id = $1
+          and (attributes ? 'shopify' or opt_in_source = 'shopify_sync')
+          and pg_column_size(attributes) > $3
+        order by updated_at desc nulls last, id
+        limit $2
+      )
+      update contacts c
+      set attributes = jsonb_strip_nulls(
+            jsonb_build_object(
+              'source', 'shopify',
+              'shopify', jsonb_build_object(
+                'customer', jsonb_strip_nulls(jsonb_build_object(
+                  'id', nullif(c.attributes #>> '{shopify,customer,id}', ''),
+                  'name', coalesce(nullif(c.display_name, ''), nullif(c.attributes #>> '{shopify,customer,name}', '')),
+                  'email', coalesce(nullif(c.email, ''), nullif(c.attributes #>> '{shopify,customer,email}', '')),
+                  'phone', coalesce(nullif(c.phone_e164, ''), nullif(c.attributes #>> '{shopify,customer,phone}', '')),
+                  'orders_count',
+                    case
+                      when coalesce(c.attributes #>> '{shopify,customer,orders_count}', '') ~ '^[0-9]+$'
+                      then (c.attributes #>> '{shopify,customer,orders_count}')::int
+                      else null
+                    end,
+                  'total_spent', nullif(c.attributes #>> '{shopify,customer,total_spent}', ''),
+                  'display_total_spent', nullif(c.attributes #>> '{shopify,customer,display_total_spent}', ''),
+                  'tags', nullif(c.attributes #>> '{shopify,customer,tags}', ''),
+                  'state', nullif(c.attributes #>> '{shopify,customer,state}', ''),
+                  'accepts_marketing',
+                    case
+                      when lower(coalesce(c.attributes #>> '{shopify,customer,accepts_marketing}', '')) in ('true', 't', 'yes', '1') then true
+                      when lower(coalesce(c.attributes #>> '{shopify,customer,accepts_marketing}', '')) in ('false', 'f', 'no', '0') then false
+                      else null
+                    end,
+                  'created_at', nullif(c.attributes #>> '{shopify,customer,created_at}', ''),
+                  'updated_at', nullif(c.attributes #>> '{shopify,customer,updated_at}', ''),
+                  'default_address',
+                    case
+                      when c.attributes #> '{shopify,customer,default_address}' is null then null
+                      else jsonb_strip_nulls(jsonb_build_object(
+                        'city', nullif(c.attributes #>> '{shopify,customer,default_address,city}', ''),
+                        'province', nullif(c.attributes #>> '{shopify,customer,default_address,province}', ''),
+                        'country', nullif(c.attributes #>> '{shopify,customer,default_address,country}', ''),
+                        'zip', nullif(c.attributes #>> '{shopify,customer,default_address,zip}', '')
+                      ))
+                    end
+                ))
+              )
+            )
+          ),
+          updated_at = now()
+      from candidates
+      where c.id = candidates.id
+      `,
+      [
+        organizationId,
+        Math.max(1, Math.min(Number(limit) || 250, 1000)),
+        Math.max(512, Number(DB_CONTACT_COMPACTION_MIN_BYTES) || 2048),
+      ]
+    );
+    return Number(result.rowCount || 0);
+  }
+
   async function runMaintenance(options = {}) {
     const nowMs = Date.now();
     if (
@@ -2493,6 +2563,7 @@ function createPostgresStorage() {
         DB_BROADCAST_MESSAGE_RETENTION_DAYS,
         DB_MAX_BROADCAST_MESSAGES
       );
+      deleted.contact_attribute_compactions = await compactShopifyContactAttributes();
 
       state.lastMaintenanceAt = new Date(nowMs).toISOString();
       state.lastMaintenanceDeleted = deleted;
@@ -2503,6 +2574,7 @@ function createPostgresStorage() {
         await query("vacuum analyze commerce_events");
         await query("vacuum analyze automation_runs");
         await query("vacuum analyze broadcast_messages");
+        await query("vacuum analyze contacts");
       } catch (vacuumError) {
         console.log(`[storage.maintenance] vacuum skipped: ${vacuumError.message}`);
       }
@@ -2535,12 +2607,33 @@ function createPostgresStorage() {
       limit 20
       `
     );
+    const contactStats = await query(
+      `
+      select
+        count(*)::int as total,
+        count(*) filter (where attributes ? 'shopify' or opt_in_source = 'shopify_sync')::int as shopify,
+        coalesce(round(avg(pg_column_size(attributes))), 0)::int as avg_attributes_bytes,
+        coalesce(max(pg_column_size(attributes)), 0)::int as max_attributes_bytes,
+        count(*) filter (where pg_column_size(attributes) > $1)::int as oversized_attributes
+      from contacts
+      `,
+      [Math.max(512, Number(DB_CONTACT_COMPACTION_MIN_BYTES) || 2048)]
+    );
+    const contacts = contactStats.rows[0] || {};
     return {
       database_bytes: Number(database.rows[0]?.bytes || 0),
       tables: tables.rows.map((row) => ({
         table_name: row.table_name,
         bytes: Number(row.bytes || 0),
       })),
+      contacts: {
+        total: Number(contacts.total || 0),
+        shopify: Number(contacts.shopify || 0),
+        avg_attributes_bytes: Number(contacts.avg_attributes_bytes || 0),
+        max_attributes_bytes: Number(contacts.max_attributes_bytes || 0),
+        oversized_attributes: Number(contacts.oversized_attributes || 0),
+        oversized_threshold_bytes: Math.max(512, Number(DB_CONTACT_COMPACTION_MIN_BYTES) || 2048),
+      },
       maintenance: {
         last_run_at: state.lastMaintenanceAt,
         last_deleted: state.lastMaintenanceDeleted,
@@ -2551,6 +2644,7 @@ function createPostgresStorage() {
           automation_runs: DB_AUTOMATION_RUN_RETENTION_DAYS,
           broadcast_messages: DB_BROADCAST_MESSAGE_RETENTION_DAYS,
         },
+        contact_compaction_limit: DB_CONTACT_COMPACTION_LIMIT,
       },
     };
   }
@@ -2881,7 +2975,10 @@ function createPostgresStorage() {
               display_name = coalesce(nullif(excluded.display_name, ''), contacts.display_name),
               email = coalesce(nullif(excluded.email, ''), contacts.email),
               opt_in_source = coalesce(contacts.opt_in_source, excluded.opt_in_source),
-              attributes = contacts.attributes || excluded.attributes,
+              attributes = jsonb_strip_nulls(
+                (coalesce(contacts.attributes, '{}'::jsonb) - 'shopify' - 'source')
+                || excluded.attributes
+              ),
               updated_at = now()
           `,
           [
