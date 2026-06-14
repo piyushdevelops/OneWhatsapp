@@ -41,7 +41,9 @@ let syncedCustomers = [];
 let customersLoading = false;
 let customersLoadedAt = 0;
 let customersLastError = "";
-let customerPreviewLimit = 25;
+const customerPageSize = 25;
+let customerNextOffset = 0;
+let customersHasMore = false;
 let customerSyncStatus = {
   loading: false,
   syncing: false,
@@ -409,8 +411,12 @@ function audienceCustomers() {
 }
 
 function applyCustomerSyncStatus(status = {}) {
+  const statusText = String(status.status || "").toLowerCase();
   customerSyncStatus = {
     ...customerSyncStatus,
+    syncing: status.syncing === undefined && !statusText
+      ? customerSyncStatus.syncing
+      : Boolean(status.syncing || statusText === "running" || statusText === "syncing"),
     synced: Number(status.shopify_synced ?? status.synced ?? customerSyncStatus.synced ?? 0),
     totalAvailable: status.total_available === null || status.total_available === undefined ? customerSyncStatus.totalAvailable : Number(status.total_available),
     totalContacts: Number(status.total_contacts ?? customerSyncStatus.totalContacts ?? 0),
@@ -419,7 +425,7 @@ function applyCustomerSyncStatus(status = {}) {
     checked: Number(status.total_checked ?? status.last_total_seen ?? customerSyncStatus.checked ?? 0),
     pages: Number(status.pages ?? customerSyncStatus.pages ?? 0),
     lastSyncedAt: status.last_synced_at || customerSyncStatus.lastSyncedAt || "",
-    lastError: status.total_available_error || status.last_error || customerSyncStatus.lastError || "",
+    lastError: status.total_available_error || (status.last_error === undefined ? customerSyncStatus.lastError : String(status.last_error || "")),
     nextPageInfo: status.next_page_info ?? customerSyncStatus.nextPageInfo ?? "",
   };
 }
@@ -906,25 +912,48 @@ function validBroadcastAudienceId(segments, requestedId) {
   return "all_customers";
 }
 
-async function loadCustomers({ force = false, limit = customerPreviewLimit } = {}) {
+function broadcastAudienceEstimate(segmentId, segments, fallbackCount = 0) {
+  if (!segmentId || segmentId === "all_customers") {
+    return customerSyncStatus.totalContacts || customerSyncStatus.synced || fallbackCount;
+  }
+  const segment = (segments || []).find((item) => item.id === segmentId);
+  const size = Number(segment?.size);
+  return Number.isFinite(size) ? size : fallbackCount;
+}
+
+async function loadCustomers({ force = false, append = false, offset = 0, limit = customerPageSize } = {}) {
   if (customersLoading) return;
-  if (!force && Date.now() - customersLoadedAt < 60000) return;
+  if (!force && !append && Date.now() - customersLoadedAt < 60000) return;
   customersLoading = true;
   customersLastError = "";
   try {
+    const requestLimit = Math.max(1, Number(limit) || customerPageSize);
+    const requestOffset = append ? Math.max(0, Number(offset) || 0) : 0;
     const url = new URL(`${INBOX_API_BASE}/api/customers`);
-    url.searchParams.set("limit", String(Math.max(25, Number(limit) || 25)));
+    url.searchParams.set("limit", String(requestLimit));
+    url.searchParams.set("offset", String(requestOffset));
     const response = await fetch(url.toString());
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.ok === false) {
       throw new Error(payload?.error?.message || payload?.error || `Customers returned ${response.status}`);
     }
-    syncedCustomers = (payload.items || []).map(normalizeAudienceCustomer);
+    const incoming = (payload.items || []).map(normalizeAudienceCustomer);
+    if (append) {
+      const existingById = new Map(syncedCustomers.map((customer) => [customer.id || customer.phone, customer]));
+      incoming.forEach((customer) => existingById.set(customer.id || customer.phone, customer));
+      syncedCustomers = Array.from(existingById.values());
+      customerNextOffset = Math.max(customerNextOffset, requestOffset + incoming.length);
+    } else {
+      syncedCustomers = incoming.length || !syncedCustomers.length ? incoming : syncedCustomers;
+      customerNextOffset = incoming.length ? incoming.length : syncedCustomers.length;
+    }
     applyCustomerSyncStatus(payload.sync_status || {
       shopify_synced: payload.counts?.shopify,
       total_contacts: payload.counts?.total,
       whatsapp_contacts: payload.counts?.whatsapp,
     });
+    const total = Number(payload.counts?.total ?? payload.sync_status?.total_contacts ?? customerSyncStatus.totalContacts ?? 0);
+    customersHasMore = total > 0 ? customerNextOffset < total && incoming.length > 0 : incoming.length >= requestLimit;
     customersLoadedAt = Date.now();
   } catch (error) {
     customersLastError = error.message || "Customer sync unavailable";
@@ -962,9 +991,6 @@ async function syncShopifyCustomers() {
   customerSyncStatus = {
     ...customerSyncStatus,
     syncing: true,
-    checked: resumeFromCursor ? customerSyncStatus.checked : 0,
-    pages: resumeFromCursor ? customerSyncStatus.pages : 0,
-    skipped: resumeFromCursor ? customerSyncStatus.skipped : 0,
     lastError: "",
   };
   customersLastError = "";
@@ -1008,7 +1034,9 @@ async function syncShopifyCustomers() {
       if (!pageInfo) break;
     }
     customersLoadedAt = 0;
-    await loadCustomers({ force: true, limit: customerPreviewLimit });
+    customerNextOffset = 0;
+    customersHasMore = false;
+    await loadCustomers({ force: true, append: false, offset: 0, limit: customerPageSize });
     await loadCustomerSyncStatus({ force: true });
     showToast(`Synced ${synced} Shopify customers${skipped ? `, skipped ${skipped} without phone` : ""}.`);
   } catch (error) {
@@ -2203,9 +2231,9 @@ function renderCustomerSyncMonitor(customers) {
       </div>
       <div class="sync-progress-track"><span style="width:${percent}%"></span></div>
       <div class="metric-grid four compact-metrics">
-        ${metric("Shopify synced", synced, total === null ? "Saved contacts with phone" : `${percent}% of Shopify total`)}
-        ${metric("Shopify total", total === null ? "-" : total, customerSyncStatus.totalAvailable === null ? "Total check pending" : "Available in Shopify")}
-        ${metric("All customers", customerSyncStatus.totalContacts || customers.length, "WhatsApp + Shopify saved")}
+        ${metric("Reachable customers", synced, total === null ? "Saved Shopify contacts with phone" : `${percent}% of Shopify total`)}
+        ${metric("Checked in Shopify", customerSyncStatus.checked || (total === null ? "-" : total), customerSyncStatus.totalAvailable === null ? "Total check pending" : "Cursor-safe progress")}
+        ${metric("Saved CRM records", customerSyncStatus.totalContacts || customers.length, "WhatsApp + Shopify index")}
         ${metric("Last synced", lastSynced, customerSyncStatus.skipped ? `${customerSyncStatus.skipped} skipped without phone` : "Ready")}
       </div>
       ${loadingSaved ? `<p class="setting-copy">Pulling saved contacts from the server. Existing synced customers are not being re-imported.</p>` : ""}
@@ -2575,7 +2603,7 @@ function renderShopifySegmentsTable() {
 
 function renderCustomersTable(customers) {
   const total = customerSyncStatus.totalContacts || customers.length;
-  const canLoadMore = customers.length < total;
+  const canLoadMore = customersHasMore && !customersLoading;
   const rows = customers.map((customer) => `
     <tr>
       <td>
@@ -2603,7 +2631,7 @@ function renderCustomersTable(customers) {
     ${table(["Name", "Email Address", "Contact No.", "Channel", "Segment", "Unread", "Last Seen", ""], rows)}
     <div class="table-footer-actions">
       <span>Showing ${customers.length} of ${total} saved customers</span>
-      <button class="secondary-button" data-action="load-more-customers" ${canLoadMore ? "" : "disabled"}>Load 25 more</button>
+      <button class="secondary-button" data-action="load-more-customers" ${canLoadMore ? "" : "disabled"}>${customersLoading ? "Loading..." : "Load next 25"}</button>
     </div>
   `;
 }
@@ -4225,6 +4253,8 @@ async function sendBroadcastLive() {
   const language = campaignPayload.template_language;
   const variables = campaignPayload.variables;
   const recipients = campaignPayload.recipients;
+  const audienceSegmentId = campaignPayload.audience_segment_id || "all_customers";
+  const audienceLabel = campaignPayload.audience_label || "selected audience";
   const optInOk = document.getElementById("broadcast-optin-check")?.checked;
   const templateOk = document.getElementById("broadcast-template-check")?.checked;
 
@@ -4232,8 +4262,8 @@ async function sendBroadcastLive() {
     showToast("Select an approved template first.");
     return;
   }
-  if (!recipients.length) {
-    showToast("Select at least one recipient.");
+  if (!audienceSegmentId) {
+    showToast("Select an audience first.");
     return;
   }
   if (!optInOk || !templateOk) {
@@ -4253,14 +4283,21 @@ async function sendBroadcastLive() {
     sendButton.disabled = true;
     sendButton.textContent = "Sending...";
   }
-  showToast(`Sending broadcast to ${recipients.length} customer${recipients.length === 1 ? "" : "s"}...`, 3200);
+  showToast(`Sending broadcast to ${audienceLabel}...`, 3200);
 
   try {
     const campaign = await saveBroadcastCampaignRecord(campaignPayload, { silent: true, reload: false });
     const response = await fetch(`${INBOX_API_BASE}/api/broadcasts/send`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ campaign_id: campaign.id, template_name, language, variables, recipients }),
+      body: JSON.stringify({
+        campaign_id: campaign.id,
+        template_name,
+        language,
+        variables,
+        audience_segment_id: audienceSegmentId,
+        recipients: [],
+      }),
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.ok === false) {
@@ -4280,8 +4317,8 @@ async function sendBroadcastLive() {
     render();
     const failed = Number(result.failed || 0);
     const message = failed
-      ? `Meta accepted ${result.accepted}/${result.total}. ${failed} failed.`
-      : `Meta accepted ${result.accepted}/${result.total}. Waiting for delivery status.`;
+      ? `Meta accepted ${result.accepted}/${result.total}. ${failed} failed. Open Report for details.`
+      : `Sent to Meta: ${result.accepted}/${result.total}. Delivery status will update from WhatsApp.`;
     showToast(message, 4500);
   } catch (error) {
     showToast(error.message || "Could not send broadcast.", 4500);
@@ -4309,9 +4346,7 @@ function collectBroadcastPayload(status = "draft") {
   const segmentSelect = document.getElementById("broadcast-audience-segment");
   const templateSelect = document.getElementById("broadcast-template-name");
   const selectedTemplateLanguage = templateSelect?.selectedOptions?.[0]?.dataset.language || "";
-  const recipients = Array.from(document.querySelectorAll(".broadcast-recipient:checked"))
-    .map((input) => input.value)
-    .filter(Boolean);
+  const previewRecipients = broadcastEligibleCustomers(recipientsForSegment(segmentSelect?.value || "all_customers"));
   const sendModeRaw = document.getElementById("broadcast-send-mode")?.value || "now";
   const sendMode = sendModeRaw === "later" ? "later" : "now";
   return {
@@ -4320,8 +4355,8 @@ function collectBroadcastPayload(status = "draft") {
     template_language: selectedTemplateLanguage || document.getElementById("broadcast-template-language")?.value?.trim() || "en_US",
     audience_segment_id: segmentSelect?.value || "all_customers",
     audience_label: segmentSelect?.selectedOptions?.[0]?.textContent || "All current WhatsApp customers",
-    recipient_count: recipients.length,
-    recipients,
+    recipient_count: broadcastAudienceEstimate(segmentSelect?.value || "all_customers", localSegments(), previewRecipients.length),
+    recipients: [],
     send_mode: sendMode,
     scheduled_at: broadcastScheduledAt(),
     status: status === "draft" && sendMode === "later" ? "scheduled" : status,
@@ -4728,15 +4763,15 @@ function broadcastRecipientRows(customers) {
   const validCustomers = broadcastEligibleCustomers(customers);
   return validCustomers.length
     ? validCustomers.map((customer) => `
-        <label class="recipient-row">
-          <input type="checkbox" class="broadcast-recipient" value="${escapeHtml(customer.phone.replace(/\D/g, ""))}" checked />
+        <div class="recipient-row">
+          <span class="recipient-sample-dot">WA</span>
           <span>
             <strong>${escapeHtml(customer.name)}</strong>
             <small>${escapeHtml(customer.phone)} · ${escapeHtml(customer.segment || "Customer")}</small>
           </span>
-        </label>
+        </div>
       `).join("")
-    : `<div class="empty-inline"><strong>No customers in this audience</strong><span>Choose another segment or wait for matching customers.</span></div>`;
+    : `<div class="empty-inline"><strong>No preview customers loaded</strong><span>The server will still resolve this audience when sending.</span></div>`;
 }
 
 function broadcastEligibleCustomers(customers) {
@@ -4757,11 +4792,12 @@ function broadcastBuilderData() {
   const selectedSegmentId = validBroadcastAudienceId(segments, requestedSegmentId);
   state.broadcastAudienceSegmentId = selectedSegmentId;
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
+  const audienceEstimate = broadcastAudienceEstimate(selectedSegmentId, segments, defaultRecipients.length);
   const templateOptions = templates.length
     ? templates.map((template) => `<option value="${escapeHtml(template.name)}" data-language="${escapeHtml(template.language || "en_US")}">${escapeHtml(template.name)} - ${escapeHtml(template.category || "Template")} - ${escapeHtml(template.language || "en_US")}</option>`).join("")
     : `<option value="">No approved templates synced</option>`;
   const segmentOptions = [
-    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${customers.length})</option>`,
+    `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${broadcastAudienceEstimate("all_customers", segments, customers.length)})</option>`,
     selectedSegmentId !== "all_customers" && !segments.some((segment) => segment.id === selectedSegmentId)
       ? `<option value="${escapeHtml(selectedSegmentId)}" selected>Loading selected audience...</option>`
       : "",
@@ -4772,16 +4808,16 @@ function broadcastBuilderData() {
     customers,
     segments,
     defaultRecipients,
+    audienceEstimate,
     templateOptions,
     segmentOptions,
   };
 }
 
 function renderBroadcastBuilderPage() {
-  const { templates, customers, segments, defaultRecipients, templateOptions, segmentOptions } = broadcastBuilderData();
+  const { templates, customers, segments, defaultRecipients, audienceEstimate, templateOptions, segmentOptions } = broadcastBuilderData();
   const customerRows = broadcastRecipientRows(defaultRecipients);
   const templatesReady = templates.length;
-  const audienceReady = defaultRecipients.length;
   const writesReady = storageWritesReady();
   return `
     <div id="broadcast-builder" class="campaign-builder-page">
@@ -4793,7 +4829,7 @@ function renderBroadcastBuilderPage() {
           <p>Choose an approved Meta template, attach a Shopify-ready UTM plan, and send only to an opted-in audience.</p>
           <div class="segment-builder-pills">
             <span>${templatesReady} approved templates</span>
-            <span>${customers.length} WhatsApp customers</span>
+            <span>${broadcastAudienceEstimate("all_customers", segments, customers.length)} reachable customers</span>
             <span>${segments.length} live segments</span>
           </div>
         </div>
@@ -4891,13 +4927,14 @@ function renderBroadcastBuilderPage() {
 
         <aside class="builder-page-side">
           <section class="segment-score-card">
-            <div><strong id="broadcast-recipient-count">${audienceReady}</strong><span>selected recipients</span></div>
+            <div><strong id="broadcast-recipient-count">${audienceEstimate}</strong><span>estimated recipients</span></div>
             <div><strong>${templatesReady}</strong><span>approved templates</span></div>
             <div><strong>${segments.length || "-"}</strong><span>usable segments</span></div>
           </section>
           <section class="segment-insight-card">
             <span class="eyebrow">Recipient preview</span>
             <h3>Audience sample</h3>
+            <p class="setting-copy">Preview shows loaded rows only. Sending resolves the full selected audience on the server.</p>
             <div class="recipient-list">${customerRows}</div>
           </section>
           <section class="segment-use-card">
@@ -5562,10 +5599,8 @@ document.addEventListener("click", (event) => {
       syncShopifyCustomers().catch((error) => showToast(error.message || "Shopify customer sync failed."));
     },
     "load-more-customers": () => {
-      customerPreviewLimit += 25;
-      customersLoadedAt = 0;
-      loadCustomers({ force: true, limit: customerPreviewLimit });
-      showToast(`Loading ${customerPreviewLimit} customers.`);
+      loadCustomers({ force: true, append: true, offset: customerNextOffset, limit: customerPageSize });
+      showToast("Loading next 25 customers.");
     },
     "download-report": () => showToast("Report export queued."),
     "refresh-live-data": () => {
@@ -5775,11 +5810,12 @@ document.addEventListener("change", (event) => {
   }
   if (target.id === "broadcast-audience-segment") {
     state.broadcastAudienceSegmentId = target.value || "all_customers";
+    const segments = localSegments();
     const recipients = broadcastEligibleCustomers(recipientsForSegment(target.value));
     const list = document.querySelector(".recipient-list");
     const count = document.getElementById("broadcast-recipient-count");
     if (list) list.innerHTML = broadcastRecipientRows(recipients);
-    if (count) count.textContent = String(recipients.length);
+    if (count) count.textContent = String(broadcastAudienceEstimate(target.value, segments, recipients.length));
   }
   if (target.id?.startsWith("template-create-")) {
     updateTemplatePreview();

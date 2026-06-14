@@ -811,6 +811,19 @@ h1 {
   border-bottom: 1px solid var(--line);
 }
 
+.recipient-sample-dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #e8f8df;
+  color: #2f7f28;
+  font-size: 10px;
+  font-weight: 800;
+}
+
 .recipient-row:last-child {
   border-bottom: 0;
 }

@@ -142,6 +142,63 @@ create table if not exists commerce_events (
   unique (provider, event_fingerprint)
 );
 
+create table if not exists shopify_customer_index (
+  id uuid primary key,
+  organization_id uuid not null references organizations(id) on delete cascade,
+  shopify_customer_id text not null,
+  phone_e164 text not null,
+  wa_id text not null,
+  display_name text,
+  email text,
+  tags text,
+  orders_count integer not null default 0,
+  total_spent numeric(14, 2) not null default 0,
+  currency text not null default 'INR',
+  last_order_at timestamptz,
+  city text,
+  province text,
+  country text,
+  zip text,
+  accepts_marketing boolean,
+  shopify_created_at timestamptz,
+  shopify_updated_at timestamptz,
+  recent_orders jsonb not null default '[]'::jsonb,
+  detail_synced_at timestamptz,
+  synced_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (organization_id, phone_e164)
+);
+
+create table if not exists shopify_sync_state (
+  organization_id uuid primary key references organizations(id) on delete cascade,
+  status text not null default 'idle',
+  cursor text,
+  checked_count integer not null default 0,
+  indexed_count integer not null default 0,
+  skipped_count integer not null default 0,
+  pages integer not null default 0,
+  total_available integer,
+  last_error text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  last_checked_at timestamptz,
+  last_synced_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+alter table shopify_sync_state
+  add column if not exists pages integer not null default 0;
+
+alter table shopify_sync_state
+  add column if not exists total_available integer;
+
+alter table shopify_customer_index
+  add column if not exists recent_orders jsonb not null default '[]'::jsonb;
+
+alter table shopify_customer_index
+  add column if not exists detail_synced_at timestamptz;
+
 create table if not exists automation_runs (
   id uuid primary key,
   organization_id uuid not null references organizations(id) on delete cascade,
@@ -307,6 +364,11 @@ create index if not exists automation_runs_org_created_idx on automation_runs (o
 create index if not exists automation_runs_status_idx on automation_runs (organization_id, status, created_at desc);
 create index if not exists automation_configs_org_idx on automation_configs (organization_id, automation_id);
 create index if not exists audience_segments_org_updated_idx on audience_segments (organization_id, updated_at desc);
+
+create index if not exists shopify_customer_index_org_customer_idx on shopify_customer_index (organization_id, shopify_customer_id);
+create index if not exists shopify_customer_index_org_updated_idx on shopify_customer_index (organization_id, updated_at desc);
+create index if not exists shopify_customer_index_org_last_order_idx on shopify_customer_index (organization_id, last_order_at desc);
+create index if not exists shopify_customer_index_org_total_spent_idx on shopify_customer_index (organization_id, total_spent desc);
 create index if not exists broadcast_campaigns_org_status_idx on broadcast_campaigns (organization_id, status, updated_at desc);
 create index if not exists broadcast_campaigns_scheduled_idx on broadcast_campaigns (organization_id, scheduled_at)
   where scheduled_at is not null;

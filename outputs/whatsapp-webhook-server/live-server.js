@@ -40,6 +40,7 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN =
   process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || "";
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 const SHOPIFY_LOOKUP_TTL_MS = Number(process.env.SHOPIFY_LOOKUP_TTL_MS || 300000);
+const SHOPIFY_DETAIL_CACHE_TTL_MS = Number(process.env.SHOPIFY_DETAIL_CACHE_TTL_MS || 10 * 60 * 1000);
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 const AUTOMATION_EVENTS_FILE =
   process.env.AUTOMATION_EVENTS_FILE || path.join(DATA_DIR, "automation-events.json");
@@ -621,7 +622,16 @@ function segmentCustomerStats(customer = {}) {
   const totalSpent = numberValue(shopifyCustomer.total_spent || shopifyCustomer.display_total_spent);
   const orderCount = Number(shopifyCustomer.orders_count || orders.length || 0);
   const averageOrder = orderCount ? totalSpent / orderCount : 0;
-  const latestOrder = orders[0] || null;
+  const latestOrder = orders[0] || (shopifyCustomer.last_order_at
+    ? {
+        processed_at: shopifyCustomer.last_order_at,
+        created_at: shopifyCustomer.last_order_at,
+        financial_status: "",
+        fulfillment_status: "",
+        shipping_address: shopifyCustomer.default_address || {},
+        line_items: [],
+      }
+    : null);
   const latestAddress = latestOrder?.shipping_address || shopifyCustomer.default_address || {};
   const productText = orders
     .flatMap((order) => Array.isArray(order.line_items) ? order.line_items : [])
@@ -2007,6 +2017,156 @@ function normalizeShopifyContactAttributes(customer) {
   };
 }
 
+function isoDateOrNull(value) {
+  const date = dateValue(value);
+  return date ? date.toISOString() : null;
+}
+
+function normalizeShopifyIndexCustomer(customer) {
+  const phone = shopifyCustomerPhone(customer);
+  if (!phone) return null;
+  const defaultAddress = customer.default_address || {};
+  const totalSpent = Number(customer.total_spent || 0);
+  const recentOrders = Array.isArray(customer.orders) ? customer.orders : [];
+  const lastOrderAt = firstTruthy(
+    customer.last_order?.processed_at,
+    customer.last_order?.created_at,
+    customer.last_order_date,
+    recentOrders[0]?.processed_at,
+    recentOrders[0]?.created_at,
+    Number(customer.orders_count || recentOrders.length || 0) ? customer.updated_at : ""
+  );
+  return {
+    shopify_customer_id: customer.id ? String(customer.id) : compactDigits(phone),
+    phone_e164: phone,
+    wa_id: compactDigits(phone),
+    display_name: limitText(shopifyCustomerName(customer), 160),
+    email: limitText(customer.email, 180),
+    tags: limitText(customer.tags, 1000),
+    orders_count: Number(customer.orders_count || recentOrders.length || 0),
+    total_spent: Number.isFinite(totalSpent) ? totalSpent : 0,
+    currency: customer.currency || customer.presentment_currency || "INR",
+    last_order_at: isoDateOrNull(lastOrderAt),
+    city: limitText(defaultAddress.city, 120),
+    province: limitText(defaultAddress.province || defaultAddress.province_code, 120),
+    country: limitText(defaultAddress.country || defaultAddress.country_code, 80),
+    zip: limitText(defaultAddress.zip, 40),
+    accepts_marketing: customer.accepts_marketing === undefined ? null : Boolean(customer.accepts_marketing),
+    shopify_created_at: isoDateOrNull(customer.created_at),
+    shopify_updated_at: isoDateOrNull(customer.updated_at),
+    recent_orders: recentOrders.slice(0, 5).map(normalizeShopifyOrder),
+  };
+}
+
+function shopifyIndexPayload(row = {}) {
+  const orders = Array.isArray(row.recent_orders)
+    ? row.recent_orders
+    : safeJsonParse(row.recent_orders, []);
+  const displayName = row.display_name || row.email || row.phone_e164 || row.wa_id || "Shopify customer";
+  const totalSpent = Number(row.total_spent || 0);
+  const currency = row.currency || "INR";
+  return {
+    connected: true,
+    matched: true,
+    customer: {
+      id: row.shopify_customer_id ? String(row.shopify_customer_id) : "",
+      name: displayName,
+      email: row.email || "",
+      phone: row.phone_e164 || formatPhone(row.wa_id),
+      orders_count: Number(row.orders_count || 0),
+      total_spent: String(totalSpent),
+      display_total_spent: totalSpent ? `${currency} ${totalSpent.toFixed(2)}` : "-",
+      tags: row.tags || "",
+      state: row.province || "",
+      last_order_at: row.last_order_at || "",
+      accepts_marketing: row.accepts_marketing,
+      created_at: row.shopify_created_at || "",
+      updated_at: row.shopify_updated_at || "",
+      default_address: {
+        city: row.city || "",
+        province: row.province || "",
+        country: row.country || "",
+        zip: row.zip || "",
+      },
+    },
+    orders: orders.slice(0, 5),
+  };
+}
+
+function shopifyIndexPayloadFromAliasedRow(row = {}) {
+  if (!row.sci_shopify_customer_id) return null;
+  return shopifyIndexPayload({
+    id: row.sci_id,
+    shopify_customer_id: row.sci_shopify_customer_id,
+    phone_e164: row.sci_phone_e164,
+    wa_id: row.sci_wa_id,
+    display_name: row.sci_display_name,
+    email: row.sci_email,
+    tags: row.sci_tags,
+    orders_count: row.sci_orders_count,
+    total_spent: row.sci_total_spent,
+    currency: row.sci_currency,
+    last_order_at: row.sci_last_order_at,
+    city: row.sci_city,
+    province: row.sci_province,
+    country: row.sci_country,
+    zip: row.sci_zip,
+    accepts_marketing: row.sci_accepts_marketing,
+    shopify_created_at: row.sci_shopify_created_at,
+    shopify_updated_at: row.sci_shopify_updated_at,
+    recent_orders: row.sci_recent_orders,
+    detail_synced_at: row.sci_detail_synced_at,
+    synced_at: row.sci_synced_at,
+    created_at: row.sci_created_at,
+    updated_at: row.sci_updated_at,
+  });
+}
+
+function shopifyIndexCustomerListItem(row = {}) {
+  const shopify = shopifyIndexPayload(row);
+  const displayName = row.display_name || shopify.customer.name;
+  const latestCreatedAt = row.latest_created_at || row.last_message_at || row.updated_at || row.synced_at || row.created_at;
+  const latestMessage = row.latest_created_at
+    ? previewForStoredMessage({
+        direction: row.latest_direction,
+        message_type: row.latest_message_type,
+        body: row.latest_body,
+        template_name: row.latest_template_name,
+        media_url: row.latest_media_url,
+      })
+    : "Synced from Shopify";
+  return {
+    id: row.index_id || row.contact_id || row.shopify_customer_id || row.phone_e164,
+    conversation_id: row.conversation_id || "",
+    wa_id: row.wa_id || compactDigits(row.phone_e164),
+    name: displayName,
+    initials: initials(displayName, row.phone_e164 || row.wa_id),
+    phone: row.phone_e164 || formatPhone(row.wa_id),
+    email: row.email || "",
+    channel: row.conversation_id ? "WhatsApp" : "Shopify",
+    segment: row.conversation_id ? "WhatsApp customer" : "Shopify customer",
+    unread: Number(row.unread_count || 0),
+    lastMessage: latestMessage,
+    lastSeen: latestCreatedAt ? formatRelative(latestCreatedAt) : "-",
+    latest_message_at: row.last_message_at || row.latest_created_at || "",
+    intent: row.intent || "customer_profile",
+    opt_in_status: row.opt_in_status || "unknown",
+    opt_in_source: row.opt_in_source || "shopify_index",
+    shopify,
+    messages: row.latest_created_at
+      ? [{
+          direction: row.latest_direction,
+          message_type: row.latest_message_type,
+          body: row.latest_body,
+          status: row.latest_status,
+          created_at: row.latest_created_at,
+          template_name: row.latest_template_name,
+          media_url: row.latest_media_url,
+        }]
+      : [],
+  };
+}
+
 async function fetchShopifyCustomers(maxPages = 1, startPageInfo = "") {
   const customers = [];
   let pageInfo = startPageInfo || "";
@@ -2238,7 +2398,9 @@ function normalizeConversation(conversation, storageMode = "json") {
 
 async function conversationResponse(conversation, storageMode = "json") {
   const normalized = normalizeConversation(conversation, storageMode);
-  const shopify = await lookupShopifyCustomerByPhone(normalized.phone || normalized.wa_id);
+  const shopify = conversation.shopify
+    || normalized.shopify
+    || await lookupShopifyCustomerByPhone(normalized.phone || normalized.wa_id);
   return {
     ...normalized,
     customer: {
@@ -2788,6 +2950,9 @@ function createJsonStorage() {
         note: "Shopify customer sync requires Postgres storage.",
       };
     },
+    async recordShopifySyncProgress() {
+      return this.customerSyncStatus();
+    },
     async customerSyncStatus() {
       const platform = readPlatformState();
       const contacts = buildInbox();
@@ -2811,6 +2976,15 @@ function createJsonStorage() {
     },
     async getConversation(id) {
       return buildInbox().find((item) => item.id === id) || null;
+    },
+    async getShopifyCustomerDetail() {
+      return null;
+    },
+    async resolveBroadcastRecipients(segmentId, limit = 250) {
+      return buildInbox()
+        .map((item) => compactDigits(item.phone || item.wa_id))
+        .filter(Boolean)
+        .slice(0, Math.max(1, Math.min(Number(limit) || 250, 250)));
     },
     async saveReply(conversation, request, outbound) {
       const replies = readReplies();
@@ -3416,6 +3590,35 @@ function createPostgresStorage() {
     }
   }
 
+  async function cleanupShopifyOnlyContacts() {
+    const organizationId = await ensureOrganization();
+    const result = await query(
+      `
+      delete from contacts ct
+      where ct.organization_id = $1
+        and (
+          ct.opt_in_source = 'shopify_sync'
+          or ct.attributes->>'source' = 'shopify'
+          or ct.attributes ? 'shopify'
+        )
+        and not exists (
+          select 1
+          from conversations c
+          where c.organization_id = ct.organization_id
+            and c.contact_id = ct.id
+        )
+        and not exists (
+          select 1
+          from messages m
+          where m.organization_id = ct.organization_id
+            and m.contact_id = ct.id
+        )
+      `,
+      [organizationId]
+    );
+    return Number(result.rowCount || 0);
+  }
+
   async function upsertShopifyCustomers(customers) {
     await runMaintenance();
     const organizationId = await ensureOrganization();
@@ -3424,95 +3627,249 @@ function createPostgresStorage() {
     const errors = [];
 
     for (const customer of customers || []) {
-      const phone = shopifyCustomerPhone(customer);
-      if (!phone) {
+      const indexed = normalizeShopifyIndexCustomer(customer);
+      if (!indexed) {
         skipped += 1;
         continue;
       }
 
-      const attributes = normalizeShopifyContactAttributes(customer);
       try {
         await query(
           `
-          insert into contacts (
+          insert into shopify_customer_index (
             id,
             organization_id,
-            wa_id,
+            shopify_customer_id,
             phone_e164,
+            wa_id,
             display_name,
             email,
-            opt_in_status,
-            opt_in_source,
-            attributes,
+            tags,
+            orders_count,
+            total_spent,
+            currency,
+            last_order_at,
+            city,
+            province,
+            country,
+            zip,
+            accepts_marketing,
+            shopify_created_at,
+            shopify_updated_at,
+            recent_orders,
+            synced_at,
             updated_at
           )
-          values ($1, $2, $3, $4, $5, $6, 'unknown', 'shopify_sync', $7::jsonb, now())
+          values (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            $9, $10, $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20::jsonb, now(), now()
+          )
           on conflict (organization_id, phone_e164) do update
-          set wa_id = coalesce(contacts.wa_id, excluded.wa_id),
-              display_name = coalesce(nullif(excluded.display_name, ''), contacts.display_name),
-              email = coalesce(nullif(excluded.email, ''), contacts.email),
-              opt_in_source = coalesce(contacts.opt_in_source, excluded.opt_in_source),
-              attributes = jsonb_strip_nulls(
-                (coalesce(contacts.attributes, '{}'::jsonb) - 'shopify' - 'source')
-                || excluded.attributes
-              ),
+          set shopify_customer_id = excluded.shopify_customer_id,
+              wa_id = excluded.wa_id,
+              display_name = coalesce(nullif(excluded.display_name, ''), shopify_customer_index.display_name),
+              email = coalesce(nullif(excluded.email, ''), shopify_customer_index.email),
+              tags = coalesce(excluded.tags, shopify_customer_index.tags),
+              orders_count = excluded.orders_count,
+              total_spent = excluded.total_spent,
+              currency = excluded.currency,
+              last_order_at = coalesce(excluded.last_order_at, shopify_customer_index.last_order_at),
+              city = coalesce(nullif(excluded.city, ''), shopify_customer_index.city),
+              province = coalesce(nullif(excluded.province, ''), shopify_customer_index.province),
+              country = coalesce(nullif(excluded.country, ''), shopify_customer_index.country),
+              zip = coalesce(nullif(excluded.zip, ''), shopify_customer_index.zip),
+              accepts_marketing = coalesce(excluded.accepts_marketing, shopify_customer_index.accepts_marketing),
+              shopify_created_at = coalesce(excluded.shopify_created_at, shopify_customer_index.shopify_created_at),
+              shopify_updated_at = coalesce(excluded.shopify_updated_at, shopify_customer_index.shopify_updated_at),
+              recent_orders = case
+                when excluded.recent_orders <> '[]'::jsonb then excluded.recent_orders
+                else shopify_customer_index.recent_orders
+              end,
+              synced_at = now(),
               updated_at = now()
           `,
           [
             uuid(),
             organizationId,
-            compactDigits(phone),
-            phone,
-            shopifyCustomerName(customer),
-            customer.email || "",
-            JSON.stringify(attributes),
+            indexed.shopify_customer_id,
+            indexed.phone_e164,
+            indexed.wa_id,
+            indexed.display_name || "",
+            indexed.email || "",
+            indexed.tags || "",
+            indexed.orders_count,
+            indexed.total_spent,
+            indexed.currency,
+            indexed.last_order_at,
+            indexed.city || "",
+            indexed.province || "",
+            indexed.country || "",
+            indexed.zip || "",
+            indexed.accepts_marketing,
+            indexed.shopify_created_at,
+            indexed.shopify_updated_at,
+            JSON.stringify(indexed.recent_orders || []),
           ]
         );
         synced += 1;
       } catch (error) {
         errors.push({
-          customer_id: customer.id ? String(customer.id) : "",
-          reason: error?.message || "contact_upsert_failed",
+          customer_id: indexed.shopify_customer_id || "",
+          reason: error?.message || "shopify_index_upsert_failed",
         });
       }
     }
 
-    return { synced, skipped, errors };
+    const cleanupDeleted = synced ? await cleanupShopifyOnlyContacts() : 0;
+    return { synced, skipped, errors, cleanup_deleted: cleanupDeleted };
+  }
+
+  async function recordShopifySyncProgress(progress = {}) {
+    const organizationId = await ensureOrganization();
+    const existing = await query(
+      `
+      select *
+      from shopify_sync_state
+      where organization_id = $1
+      limit 1
+      `,
+      [organizationId]
+    );
+    const current = existing.rows[0] || {};
+    const isNewRun = Boolean(progress.is_new_run);
+    const checked = (isNewRun ? 0 : Number(current.checked_count || 0)) + Number(progress.checked || 0);
+    const indexed = (isNewRun ? 0 : Number(current.indexed_count || 0)) + Number(progress.indexed || 0);
+    const skipped = (isNewRun ? 0 : Number(current.skipped_count || 0)) + Number(progress.skipped || 0);
+    const pages = (isNewRun ? 0 : Number(current.pages || 0)) + Number(progress.pages || 0);
+    const cursor = progress.next_page_info ?? progress.cursor ?? current.cursor ?? "";
+    const lastError = progress.last_error === undefined
+      ? current.last_error || ""
+      : String(progress.last_error || "");
+    const status = progress.status || (lastError ? "failed" : cursor ? "syncing" : "completed");
+    const now = new Date().toISOString();
+    const startedAt = isNewRun ? now : current.started_at || now;
+    const completedAt = status === "syncing" ? current.completed_at || null : now;
+    const lastSyncedAt = Number(progress.indexed || 0) > 0 ? now : current.last_synced_at || null;
+    const totalAvailable = progress.total_available === undefined
+      ? current.total_available
+      : progress.total_available;
+
+    await query(
+      `
+      insert into shopify_sync_state (
+        organization_id,
+        status,
+        cursor,
+        checked_count,
+        indexed_count,
+        skipped_count,
+        pages,
+        total_available,
+        last_error,
+        started_at,
+        completed_at,
+        last_checked_at,
+        last_synced_at,
+        updated_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+      on conflict (organization_id) do update
+      set status = excluded.status,
+          cursor = excluded.cursor,
+          checked_count = excluded.checked_count,
+          indexed_count = excluded.indexed_count,
+          skipped_count = excluded.skipped_count,
+          pages = excluded.pages,
+          total_available = coalesce(excluded.total_available, shopify_sync_state.total_available),
+          last_error = excluded.last_error,
+          started_at = excluded.started_at,
+          completed_at = excluded.completed_at,
+          last_checked_at = excluded.last_checked_at,
+          last_synced_at = coalesce(excluded.last_synced_at, shopify_sync_state.last_synced_at),
+          updated_at = now()
+      `,
+      [
+        organizationId,
+        status,
+        cursor || null,
+        checked,
+        indexed,
+        skipped,
+        pages,
+        totalAvailable === undefined ? null : totalAvailable,
+        lastError || null,
+        startedAt,
+        completedAt,
+        now,
+        lastSyncedAt,
+      ]
+    );
+    return customerSyncStatus();
   }
 
   async function customerSyncStatus() {
     const organizationId = await ensureOrganization();
-    const platform = readPlatformState();
     const result = await query(
       `
+      with stats as (
+        select
+          (select count(*)::int from shopify_customer_index where organization_id = $1) as shopify_synced,
+          (select count(*)::int from contacts where organization_id = $1 and last_inbound_at is not null) as whatsapp_contacts,
+          (
+            select count(*)::int
+            from contacts ct
+            where ct.organization_id = $1
+              and not exists (
+                select 1
+                from shopify_customer_index sci
+                where sci.organization_id = ct.organization_id
+                  and sci.wa_id = regexp_replace(coalesce(ct.phone_e164, ct.wa_id, ''), '\\D', '', 'g')
+              )
+          ) as whatsapp_only,
+          (select max(synced_at) from shopify_customer_index where organization_id = $1) as indexed_synced_at
+      )
       select
-        count(*)::int as total_contacts,
-        count(*) filter (where attributes->>'source' = 'shopify')::int as shopify_synced,
-        count(*) filter (where last_inbound_at is not null)::int as whatsapp_contacts,
-        max(updated_at) filter (where attributes->>'source' = 'shopify') as last_synced_at
-      from contacts
-      where organization_id = $1
+        stats.*,
+        ss.status,
+        ss.cursor,
+        ss.checked_count,
+        ss.indexed_count,
+        ss.skipped_count,
+        ss.pages,
+        ss.total_available,
+        ss.last_error,
+        ss.started_at,
+        ss.completed_at,
+        ss.last_checked_at,
+        ss.last_synced_at
+      from stats
+      left join shopify_sync_state ss on ss.organization_id = $1
       `,
       [organizationId]
     );
     const row = result.rows[0] || {};
+    const shopifySynced = Number(row.shopify_synced || 0);
+    const whatsappOnly = Number(row.whatsapp_only || 0);
     return {
-      total_contacts: Number(row.total_contacts || 0),
-      shopify_synced: Number(row.shopify_synced || 0),
+      total_contacts: shopifySynced + whatsappOnly,
+      shopify_synced: shopifySynced,
       whatsapp_contacts: Number(row.whatsapp_contacts || 0),
-      last_synced_at: row.last_synced_at || platform.customerSync?.last_synced_at || "",
-      last_checked_at: platform.customerSync?.last_checked_at || "",
-      last_skipped: Number(platform.customerSync?.last_skipped || 0),
-      total_checked: Number(platform.customerSync?.total_checked || 0),
-      total_synced: Number(platform.customerSync?.total_synced || row.shopify_synced || 0),
-      total_skipped: Number(platform.customerSync?.total_skipped || platform.customerSync?.last_skipped || 0),
-      pages: Number(platform.customerSync?.pages || 0),
-      syncing: Boolean(platform.customerSync?.syncing),
-      started_at: platform.customerSync?.started_at || "",
-      completed_at: platform.customerSync?.completed_at || "",
-      last_error: platform.customerSync?.last_error || "",
-      last_total_seen: Number(platform.customerSync?.last_total_seen || 0),
-      next_page_info: platform.customerSync?.next_page_info || "",
+      last_synced_at: row.last_synced_at || row.indexed_synced_at || "",
+      last_checked_at: row.last_checked_at || "",
+      last_skipped: Number(row.skipped_count || 0),
+      total_checked: Number(row.checked_count || 0),
+      total_synced: Number(row.indexed_count || shopifySynced || 0),
+      total_skipped: Number(row.skipped_count || 0),
+      pages: Number(row.pages || 0),
+      syncing: row.status === "syncing",
+      status: row.status || "idle",
+      started_at: row.started_at || "",
+      completed_at: row.completed_at || "",
+      last_error: row.last_error || "",
+      last_total_seen: Number(row.checked_count || 0),
+      total_available: row.total_available === null || row.total_available === undefined ? null : Number(row.total_available),
+      next_page_info: row.cursor || "",
     };
   }
 
@@ -3522,47 +3879,141 @@ function createPostgresStorage() {
     const offset = Math.max(0, Number(options.offset || 0));
     const result = await query(
       `
-      select
-        ct.id as contact_id,
-        ct.wa_id,
-        ct.phone_e164,
-        ct.display_name,
-        ct.email,
-        ct.opt_in_status,
-        ct.opt_in_source,
-        ct.attributes,
-        ct.created_at as contact_created_at,
-        ct.updated_at as contact_updated_at,
-        c.id as conversation_id,
-        c.status,
-        c.intent,
-        c.unread_count,
-        c.last_message_at,
-        lm.message_type as latest_message_type,
-        lm.body as latest_body,
-        lm.direction as latest_direction,
-        lm.status as latest_status,
-        lm.created_at as latest_created_at,
-        lm.template_name as latest_template_name,
-        lm.media_url as latest_media_url
-      from contacts ct
-      left join lateral (
-        select *
-        from conversations c
-        where c.organization_id = ct.organization_id
-          and c.contact_id = ct.id
-        order by coalesce(c.last_message_at, c.updated_at, c.created_at) desc
-        limit 1
-      ) c on true
-      left join lateral (
-        select direction, message_type, body, status, created_at, template_name, media_url
-        from messages m
-        where m.conversation_id = c.id
-        order by m.created_at desc
-        limit 1
-      ) lm on true
-      where ct.organization_id = $1
-      order by coalesce(c.last_message_at, lm.created_at, ct.updated_at, ct.created_at) desc
+      with combined as (
+        select
+          sci.id::text as index_id,
+          ct.id::text as contact_id,
+          sci.shopify_customer_id,
+          sci.phone_e164,
+          sci.wa_id,
+          coalesce(nullif(ct.display_name, ''), nullif(sci.display_name, ''), sci.phone_e164) as display_name,
+          coalesce(nullif(ct.email, ''), nullif(sci.email, '')) as email,
+          sci.tags,
+          sci.orders_count,
+          sci.total_spent,
+          sci.currency,
+          sci.last_order_at,
+          sci.city,
+          sci.province,
+          sci.country,
+          sci.zip,
+          sci.accepts_marketing,
+          sci.shopify_created_at,
+          sci.shopify_updated_at,
+          sci.recent_orders,
+          sci.detail_synced_at,
+          sci.synced_at,
+          sci.created_at,
+          sci.updated_at,
+          ct.attributes,
+          ct.opt_in_status,
+          coalesce(ct.opt_in_source, 'shopify_index') as opt_in_source,
+          ct.created_at as contact_created_at,
+          ct.updated_at as contact_updated_at,
+          c.id::text as conversation_id,
+          c.status,
+          c.intent,
+          c.unread_count,
+          c.last_message_at,
+          lm.message_type as latest_message_type,
+          lm.body as latest_body,
+          lm.direction as latest_direction,
+          lm.status as latest_status,
+          lm.created_at as latest_created_at,
+          lm.template_name as latest_template_name,
+          lm.media_url as latest_media_url
+        from shopify_customer_index sci
+        left join contacts ct
+          on ct.organization_id = sci.organization_id
+          and sci.wa_id = regexp_replace(coalesce(ct.phone_e164, ct.wa_id, ''), '\\D', '', 'g')
+        left join lateral (
+          select *
+          from conversations c
+          where c.organization_id = sci.organization_id
+            and c.contact_id = ct.id
+          order by coalesce(c.last_message_at, c.updated_at, c.created_at) desc
+          limit 1
+        ) c on true
+        left join lateral (
+          select direction, message_type, body, status, created_at, template_name, media_url
+          from messages m
+          where m.conversation_id = c.id
+          order by m.created_at desc
+          limit 1
+        ) lm on true
+        where sci.organization_id = $1
+
+        union all
+
+        select
+          null::text as index_id,
+          ct.id::text as contact_id,
+          null::text as shopify_customer_id,
+          ct.phone_e164,
+          ct.wa_id,
+          ct.display_name,
+          ct.email,
+          null::text as tags,
+          0::integer as orders_count,
+          0::numeric as total_spent,
+          'INR'::text as currency,
+          null::timestamptz as last_order_at,
+          null::text as city,
+          null::text as province,
+          null::text as country,
+          null::text as zip,
+          null::boolean as accepts_marketing,
+          null::timestamptz as shopify_created_at,
+          null::timestamptz as shopify_updated_at,
+          '[]'::jsonb as recent_orders,
+          null::timestamptz as detail_synced_at,
+          ct.updated_at as synced_at,
+          ct.created_at,
+          ct.updated_at,
+          ct.attributes,
+          ct.opt_in_status,
+          ct.opt_in_source,
+          ct.created_at as contact_created_at,
+          ct.updated_at as contact_updated_at,
+          c.id::text as conversation_id,
+          c.status,
+          c.intent,
+          c.unread_count,
+          c.last_message_at,
+          lm.message_type as latest_message_type,
+          lm.body as latest_body,
+          lm.direction as latest_direction,
+          lm.status as latest_status,
+          lm.created_at as latest_created_at,
+          lm.template_name as latest_template_name,
+          lm.media_url as latest_media_url
+        from contacts ct
+        left join lateral (
+          select *
+          from conversations c
+          where c.organization_id = ct.organization_id
+            and c.contact_id = ct.id
+          order by coalesce(c.last_message_at, c.updated_at, c.created_at) desc
+          limit 1
+        ) c on true
+        left join lateral (
+          select direction, message_type, body, status, created_at, template_name, media_url
+          from messages m
+          where m.conversation_id = c.id
+          order by m.created_at desc
+          limit 1
+        ) lm on true
+        where ct.organization_id = $1
+          and not exists (
+            select 1
+            from shopify_customer_index sci
+            where sci.organization_id = ct.organization_id
+              and sci.wa_id = regexp_replace(coalesce(ct.phone_e164, ct.wa_id, ''), '\\D', '', 'g')
+          )
+      )
+      select *
+      from combined
+      order by coalesce(latest_created_at, last_message_at, last_order_at, updated_at, synced_at, contact_updated_at, contact_created_at) desc nulls last
       limit $2
       offset $3
       `,
@@ -3570,9 +4021,12 @@ function createPostgresStorage() {
     );
 
     return result.rows.map((row) => {
+      if (row.shopify_customer_id) {
+        return shopifyIndexCustomerListItem(row);
+      }
+
       const attributes = safeJsonParse(row.attributes, {});
-      const shopifyCustomer = attributes.shopify?.customer || null;
-      const displayName = row.display_name || shopifyCustomer?.name || row.email || row.phone_e164 || row.wa_id || "Customer";
+      const displayName = row.display_name || row.email || row.phone_e164 || row.wa_id || "Customer";
       const latestCreatedAt = row.latest_created_at || row.last_message_at || row.contact_updated_at || row.contact_created_at;
       return {
         id: row.contact_id,
@@ -3581,9 +4035,9 @@ function createPostgresStorage() {
         name: displayName,
         initials: initials(displayName, row.phone_e164 || row.wa_id),
         phone: row.phone_e164 || formatPhone(row.wa_id),
-        email: row.email || shopifyCustomer?.email || "",
-        channel: row.conversation_id ? "WhatsApp" : "Shopify",
-        segment: attributes.source === "shopify" ? "Shopify customer" : "Webhook contact",
+        email: row.email || "",
+        channel: row.conversation_id ? "WhatsApp" : "Customer",
+        segment: "WhatsApp contact",
         unread: Number(row.unread_count || 0),
         lastMessage: row.latest_created_at ? previewForStoredMessage({
           direction: row.latest_direction,
@@ -3591,20 +4045,13 @@ function createPostgresStorage() {
           body: row.latest_body,
           template_name: row.latest_template_name,
           media_url: row.latest_media_url,
-        }) : attributes.source === "shopify" ? "Synced from Shopify" : "No conversation yet",
+        }) : "No conversation yet",
         lastSeen: latestCreatedAt ? formatRelative(latestCreatedAt) : "-",
         latest_message_at: row.last_message_at || row.latest_created_at || "",
-        intent: row.intent || "customer_profile",
+        intent: row.intent || attributes.intent || "customer_profile",
         opt_in_status: row.opt_in_status,
         opt_in_source: row.opt_in_source,
-        shopify: attributes.shopify
-          ? {
-              connected: true,
-              matched: true,
-              customer: shopifyCustomer || {},
-              orders: attributes.shopify.orders || [],
-            }
-          : null,
+        shopify: null,
         messages: row.latest_created_at
           ? [{
               direction: row.latest_direction,
@@ -3618,6 +4065,138 @@ function createPostgresStorage() {
           : [],
       };
     });
+  }
+
+  async function findShopifyCustomerByPhone(phone) {
+    const organizationId = await ensureOrganization();
+    const digits = compactDigits(phone);
+    if (!digits) return null;
+    const result = await query(
+      `
+      select *
+      from shopify_customer_index
+      where organization_id = $1
+        and wa_id = $2
+      limit 1
+      `,
+      [organizationId, digits]
+    );
+    if (!result.rowCount) return null;
+    return shopifyIndexPayload(result.rows[0]);
+  }
+
+  async function getShopifyCustomerDetail(idOrPhone) {
+    const organizationId = await ensureOrganization();
+    const lookup = String(idOrPhone || "");
+    const digits = compactDigits(lookup);
+    const result = await query(
+      `
+      select *
+      from shopify_customer_index
+      where organization_id = $1
+        and (
+          id::text = $2
+          or shopify_customer_id = $2
+          or phone_e164 = $2
+          or wa_id = $3
+        )
+      limit 1
+      `,
+      [organizationId, lookup, digits]
+    );
+    if (!result.rowCount) return null;
+
+    const row = result.rows[0];
+    const cachedOrders = Array.isArray(row.recent_orders)
+      ? row.recent_orders
+      : safeJsonParse(row.recent_orders, []);
+    const cacheAgeMs = row.detail_synced_at
+      ? Date.now() - new Date(row.detail_synced_at).getTime()
+      : Number.POSITIVE_INFINITY;
+    if (cachedOrders.length && cacheAgeMs < SHOPIFY_DETAIL_CACHE_TTL_MS) {
+      return shopifyIndexPayload(row);
+    }
+
+    const ordersResult = await shopifyGet("orders.json", {
+      customer_id: row.shopify_customer_id,
+      status: "any",
+      limit: "5",
+      order: "created_at desc",
+    });
+    if (!ordersResult.ok) {
+      return {
+        ...shopifyIndexPayload(row),
+        detail_error: ordersResult.payload?.errors || ordersResult.payload?.error || `Shopify returned ${ordersResult.status}`,
+      };
+    }
+
+    const orders = (ordersResult.payload?.orders || []).map(normalizeShopifyOrder);
+    const latest = orders[0] || {};
+    const updated = await query(
+      `
+      update shopify_customer_index
+      set recent_orders = $3::jsonb,
+          detail_synced_at = now(),
+          last_order_at = coalesce($4, last_order_at),
+          orders_count = greatest(orders_count, $5),
+          updated_at = now()
+      where organization_id = $1
+        and id = $2
+      returning *
+      `,
+      [
+        organizationId,
+        row.id,
+        JSON.stringify(orders),
+        isoDateOrNull(latest.processed_at || latest.created_at),
+        orders.length,
+      ]
+    );
+    return shopifyIndexPayload(updated.rows[0] || row);
+  }
+
+  async function resolveBroadcastRecipients(segmentId, limit = 250) {
+    const normalizedLimit = Math.max(1, Math.min(Number(limit) || 250, 250));
+    const targetSegmentId = String(segmentId || "all_customers");
+    if (!targetSegmentId || targetSegmentId === "all_customers") {
+      const organizationId = await ensureOrganization();
+      const result = await query(
+        `
+        select wa_id
+        from shopify_customer_index
+        where organization_id = $1
+          and wa_id <> ''
+        order by coalesce(last_order_at, synced_at, updated_at, created_at) desc nulls last
+        limit $2
+        `,
+        [organizationId, normalizedLimit]
+      );
+      return result.rows.map((row) => row.wa_id).filter(Boolean);
+    }
+
+    const organizationId = await ensureOrganization();
+    const segmentResult = await query(
+      `
+      select *
+      from audience_segments
+      where organization_id = $1
+        and id = $2
+      limit 1
+      `,
+      [organizationId, targetSegmentId]
+    );
+    if (!segmentResult.rowCount) return [];
+    const segment = mapAudienceSegment(segmentResult.rows[0]);
+    const customers = await listContacts({
+      limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000),
+      offset: 0,
+    });
+    return Array.from(new Set(
+      customers
+        .filter((customer) => customSegmentMatchesCustomer(customer, segment))
+        .map((customer) => compactDigits(customer.phone || customer.wa_id))
+        .filter(Boolean)
+    )).slice(0, normalizedLimit);
   }
 
   async function listConversations() {
@@ -3637,6 +4216,29 @@ function createPostgresStorage() {
         ct.phone_e164,
         ct.email,
         ct.customer_service_window_expires_at,
+        sci.id as sci_id,
+        sci.shopify_customer_id as sci_shopify_customer_id,
+        sci.phone_e164 as sci_phone_e164,
+        sci.wa_id as sci_wa_id,
+        sci.display_name as sci_display_name,
+        sci.email as sci_email,
+        sci.tags as sci_tags,
+        sci.orders_count as sci_orders_count,
+        sci.total_spent as sci_total_spent,
+        sci.currency as sci_currency,
+        sci.last_order_at as sci_last_order_at,
+        sci.city as sci_city,
+        sci.province as sci_province,
+        sci.country as sci_country,
+        sci.zip as sci_zip,
+        sci.accepts_marketing as sci_accepts_marketing,
+        sci.shopify_created_at as sci_shopify_created_at,
+        sci.shopify_updated_at as sci_shopify_updated_at,
+        sci.recent_orders as sci_recent_orders,
+        sci.detail_synced_at as sci_detail_synced_at,
+        sci.synced_at as sci_synced_at,
+        sci.created_at as sci_created_at,
+        sci.updated_at as sci_updated_at,
         lm.message_type as latest_message_type,
         lm.body as latest_body,
         lm.direction as latest_direction,
@@ -3646,6 +4248,9 @@ function createPostgresStorage() {
         lm.media_url as latest_media_url
       from conversations c
       join contacts ct on ct.id = c.contact_id
+      left join shopify_customer_index sci
+        on sci.organization_id = c.organization_id
+        and sci.wa_id = regexp_replace(coalesce(ct.phone_e164, ct.wa_id, ''), '\\D', '', 'g')
       left join lateral (
         select direction, message_type, body, status, created_at, template_name, media_url
         from messages m
@@ -3659,8 +4264,9 @@ function createPostgresStorage() {
       [organizationId]
     );
 
-    return result.rows.map((row) =>
-      normalizeConversation(
+    return result.rows.map((row) => {
+      const shopify = shopifyIndexPayloadFromAliasedRow(row);
+      const normalized = normalizeConversation(
         {
           id: row.id,
           status: row.status,
@@ -3668,12 +4274,12 @@ function createPostgresStorage() {
           intent: row.intent,
           unread: row.unread_count,
           wa_id: row.wa_id,
-          name: row.display_name || row.wa_id,
-          initials: initials(row.display_name, row.wa_id),
+          name: row.display_name || row.sci_display_name || row.wa_id,
+          initials: initials(row.display_name || row.sci_display_name, row.wa_id),
           phone: row.phone_e164 || formatPhone(row.wa_id),
-          email: row.email || "",
-          segment: "Webhook contact",
-          owner: "WhatsApp Cloud API",
+          email: row.email || row.sci_email || "",
+          segment: shopify ? "Shopify matched" : "WhatsApp contact",
+          owner: BUSINESS_DISPLAY_NAME || "The June Shop",
           last_message_at: row.last_message_at || row.latest_created_at,
           last_customer_message_at: row.last_customer_message_at,
           customer_service_window_expires_at: row.customer_service_window_expires_at,
@@ -3693,8 +4299,12 @@ function createPostgresStorage() {
             : [],
         },
         "postgres"
-      )
-    );
+      );
+      return {
+        ...normalized,
+        shopify,
+      };
+    });
   }
 
   async function getConversation(id) {
@@ -3707,9 +4317,35 @@ function createPostgresStorage() {
         ct.display_name,
         ct.phone_e164,
         ct.email,
-        ct.customer_service_window_expires_at
+        ct.customer_service_window_expires_at,
+        sci.id as sci_id,
+        sci.shopify_customer_id as sci_shopify_customer_id,
+        sci.phone_e164 as sci_phone_e164,
+        sci.wa_id as sci_wa_id,
+        sci.display_name as sci_display_name,
+        sci.email as sci_email,
+        sci.tags as sci_tags,
+        sci.orders_count as sci_orders_count,
+        sci.total_spent as sci_total_spent,
+        sci.currency as sci_currency,
+        sci.last_order_at as sci_last_order_at,
+        sci.city as sci_city,
+        sci.province as sci_province,
+        sci.country as sci_country,
+        sci.zip as sci_zip,
+        sci.accepts_marketing as sci_accepts_marketing,
+        sci.shopify_created_at as sci_shopify_created_at,
+        sci.shopify_updated_at as sci_shopify_updated_at,
+        sci.recent_orders as sci_recent_orders,
+        sci.detail_synced_at as sci_detail_synced_at,
+        sci.synced_at as sci_synced_at,
+        sci.created_at as sci_created_at,
+        sci.updated_at as sci_updated_at
       from conversations c
       join contacts ct on ct.id = c.contact_id
+      left join shopify_customer_index sci
+        on sci.organization_id = c.organization_id
+        and sci.wa_id = regexp_replace(coalesce(ct.phone_e164, ct.wa_id, ''), '\\D', '', 'g')
       where c.id = $1 and c.organization_id = $2
       limit 1
       `,
@@ -3739,7 +4375,8 @@ function createPostgresStorage() {
       [id]
     );
 
-    return normalizeConversation(
+    const shopify = shopifyIndexPayloadFromAliasedRow(conversation);
+    const normalized = normalizeConversation(
       {
         id: conversation.id,
         status: conversation.status,
@@ -3747,12 +4384,12 @@ function createPostgresStorage() {
         intent: conversation.intent,
         unread: conversation.unread_count,
         wa_id: conversation.wa_id,
-        name: conversation.display_name || conversation.wa_id,
-        initials: initials(conversation.display_name, conversation.wa_id),
+        name: conversation.display_name || conversation.sci_display_name || conversation.wa_id,
+        initials: initials(conversation.display_name || conversation.sci_display_name, conversation.wa_id),
         phone: conversation.phone_e164 || formatPhone(conversation.wa_id),
-        email: conversation.email || "",
-        segment: "Webhook contact",
-        owner: "WhatsApp Cloud API",
+        email: conversation.email || conversation.sci_email || "",
+        segment: shopify ? "Shopify matched" : "WhatsApp contact",
+        owner: BUSINESS_DISPLAY_NAME || "The June Shop",
         last_message_at: conversation.last_message_at || conversation.created_at,
         last_customer_message_at: conversation.last_customer_message_at,
         customer_service_window_expires_at: conversation.customer_service_window_expires_at,
@@ -3768,6 +4405,10 @@ function createPostgresStorage() {
       },
       "postgres"
     );
+    return {
+      ...normalized,
+      shopify,
+    };
   }
 
   async function saveReply(conversation, request, outbound) {
@@ -4197,7 +4838,7 @@ function createPostgresStorage() {
       `,
       [organizationId]
     );
-    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000) });
+    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000) });
     return result.rows.map((row) => decorateAudienceSegment(mapAudienceSegment(row), contacts));
   }
 
@@ -4236,7 +4877,7 @@ function createPostgresStorage() {
         segment.description || null,
       ]
     );
-    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000) });
+    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000) });
     return decorateAudienceSegment(mapAudienceSegment(result.rows[0]), contacts);
   }
 
@@ -4746,7 +5387,10 @@ function createPostgresStorage() {
     ingestWebhook,
     listContacts,
     upsertShopifyCustomers,
+    recordShopifySyncProgress,
     customerSyncStatus,
+    getShopifyCustomerDetail,
+    resolveBroadcastRecipients,
     listConversations,
     getConversation,
     saveReply,
@@ -4852,9 +5496,27 @@ function createStorage() {
       await storage.ready();
       return storage._impl.upsertShopifyCustomers(...args);
     },
+    async recordShopifySyncProgress(...args) {
+      await storage.ready();
+      return storage._impl.recordShopifySyncProgress
+        ? storage._impl.recordShopifySyncProgress(...args)
+        : storage._impl.customerSyncStatus(...args);
+    },
     async customerSyncStatus(...args) {
       await storage.ready();
       return storage._impl.customerSyncStatus(...args);
+    },
+    async getShopifyCustomerDetail(...args) {
+      await storage.ready();
+      return storage._impl.getShopifyCustomerDetail
+        ? storage._impl.getShopifyCustomerDetail(...args)
+        : null;
+    },
+    async resolveBroadcastRecipients(...args) {
+      await storage.ready();
+      return storage._impl.resolveBroadcastRecipients
+        ? storage._impl.resolveBroadcastRecipients(...args)
+        : [];
     },
     async getConversation(id) {
       await storage.ready();
@@ -5022,7 +5684,11 @@ function sendStorageUnavailable(res, error) {
 let broadcastSchedulerRunning = false;
 
 async function executeBroadcastCampaign(campaign) {
-  const recipients = Array.isArray(campaign.recipients) ? campaign.recipients : [];
+  let recipients = Array.isArray(campaign.recipients) ? campaign.recipients : [];
+  if (!recipients.length && campaign.audience_segment_id) {
+    recipients = await storage.resolveBroadcastRecipients(campaign.audience_segment_id, 250);
+  }
+  recipients = Array.from(new Set(recipients.map((item) => compactDigits(item)).filter(Boolean))).slice(0, 250);
   if (!recipients.length) {
     await storage.markBroadcastCampaignStatus(campaign.id, "failed", {
       last_send_error: "scheduled_campaign_has_no_recipients",
@@ -5484,10 +6150,14 @@ async function handleApi(req, res, parsed) {
       const rawBody = await readBody(req, 1_000_000);
       const body = rawBody ? JSON.parse(rawBody) : {};
       const templateName = validateTemplateName(body.template_name);
-      const recipients = Array.isArray(body.recipients)
+      let recipients = Array.isArray(body.recipients)
         ? body.recipients.map((item) => String(item || "").replace(/\D/g, "")).filter(Boolean)
         : [];
       if (!templateName) return sendJson(res, 400, { ok: false, error: "template_name_required" });
+      if (!recipients.length && body.audience_segment_id) {
+        recipients = await storage.resolveBroadcastRecipients(body.audience_segment_id, 250);
+      }
+      recipients = Array.from(new Set(recipients)).slice(0, 250);
       if (!recipients.length) return sendJson(res, 400, { ok: false, error: "recipients_required" });
       if (recipients.length > 250) return sendJson(res, 400, { ok: false, error: "recipient_limit_exceeded" });
 
@@ -5574,47 +6244,47 @@ async function handleApi(req, res, parsed) {
       const pageInfo = parsed.query.page_info || "";
       const result = await fetchShopifyCustomers(maxPages, pageInfo);
       if (!result.ok) {
+        const errorMessage = result.payload?.errors || result.payload?.error || result.payload || "shopify_customer_sync_failed";
+        const status = await storage.recordShopifySyncProgress({
+          is_new_run: false,
+          checked: result.customers?.length || 0,
+          indexed: 0,
+          skipped: 0,
+          pages: result.pages || 0,
+          next_page_info: "",
+          status: "failed",
+          last_error: typeof errorMessage === "string" ? errorMessage : JSON.stringify(errorMessage),
+        });
         return sendJson(res, result.status || 500, {
           ok: false,
-          error: result.payload?.errors || result.payload?.error || result.payload || "shopify_customer_sync_failed",
+          error: errorMessage,
           synced: 0,
           skipped: 0,
           total_seen: result.customers?.length || 0,
           pages: result.pages || 0,
           next_page_info: "",
+          status,
         });
       }
 
       const saved = await storage.upsertShopifyCustomers(result.customers);
-      const checkedAt = new Date().toISOString();
-      const platform = readPlatformState();
-      const previousSync = platform.customerSync || {};
       const isNewRun = !pageInfo;
       const nextPageInfo = result.nextPageInfo || result.payload?.next_page_info || "";
-      const previousChecked = isNewRun ? 0 : Number(previousSync.total_checked || previousSync.last_total_seen || 0);
-      const previousSynced = isNewRun ? 0 : Number(previousSync.total_synced || previousSync.shopify_synced || 0);
-      const previousSkipped = isNewRun ? 0 : Number(previousSync.total_skipped || previousSync.last_skipped || 0);
       const pageCount = Number(result.pages || result.payload?.pages || 1);
-      writePlatformState({
-        ...platform,
-        customerSync: {
-          ...previousSync,
-          syncing: Boolean(nextPageInfo),
-          started_at: isNewRun ? checkedAt : previousSync.started_at || checkedAt,
-          last_checked_at: checkedAt,
-          last_synced_at: saved.synced ? checkedAt : previousSync.last_synced_at || "",
-          last_total_seen: result.customers.length,
-          last_skipped: saved.skipped || 0,
-          last_error: saved.errors?.[0]?.reason || "",
-          total_checked: previousChecked + result.customers.length,
-          total_synced: previousSynced + Number(saved.synced || 0),
-          total_skipped: previousSkipped + Number(saved.skipped || 0),
-          pages: (isNewRun ? 0 : Number(previousSync.pages || 0)) + pageCount,
-          completed_at: nextPageInfo ? previousSync.completed_at || "" : checkedAt,
-          next_page_info: nextPageInfo,
-        },
+      const shopifyCount = isNewRun
+        ? await countShopifyCustomers()
+        : { ok: false, count: undefined };
+      const status = await storage.recordShopifySyncProgress({
+        is_new_run: isNewRun,
+        checked: result.customers.length,
+        indexed: saved.synced || 0,
+        skipped: saved.skipped || 0,
+        pages: pageCount,
+        next_page_info: nextPageInfo,
+        total_available: shopifyCount.count,
+        last_error: saved.errors?.[0]?.reason || "",
+        status: nextPageInfo ? "syncing" : "completed",
       });
-      const status = await storage.customerSyncStatus();
       return sendJson(res, 200, {
         ok: true,
         synced: saved.synced || 0,
@@ -5624,21 +6294,22 @@ async function handleApi(req, res, parsed) {
         truncated: Boolean(result.payload?.truncated),
         next_page_info: nextPageInfo,
         errors: saved.errors || [],
+        cleanup_deleted: saved.cleanup_deleted || 0,
         note: saved.note || "",
         status,
       });
     } catch (error) {
       console.log(`[shopify.sync_customers] failed error=${error?.message || "unknown"}`);
-      const platform = readPlatformState();
-      writePlatformState({
-        ...platform,
-        customerSync: {
-          ...(platform.customerSync || {}),
-          syncing: false,
-          last_checked_at: new Date().toISOString(),
-          last_error: error?.message || "shopify_customer_sync_failed",
-        },
-      });
+      const status = await storage.recordShopifySyncProgress({
+        is_new_run: false,
+        checked: 0,
+        indexed: 0,
+        skipped: 0,
+        pages: 0,
+        next_page_info: "",
+        status: "failed",
+        last_error: error?.message || "shopify_customer_sync_failed",
+      }).catch(() => null);
       return sendJson(res, 500, {
         ok: false,
         error: error?.message || "shopify_customer_sync_failed",
@@ -5647,6 +6318,7 @@ async function handleApi(req, res, parsed) {
         total_seen: 0,
         pages: 0,
         next_page_info: "",
+        status,
       });
     }
   }
@@ -5662,6 +6334,17 @@ async function handleApi(req, res, parsed) {
         total_available_ok: shopifyCount.ok,
         total_available_error: shopifyCount.error || null,
       },
+    });
+  }
+
+  const customerShopifyDetailMatch = parsed.pathname.match(/^\/api\/customers\/([^/]+)\/shopify-detail$/);
+  if (req.method === "GET" && customerShopifyDetailMatch) {
+    const id = decodeURIComponent(customerShopifyDetailMatch[1]);
+    const detail = await storage.getShopifyCustomerDetail(id);
+    if (!detail) return sendJson(res, 404, { ok: false, error: "customer_not_found" });
+    return sendJson(res, 200, {
+      ok: true,
+      shopify: detail,
     });
   }
 
