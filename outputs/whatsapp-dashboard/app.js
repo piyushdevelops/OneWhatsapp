@@ -68,6 +68,12 @@ let savedBroadcastsLoading = false;
 let savedBroadcastsLoadedAt = 0;
 let savedBroadcastsLastError = "";
 let broadcastSending = false;
+let broadcastAudiencePreview = null;
+let broadcastAudiencePreviewLoading = false;
+let broadcastAudiencePreviewLoadingSegment = "";
+let broadcastAudiencePreviewLastError = "";
+let broadcastAudiencePreviewRequestId = 0;
+let broadcastAudiencePreviewQueuedSegment = "";
 let automationOverview = {
   mode: "observe",
   sends_enabled: false,
@@ -913,12 +919,110 @@ function validBroadcastAudienceId(segments, requestedId) {
 }
 
 function broadcastAudienceEstimate(segmentId, segments, fallbackCount = 0) {
+  if (broadcastAudiencePreview?.segment_id === (segmentId || "all_customers")) {
+    const previewCount = Number(broadcastAudiencePreview.count);
+    if (Number.isFinite(previewCount)) return previewCount;
+  }
   if (!segmentId || segmentId === "all_customers") {
     return customerSyncStatus.totalContacts || customerSyncStatus.synced || fallbackCount;
   }
   const segment = (segments || []).find((item) => item.id === segmentId);
   const size = Number(segment?.size);
   return Number.isFinite(size) ? size : fallbackCount;
+}
+
+function broadcastAudiencePreviewFor(segmentId) {
+  const requested = segmentId || "all_customers";
+  return broadcastAudiencePreview?.segment_id === requested ? broadcastAudiencePreview : null;
+}
+
+function broadcastAudiencePreviewText(segmentId, fallbackCount = 0) {
+  const preview = broadcastAudiencePreviewFor(segmentId);
+  if (broadcastAudiencePreviewLoading) return "Checking this audience...";
+  if (broadcastAudiencePreviewLastError) return broadcastAudiencePreviewLastError;
+  if (!preview) return "The server will check this audience before sending.";
+  const count = Number(preview.count || 0);
+  const limit = Number(preview.send_limit || 0);
+  if (count && limit && count > limit) {
+    return `Ready audience: ${count}. This campaign will send to the first ${limit} customers for safety.`;
+  }
+  return `Ready audience: ${count || fallbackCount} reachable customer${(count || fallbackCount) === 1 ? "" : "s"}.`;
+}
+
+function broadcastAudiencePreviewRows(segmentId, fallbackCustomers = []) {
+  const preview = broadcastAudiencePreviewFor(segmentId);
+  if (broadcastAudiencePreviewLoading) {
+    return `<div class="empty-inline"><strong>Checking audience</strong><span>Loading saved customers from the server.</span></div>`;
+  }
+  if (broadcastAudiencePreviewLastError) {
+    return `<div class="empty-inline"><strong>Preview issue</strong><span>${escapeHtml(broadcastAudiencePreviewLastError)}</span></div>`;
+  }
+  const previewCustomers = Array.isArray(preview?.sample) ? preview.sample : [];
+  return broadcastRecipientRows(previewCustomers.length ? previewCustomers : fallbackCustomers);
+}
+
+function updateBroadcastAudiencePreviewDom() {
+  const select = document.getElementById("broadcast-audience-segment");
+  if (!select) return;
+  const segmentId = select.value || "all_customers";
+  const fallbackRecipients = broadcastEligibleCustomers(recipientsForSegment(segmentId));
+  const count = document.getElementById("broadcast-recipient-count");
+  const notice = document.getElementById("broadcast-audience-preview-note");
+  const list = document.getElementById("broadcast-recipient-list");
+  if (count) count.textContent = String(broadcastAudienceEstimate(segmentId, localSegments(), fallbackRecipients.length));
+  if (notice) notice.textContent = broadcastAudiencePreviewText(segmentId, fallbackRecipients.length);
+  if (list) list.innerHTML = broadcastAudiencePreviewRows(segmentId, fallbackRecipients);
+}
+
+async function loadBroadcastAudiencePreview(segmentId = "all_customers", { force = false } = {}) {
+  const requested = segmentId || "all_customers";
+  if (!force && broadcastAudiencePreviewFor(requested) && Date.now() - Number(broadcastAudiencePreview.loaded_at || 0) < 60000) {
+    updateBroadcastAudiencePreviewDom();
+    return;
+  }
+  const requestId = ++broadcastAudiencePreviewRequestId;
+  broadcastAudiencePreviewLoading = true;
+  broadcastAudiencePreviewLoadingSegment = requested;
+  broadcastAudiencePreviewLastError = "";
+  updateBroadcastAudiencePreviewDom();
+  try {
+    const url = new URL(`${INBOX_API_BASE}/api/broadcasts/audience-preview`);
+    url.searchParams.set("segment_id", requested);
+    url.searchParams.set("sample_limit", "10");
+    const response = await fetch(url.toString());
+    const payload = await response.json().catch(() => ({}));
+    if (requestId !== broadcastAudiencePreviewRequestId) return;
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload?.error?.message || payload?.error || `Audience preview returned ${response.status}`);
+    }
+    broadcastAudiencePreview = {
+      ...payload,
+      segment_id: payload.segment_id || requested,
+      loaded_at: Date.now(),
+    };
+  } catch (error) {
+    if (requestId !== broadcastAudiencePreviewRequestId) return;
+    broadcastAudiencePreviewLastError = error.message || "Could not check this audience.";
+  } finally {
+    if (requestId === broadcastAudiencePreviewRequestId) {
+      broadcastAudiencePreviewLoading = false;
+      broadcastAudiencePreviewLoadingSegment = "";
+      updateBroadcastAudiencePreviewDom();
+    }
+  }
+}
+
+function queueBroadcastAudiencePreview(segmentId) {
+  const requested = segmentId || "all_customers";
+  if (!state.broadcastBuilderOpen) return;
+  if (broadcastAudiencePreviewLoading && broadcastAudiencePreviewLoadingSegment === requested) return;
+  if (broadcastAudiencePreviewQueuedSegment === requested) return;
+  if (broadcastAudiencePreviewFor(requested) && Date.now() - Number(broadcastAudiencePreview.loaded_at || 0) < 60000) return;
+  broadcastAudiencePreviewQueuedSegment = requested;
+  window.setTimeout(() => {
+    broadcastAudiencePreviewQueuedSegment = "";
+    if (state.broadcastBuilderOpen) loadBroadcastAudiencePreview(requested).catch(() => {});
+  }, 0);
 }
 
 async function loadCustomers({ force = false, append = false, offset = 0, limit = customerPageSize } = {}) {
@@ -4296,6 +4400,7 @@ async function sendBroadcastLive() {
         language,
         variables,
         audience_segment_id: audienceSegmentId,
+        max_recipients: campaignPayload.max_recipients,
         recipients: [],
       }),
     });
@@ -4308,6 +4413,9 @@ async function sendBroadcastLive() {
     closeModal();
     state.broadcastBuilderOpen = false;
     state.broadcastSegmentSeed = "";
+    state.broadcastAudienceSegmentId = "all_customers";
+    broadcastAudiencePreview = null;
+    broadcastAudiencePreviewLastError = "";
     inboxLoadedAt = 0;
     savedBroadcastsLoadedAt = 0;
     await Promise.all([
@@ -4347,6 +4455,7 @@ function collectBroadcastPayload(status = "draft") {
   const templateSelect = document.getElementById("broadcast-template-name");
   const selectedTemplateLanguage = templateSelect?.selectedOptions?.[0]?.dataset.language || "";
   const previewRecipients = broadcastEligibleCustomers(recipientsForSegment(segmentSelect?.value || "all_customers"));
+  const preview = broadcastAudiencePreviewFor(segmentSelect?.value || "all_customers");
   const sendModeRaw = document.getElementById("broadcast-send-mode")?.value || "now";
   const sendMode = sendModeRaw === "later" ? "later" : "now";
   return {
@@ -4356,6 +4465,7 @@ function collectBroadcastPayload(status = "draft") {
     audience_segment_id: segmentSelect?.value || "all_customers",
     audience_label: segmentSelect?.selectedOptions?.[0]?.textContent || "All current WhatsApp customers",
     recipient_count: broadcastAudienceEstimate(segmentSelect?.value || "all_customers", localSegments(), previewRecipients.length),
+    max_recipients: Number(preview?.send_limit || 0) || undefined,
     recipients: [],
     send_mode: sendMode,
     scheduled_at: broadcastScheduledAt(),
@@ -4789,8 +4899,9 @@ function broadcastBuilderData() {
   const customers = audienceCustomers();
   const segments = localSegments();
   const requestedSegmentId = state.broadcastAudienceSegmentId || state.broadcastSegmentSeed || "all_customers";
-  const selectedSegmentId = validBroadcastAudienceId(segments, requestedSegmentId);
+  const selectedSegmentId = requestedSegmentId || "all_customers";
   state.broadcastAudienceSegmentId = selectedSegmentId;
+  queueBroadcastAudiencePreview(selectedSegmentId);
   const defaultRecipients = broadcastEligibleCustomers(recipientsForSegment(selectedSegmentId));
   const audienceEstimate = broadcastAudienceEstimate(selectedSegmentId, segments, defaultRecipients.length);
   const templateOptions = templates.length
@@ -4799,7 +4910,7 @@ function broadcastBuilderData() {
   const segmentOptions = [
     `<option value="all_customers" ${selectedSegmentId === "all_customers" ? "selected" : ""}>All reachable customers (${broadcastAudienceEstimate("all_customers", segments, customers.length)})</option>`,
     selectedSegmentId !== "all_customers" && !segments.some((segment) => segment.id === selectedSegmentId)
-      ? `<option value="${escapeHtml(selectedSegmentId)}" selected>Loading selected audience...</option>`
+      ? `<option value="${escapeHtml(selectedSegmentId)}" selected>Selected audience (${audienceEstimate})</option>`
       : "",
     ...segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${segment.id === selectedSegmentId ? "selected" : ""}>${escapeHtml(segment.name)} (${segment.size})</option>`),
   ].join("");
@@ -4807,6 +4918,7 @@ function broadcastBuilderData() {
     templates,
     customers,
     segments,
+    selectedSegmentId,
     defaultRecipients,
     audienceEstimate,
     templateOptions,
@@ -4815,8 +4927,8 @@ function broadcastBuilderData() {
 }
 
 function renderBroadcastBuilderPage() {
-  const { templates, customers, segments, defaultRecipients, audienceEstimate, templateOptions, segmentOptions } = broadcastBuilderData();
-  const customerRows = broadcastRecipientRows(defaultRecipients);
+  const { templates, customers, segments, selectedSegmentId, defaultRecipients, audienceEstimate, templateOptions, segmentOptions } = broadcastBuilderData();
+  const customerRows = broadcastAudiencePreviewRows(selectedSegmentId, defaultRecipients);
   const templatesReady = templates.length;
   const writesReady = storageWritesReady();
   return `
@@ -4934,8 +5046,8 @@ function renderBroadcastBuilderPage() {
           <section class="segment-insight-card">
             <span class="eyebrow">Recipient preview</span>
             <h3>Audience sample</h3>
-            <p class="setting-copy">Preview shows loaded rows only. Sending resolves the full selected audience on the server.</p>
-            <div class="recipient-list">${customerRows}</div>
+            <p id="broadcast-audience-preview-note" class="setting-copy">${escapeHtml(broadcastAudiencePreviewText(selectedSegmentId, defaultRecipients.length))}</p>
+            <div id="broadcast-recipient-list" class="recipient-list">${customerRows}</div>
           </section>
           <section class="segment-use-card">
             <span class="eyebrow">Before sending</span>
@@ -5810,12 +5922,13 @@ document.addEventListener("change", (event) => {
   }
   if (target.id === "broadcast-audience-segment") {
     state.broadcastAudienceSegmentId = target.value || "all_customers";
-    const segments = localSegments();
-    const recipients = broadcastEligibleCustomers(recipientsForSegment(target.value));
-    const list = document.querySelector(".recipient-list");
-    const count = document.getElementById("broadcast-recipient-count");
-    if (list) list.innerHTML = broadcastRecipientRows(recipients);
-    if (count) count.textContent = String(broadcastAudienceEstimate(target.value, segments, recipients.length));
+    broadcastAudiencePreview = null;
+    broadcastAudiencePreviewLastError = "";
+    updateBroadcastAudiencePreviewDom();
+    loadBroadcastAudiencePreview(state.broadcastAudienceSegmentId, { force: true }).catch((error) => {
+      broadcastAudiencePreviewLastError = error.message || "Could not check this audience.";
+      updateBroadcastAudiencePreviewDom();
+    });
   }
   if (target.id?.startsWith("template-create-")) {
     updateTemplatePreview();

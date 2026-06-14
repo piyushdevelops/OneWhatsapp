@@ -48,6 +48,9 @@ const PLATFORM_STATE_FILE = process.env.PLATFORM_STATE_FILE || path.join(DATA_DI
 const AUTOMATION_MODE = process.env.AUTOMATION_MODE || "observe";
 const BROADCAST_SCHEDULER_INTERVAL_MS = Number(process.env.BROADCAST_SCHEDULER_INTERVAL_MS || 60000);
 const BROADCAST_ATTRIBUTION_WINDOW_DAYS = Number(process.env.BROADCAST_ATTRIBUTION_WINDOW_DAYS || 14);
+const BROADCAST_SEND_LIMIT = Math.max(1, Math.min(Number(process.env.BROADCAST_SEND_LIMIT || 250), 5000));
+const BROADCAST_AUDIENCE_SAMPLE_LIMIT = Math.max(1, Math.min(Number(process.env.BROADCAST_AUDIENCE_SAMPLE_LIMIT || 10), 25));
+const SEGMENT_EVALUATION_LIMIT = Math.max(1000, Math.min(Number(process.env.SEGMENT_EVALUATION_LIMIT || 500000), 1000000));
 const MAX_PENDING_BROADCAST_STATUSES = 500;
 const DB_CLEANUP_INTERVAL_MS = Number(process.env.DB_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const DB_WEBHOOK_EVENT_RETENTION_DAYS = Number(process.env.DB_WEBHOOK_EVENT_RETENTION_DAYS || 14);
@@ -858,12 +861,19 @@ function broadcastMemberFromCustomer(customer = {}) {
   };
 }
 
+function compactBroadcastAudienceMember(customer = {}) {
+  const member = broadcastMemberFromCustomer(customer);
+  delete member.messages;
+  delete member.shopify;
+  return member;
+}
+
 function decorateAudienceSegment(segment, customers = [], memberLimit = 250) {
   const matched = customers.filter((customer) => customSegmentMatchesCustomer(customer, segment));
   return {
     ...segment,
     size: matched.length,
-    members: matched.slice(0, memberLimit).map(broadcastMemberFromCustomer),
+    members: matched.slice(0, memberLimit).map(compactBroadcastAudienceMember),
     member_limit: memberLimit,
     member_limit_reached: matched.length > memberLimit,
     evaluated_at: new Date().toISOString(),
@@ -1364,13 +1374,23 @@ function compactOutboundStoragePayload(request, outbound) {
 }
 
 function compactBroadcastResultPayload(item) {
+  const errorReason = friendlyMetaError(item.error);
   return {
     recipient: item.recipient || "",
     ok: Boolean(item.ok),
-    reason: item.reason || item.error?.message || "",
+    reason: item.reason || errorReason || "",
     provider_message_id: item.provider_message_id || "",
     error: item.error || null,
   };
+}
+
+function friendlyMetaError(error) {
+  if (!error) return "";
+  if (typeof error === "string") return error;
+  const message = error.message || error.error_user_msg || error.error_data?.details || "";
+  const code = error.code ? `code ${error.code}` : "";
+  const subcode = error.error_subcode ? `subcode ${error.error_subcode}` : "";
+  return [message, code, subcode].filter(Boolean).join(" · ");
 }
 
 function extractInboundText(message) {
@@ -2705,7 +2725,7 @@ function createJsonStorage() {
   }
 
   async function jsonContactsForSegments() {
-    const limit = Math.max(500, Number(process.env.SEGMENT_EVALUATION_LIMIT || 5000));
+    const limit = Math.max(500, SEGMENT_EVALUATION_LIMIT);
     return buildInbox().slice(0, limit).map((item) => {
       const conversation = normalizeConversation(item, "json");
       return broadcastMemberFromCustomer({
@@ -2749,6 +2769,42 @@ function createJsonStorage() {
     }
     writePlatformState(platform);
     return decorateAudienceSegment(segment, await jsonContactsForSegments());
+  }
+
+  async function previewBroadcastAudience(segmentId = "all_customers", sampleLimit = BROADCAST_AUDIENCE_SAMPLE_LIMIT) {
+    const targetSegmentId = String(segmentId || "all_customers");
+    const contacts = await jsonContactsForSegments();
+    const segment = targetSegmentId === "all_customers"
+      ? {
+          id: "all_customers",
+          name: "All reachable customers",
+          source: "Combined",
+          match_mode: "all",
+          rules: { whatsapp_subscriber: true },
+        }
+      : readPlatformState().segments.find((item) => item.id === targetSegmentId);
+    if (!segment) {
+      return {
+        segment_id: targetSegmentId,
+        segment_name: "Selected audience",
+        count: 0,
+        send_limit: BROADCAST_SEND_LIMIT,
+        capped: false,
+        sample: [],
+      };
+    }
+    const matched = targetSegmentId === "all_customers"
+      ? contacts.filter((customer) => compactDigits(customer.phone || customer.wa_id))
+      : contacts.filter((customer) => customSegmentMatchesCustomer(customer, segment));
+    const count = matched.length;
+    return {
+      segment_id: targetSegmentId,
+      segment_name: segment.name || "Selected audience",
+      count,
+      send_limit: BROADCAST_SEND_LIMIT,
+      capped: count > BROADCAST_SEND_LIMIT,
+      sample: matched.slice(0, sampleLimit).map(compactBroadcastAudienceMember),
+    };
   }
 
   async function deleteCustomSegment(id) {
@@ -2980,11 +3036,13 @@ function createJsonStorage() {
     async getShopifyCustomerDetail() {
       return null;
     },
-    async resolveBroadcastRecipients(segmentId, limit = 250) {
-      return buildInbox()
+    async resolveBroadcastRecipients(segmentId, limit = BROADCAST_SEND_LIMIT) {
+      const normalizedLimit = Math.max(1, Math.min(Number(limit) || BROADCAST_SEND_LIMIT, BROADCAST_SEND_LIMIT));
+      const preview = await previewBroadcastAudience(segmentId, normalizedLimit);
+      return (preview.sample || [])
         .map((item) => compactDigits(item.phone || item.wa_id))
         .filter(Boolean)
-        .slice(0, Math.max(1, Math.min(Number(limit) || 250, 250)));
+        .slice(0, normalizedLimit);
     },
     async saveReply(conversation, request, outbound) {
       const replies = readReplies();
@@ -3028,6 +3086,7 @@ function createJsonStorage() {
     saveAutomationConfig,
     listCustomSegments,
     saveCustomSegment,
+    previewBroadcastAudience,
     deleteCustomSegment,
     duplicateCustomSegment,
     listBroadcastCampaigns,
@@ -3875,7 +3934,8 @@ function createPostgresStorage() {
 
   async function listContacts(options = {}) {
     const organizationId = await ensureOrganization();
-    const limit = Math.max(1, Math.min(Number(options.limit || 25), 5000));
+    const limitCap = options.evaluation ? SEGMENT_EVALUATION_LIMIT : 5000;
+    const limit = Math.max(1, Math.min(Number(options.limit || 25), limitCap));
     const offset = Math.max(0, Number(options.offset || 0));
     const result = await query(
       `
@@ -4155,23 +4215,40 @@ function createPostgresStorage() {
     return shopifyIndexPayload(updated.rows[0] || row);
   }
 
-  async function resolveBroadcastRecipients(segmentId, limit = 250) {
-    const normalizedLimit = Math.max(1, Math.min(Number(limit) || 250, 250));
+  async function previewBroadcastAudience(segmentId = "all_customers", sampleLimit = BROADCAST_AUDIENCE_SAMPLE_LIMIT) {
+    const normalizedSampleLimit = Math.max(1, Math.min(Number(sampleLimit) || BROADCAST_AUDIENCE_SAMPLE_LIMIT, SEGMENT_EVALUATION_LIMIT));
     const targetSegmentId = String(segmentId || "all_customers");
     if (!targetSegmentId || targetSegmentId === "all_customers") {
       const organizationId = await ensureOrganization();
-      const result = await query(
+      const countResult = await query(
         `
-        select wa_id
+        select count(*)::int as count
+        from shopify_customer_index
+        where organization_id = $1
+          and wa_id <> ''
+        `,
+        [organizationId]
+      );
+      const sampleResult = await query(
+        `
+        select *
         from shopify_customer_index
         where organization_id = $1
           and wa_id <> ''
         order by coalesce(last_order_at, synced_at, updated_at, created_at) desc nulls last
         limit $2
         `,
-        [organizationId, normalizedLimit]
+        [organizationId, normalizedSampleLimit]
       );
-      return result.rows.map((row) => row.wa_id).filter(Boolean);
+      const count = Number(countResult.rows[0]?.count || 0);
+      return {
+        segment_id: "all_customers",
+        segment_name: "All reachable customers",
+        count,
+        send_limit: BROADCAST_SEND_LIMIT,
+        capped: count > BROADCAST_SEND_LIMIT,
+        sample: sampleResult.rows.map(shopifyIndexCustomerListItem),
+      };
     }
 
     const organizationId = await ensureOrganization();
@@ -4185,15 +4262,38 @@ function createPostgresStorage() {
       `,
       [organizationId, targetSegmentId]
     );
-    if (!segmentResult.rowCount) return [];
+    if (!segmentResult.rowCount) {
+      return {
+        segment_id: targetSegmentId,
+        segment_name: "Selected audience",
+        count: 0,
+        send_limit: BROADCAST_SEND_LIMIT,
+        capped: false,
+        sample: [],
+      };
+    }
     const segment = mapAudienceSegment(segmentResult.rows[0]);
     const customers = await listContacts({
-      limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000),
+      limit: SEGMENT_EVALUATION_LIMIT,
       offset: 0,
+      evaluation: true,
     });
+    const matched = customers.filter((customer) => customSegmentMatchesCustomer(customer, segment));
+    return {
+      segment_id: targetSegmentId,
+      segment_name: segment.name || "Selected audience",
+      count: matched.length,
+      send_limit: BROADCAST_SEND_LIMIT,
+      capped: matched.length > BROADCAST_SEND_LIMIT,
+      sample: matched.slice(0, normalizedSampleLimit).map(compactBroadcastAudienceMember),
+    };
+  }
+
+  async function resolveBroadcastRecipients(segmentId, limit = BROADCAST_SEND_LIMIT) {
+    const normalizedLimit = Math.max(1, Math.min(Number(limit) || BROADCAST_SEND_LIMIT, BROADCAST_SEND_LIMIT));
+    const preview = await previewBroadcastAudience(segmentId, normalizedLimit);
     return Array.from(new Set(
-      customers
-        .filter((customer) => customSegmentMatchesCustomer(customer, segment))
+      (preview.sample || [])
         .map((customer) => compactDigits(customer.phone || customer.wa_id))
         .filter(Boolean)
     )).slice(0, normalizedLimit);
@@ -4838,7 +4938,7 @@ function createPostgresStorage() {
       `,
       [organizationId]
     );
-    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000) });
+    const contacts = await listContacts({ limit: SEGMENT_EVALUATION_LIMIT, evaluation: true });
     return result.rows.map((row) => decorateAudienceSegment(mapAudienceSegment(row), contacts));
   }
 
@@ -4877,7 +4977,7 @@ function createPostgresStorage() {
         segment.description || null,
       ]
     );
-    const contacts = await listContacts({ limit: Number(process.env.SEGMENT_EVALUATION_LIMIT || 50000) });
+    const contacts = await listContacts({ limit: SEGMENT_EVALUATION_LIMIT, evaluation: true });
     return decorateAudienceSegment(mapAudienceSegment(result.rows[0]), contacts);
   }
 
@@ -5391,6 +5491,7 @@ function createPostgresStorage() {
     customerSyncStatus,
     getShopifyCustomerDetail,
     resolveBroadcastRecipients,
+    previewBroadcastAudience,
     listConversations,
     getConversation,
     saveReply,
@@ -5517,6 +5618,19 @@ function createStorage() {
       return storage._impl.resolveBroadcastRecipients
         ? storage._impl.resolveBroadcastRecipients(...args)
         : [];
+    },
+    async previewBroadcastAudience(...args) {
+      await storage.ready();
+      return storage._impl.previewBroadcastAudience
+        ? storage._impl.previewBroadcastAudience(...args)
+        : {
+            segment_id: args[0] || "all_customers",
+            segment_name: "Selected audience",
+            count: 0,
+            send_limit: BROADCAST_SEND_LIMIT,
+            capped: false,
+            sample: [],
+          };
     },
     async getConversation(id) {
       await storage.ready();
@@ -5686,9 +5800,9 @@ let broadcastSchedulerRunning = false;
 async function executeBroadcastCampaign(campaign) {
   let recipients = Array.isArray(campaign.recipients) ? campaign.recipients : [];
   if (!recipients.length && campaign.audience_segment_id) {
-    recipients = await storage.resolveBroadcastRecipients(campaign.audience_segment_id, 250);
+    recipients = await storage.resolveBroadcastRecipients(campaign.audience_segment_id, BROADCAST_SEND_LIMIT);
   }
-  recipients = Array.from(new Set(recipients.map((item) => compactDigits(item)).filter(Boolean))).slice(0, 250);
+  recipients = Array.from(new Set(recipients.map((item) => compactDigits(item)).filter(Boolean))).slice(0, BROADCAST_SEND_LIMIT);
   if (!recipients.length) {
     await storage.markBroadcastCampaignStatus(campaign.id, "failed", {
       last_send_error: "scheduled_campaign_has_no_recipients",
@@ -5698,7 +5812,7 @@ async function executeBroadcastCampaign(campaign) {
 
   await storage.markBroadcastCampaignStatus(campaign.id, "sending");
   const results = [];
-  for (const recipient of recipients.slice(0, 250)) {
+  for (const recipient of recipients.slice(0, BROADCAST_SEND_LIMIT)) {
     const outbound = await sendWhatsAppMessage(
       {
         id: `broadcast_${campaign.id}_${recipient}`,
@@ -5711,12 +5825,16 @@ async function executeBroadcastCampaign(campaign) {
         variables: Array.isArray(campaign.variables) ? campaign.variables : [],
       }
     );
+    const metaError = outbound.payload?.error || outbound.error || null;
+    const failureReason = outbound.ok
+      ? outbound.reason || "accepted_by_meta"
+      : friendlyMetaError(metaError) || outbound.reason || "Meta rejected this send";
     results.push({
       recipient,
       ok: Boolean(outbound.ok),
-      reason: outbound.reason || "",
+      reason: failureReason,
       provider_message_id: outbound.providerMessageId || "",
-      error: outbound.error || null,
+      error: metaError,
     });
   }
 
@@ -6124,6 +6242,23 @@ async function handleApi(req, res, parsed) {
     }
   }
 
+  if (req.method === "GET" && parsed.pathname === "/api/broadcasts/audience-preview") {
+    try {
+      const segmentId = parsed.query.segment_id || "all_customers";
+      const sampleLimit = Number(parsed.query.sample_limit || BROADCAST_AUDIENCE_SAMPLE_LIMIT);
+      const preview = await storage.previewBroadcastAudience(segmentId, sampleLimit);
+      return sendJson(res, 200, {
+        ok: true,
+        ...preview,
+      });
+    } catch (error) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: error?.message || "audience_preview_failed",
+      });
+    }
+  }
+
   const broadcastReportMatch = parsed.pathname.match(/^\/api\/broadcasts\/([^/]+)\/report$/);
   if (broadcastReportMatch && req.method === "GET") {
     const campaignId = decodeURIComponent(broadcastReportMatch[1]);
@@ -6153,13 +6288,13 @@ async function handleApi(req, res, parsed) {
       let recipients = Array.isArray(body.recipients)
         ? body.recipients.map((item) => String(item || "").replace(/\D/g, "")).filter(Boolean)
         : [];
+      const maxRecipients = Math.max(1, Math.min(Number(body.max_recipients || BROADCAST_SEND_LIMIT), BROADCAST_SEND_LIMIT));
       if (!templateName) return sendJson(res, 400, { ok: false, error: "template_name_required" });
       if (!recipients.length && body.audience_segment_id) {
-        recipients = await storage.resolveBroadcastRecipients(body.audience_segment_id, 250);
+        recipients = await storage.resolveBroadcastRecipients(body.audience_segment_id, maxRecipients);
       }
-      recipients = Array.from(new Set(recipients)).slice(0, 250);
+      recipients = Array.from(new Set(recipients)).slice(0, maxRecipients);
       if (!recipients.length) return sendJson(res, 400, { ok: false, error: "recipients_required" });
-      if (recipients.length > 250) return sendJson(res, 400, { ok: false, error: "recipient_limit_exceeded" });
 
       const results = [];
       for (const recipient of recipients) {
@@ -6175,12 +6310,16 @@ async function handleApi(req, res, parsed) {
             variables: Array.isArray(body.variables) ? body.variables : [],
           }
         );
+        const metaError = outbound.payload?.error || outbound.error || null;
+        const failureReason = outbound.ok
+          ? outbound.reason || "accepted_by_meta"
+          : friendlyMetaError(metaError) || outbound.reason || "Meta rejected this send";
         results.push({
           recipient,
           ok: Boolean(outbound.ok),
-          reason: outbound.reason || "",
+          reason: failureReason,
           provider_message_id: outbound.providerMessageId || "",
-          error: outbound.error || null,
+          error: metaError,
         });
       }
 
@@ -6198,6 +6337,7 @@ async function handleApi(req, res, parsed) {
         accepted,
         failed: results.length - accepted,
         total: results.length,
+        send_limit: maxRecipients,
         results,
       });
     } catch (error) {
